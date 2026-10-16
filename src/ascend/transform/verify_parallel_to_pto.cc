@@ -366,10 +366,18 @@ private:
                     "loops (serial/pipelined/while) inside T.Parallel are "
                     "not yet supported");
     }
-    void VisitStmt_(const IfThenElseNode *) final {
-      parent_->Fail("loop structure",
-                    "conditional branches inside T.Parallel are not yet "
-                    "supported");
+    void VisitStmt_(const IfThenElseNode *op) final {
+      // M2 (control-flow stage): the restricted lane-varying conditional forms
+      // are admitted. LegalizeParallelToPTO rewrites them into the Select form
+      // before VectorizeParallelToPTO runs, so the admitted shape is exactly
+      // what Legalize can rewrite: buffer stores, no-ops, a SeqStmt of those,
+      // or a nested conditional whose destinations are lane-varying
+      // (lane-uniform stores stay rejected by the store check).
+      CheckComputeValue(op->condition, "if condition");
+      CheckConditionalBranch(op->then_case, "then");
+      if (op->else_case.defined()) {
+        CheckConditionalBranch(op->else_case.value(), "else");
+      }
     }
     void VisitStmt_(const WhileNode *) final {
       parent_->Fail("loop structure",
@@ -477,6 +485,54 @@ private:
       ctx.external_defs = external_defs_;
       ctx.classified = classified_;
       return ctx;
+    }
+
+    // A no-op statement carries no work: an Evaluate of a constant or an
+    // (empty) SeqStmt of those. Mirrors the Legalize-side helper so the
+    // admitted branch shapes are exactly the rewritable ones.
+    static bool IsNoOpStmt(const Stmt &stmt) {
+      if (const auto *seq = stmt.as<SeqStmtNode>()) {
+        for (const Stmt &sub : seq->seq) {
+          if (!IsNoOpStmt(sub)) {
+            return false;
+          }
+        }
+        return true;
+      }
+      if (const auto *eval = stmt.as<EvaluateNode>()) {
+        return eval->value.as<IntImmNode>() != nullptr;
+      }
+      return false;
+    }
+
+    // Statements allowed inside a conditional branch under T.Parallel: the
+    // branch must stay rewritable as Select arm(s) — buffer stores, no-ops,
+    // SeqStmt of those, or a nested conditional (which recurses through the
+    // same checks).
+    void CheckConditionalBranch(const Stmt &stmt, const char *which) {
+      if (const auto *seq = stmt.as<SeqStmtNode>()) {
+        for (const Stmt &sub : seq->seq) {
+          CheckConditionalBranch(sub, which);
+        }
+        return;
+      }
+      if (const auto *nested = stmt.as<IfThenElseNode>()) {
+        VisitStmt_(nested);
+        return;
+      }
+      if (const auto *store = stmt.as<BufferStoreNode>()) {
+        VisitStmt_(store);
+        return;
+      }
+      if (IsNoOpStmt(stmt)) {
+        return;
+      }
+      std::ostringstream oss;
+      oss << "If " << which
+          << "-branch under T.Parallel must be buffer stores, nested "
+             "conditionals or no-ops (the Select-rewritable shape); other "
+             "statements are not supported at this stage";
+      parent_->Fail("loop structure", oss.str());
     }
 
     // The unified reference check. One StmtExprVisitor
@@ -611,9 +667,77 @@ private:
           check(cast->value);
           return;
         }
+        // M2: Select and the relational / boolean ops that Legalize and
+        // Vectorize express as vcmp+vsel / mask_and|or|not. Operands recurse
+        // through the same check, so lane classification and dtype rules still
+        // apply to whatever feeds them.
+        if (const auto *sel = e.as<SelectNode>()) {
+          check(sel->condition);
+          check(sel->true_value);
+          check(sel->false_value);
+          return;
+        }
+        if (const auto *lt = e.as<LTNode>()) {
+          check(lt->a);
+          check(lt->b);
+          return;
+        }
+        if (const auto *le = e.as<LENode>()) {
+          check(le->a);
+          check(le->b);
+          return;
+        }
+        if (const auto *gt = e.as<GTNode>()) {
+          check(gt->a);
+          check(gt->b);
+          return;
+        }
+        if (const auto *ge = e.as<GENode>()) {
+          check(ge->a);
+          check(ge->b);
+          return;
+        }
+        if (const auto *eq = e.as<EQNode>()) {
+          check(eq->a);
+          check(eq->b);
+          return;
+        }
+        if (const auto *ne = e.as<NENode>()) {
+          check(ne->a);
+          check(ne->b);
+          return;
+        }
+        if (const auto *andn = e.as<AndNode>()) {
+          check(andn->a);
+          check(andn->b);
+          return;
+        }
+        if (const auto *orn = e.as<OrNode>()) {
+          check(orn->a);
+          check(orn->b);
+          return;
+        }
+        if (const auto *notn = e.as<NotNode>()) {
+          check(notn->a);
+          return;
+        }
         if (const auto *call = e.as<CallNode>()) {
           if (auto call_op = call->op.as<Op>()) {
             const std::string &name = call_op.value()->name;
+            // M2: boolean mask-combine calls (tirx.bitwise_* / tir.And|Or|Not)
+            // and the topk_gate -T.infinity() constant.
+            if (name.find("bitwise_and") != std::string::npos ||
+                name.find("bitwise_or") != std::string::npos ||
+                name.find("bitwise_not") != std::string::npos ||
+                name == "tir.And" || name == "tir.Or" || name == "tir.Not") {
+              for (const auto &arg : call->args) {
+                check(arg);
+              }
+              return;
+            }
+            if (name == "tl.infinity" || name == "tir.infinity") {
+              return;
+            }
             if (name == "tirx.fabs" || name == "tirx.exp" ||
                 name == "tirx.log" || name == "tirx.sqrt") {
               check(call->args[0]);

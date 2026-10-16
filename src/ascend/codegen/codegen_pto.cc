@@ -289,6 +289,25 @@ std::string PtoIntegerVectorInterpretTarget(DataType element) {
   return "pto.ui" + std::to_string(element.bits());
 }
 
+// The TileLang-side name of a VMI call maps to the PTODSL surface name. The
+// PR262 boolean mask-combine ops have no PTODSL counterpart under their own
+// names; the current PTOAS surface exposes the same operation as the bitwise
+// vector ops on mask registers, verified by the stage-4 ABI probe:
+//   pto.vmi.vand %a, %b : mask<128xpred>, mask<128xpred> -> mask<128xpred>
+//   pto.vmi.vor  (same shape) / pto.vmi.vnot : mask -> mask
+std::string PtoVmiEmitName(const std::string &op_name) {
+  if (op_name == "tl.vmi.mask_and") {
+    return "vmi.vand";
+  }
+  if (op_name == "tl.vmi.mask_or") {
+    return "vmi.vor";
+  }
+  if (op_name == "tl.vmi.mask_not") {
+    return "vmi.vnot";
+  }
+  return op_name.substr(3);
+}
+
 std::string StripPipePrefix(const std::string &name) {
   if (name.rfind("PIPE_", 0) == 0) {
     return name.substr(5);
@@ -5494,7 +5513,7 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
   if (bridge_integer_source) {
     os << "pto.vmi.vinterpret_cast(";
   }
-  os << "pto." << op_name.substr(3) << "(";
+  os << "pto." << PtoVmiEmitName(op_name) << "(";
   bool needs_comma = false;
 
   auto print_scalar_literal_value = [&](const PrimExpr &arg) {
