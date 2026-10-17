@@ -470,11 +470,44 @@ bool IsSupportedSIMTLocalStorageType(DataType t) {
   return IsSimtLocalBufferDtype(t) || (t.is_scalar() && t == DataType::Int(32));
 }
 
+bool IsSimtLocalIntegerStorageDtype(DataType t) {
+  return t.is_scalar() && (t.is_int() || t.is_uint()) &&
+         (t.bits() == 8 || t.bits() == 32) &&
+         IsSupportedSIMTLocalStorageType(t);
+}
+
+std::string SimtLocalIntegerStorageTypeName(DataType t) {
+  ICHECK(IsSimtLocalIntegerStorageDtype(t));
+  return "pto.i" + std::to_string(t.bits());
+}
+
+// SIMT local integer storage is signless because LLVM stack accesses require
+// signless integer element types.  TileLang's logical signedness is restored
+// at the load boundary and folded back to the backing type at the store
+// boundary.  These adapters are only consumed by the SIMT local branches of
+// ScalarLoad/EmitScalarStore/EmitScalarizedLoad/EmitScalarizedStore.
+std::string SimtLocalLoadAdapter(const std::string &value, DataType t) {
+  if (!IsSimtLocalIntegerStorageDtype(t)) {
+    return value;
+  }
+  return "pto.cast(" + value + ", " + DataTypeName(t) + ")";
+}
+
+std::string SimtLocalStoreAdapter(const std::string &value, DataType t) {
+  if (!IsSimtLocalIntegerStorageDtype(t)) {
+    return value;
+  }
+  return "pto.cast(" + value + ", " + SimtLocalIntegerStorageTypeName(t) + ")";
+}
+
 std::string SIMTLocalStorageTypeName(DataType t) {
   ICHECK(IsSupportedSIMTLocalStorageType(t));
   // LLVM stack allocations require signless integer element types. Preserve
   // TileLang's signedness at load/store boundaries instead.
-  return IsInteger32(t) ? "pto.i32" : DataTypeName(t);
+  if (IsSimtLocalIntegerStorageDtype(t)) {
+    return SimtLocalIntegerStorageTypeName(t);
+  }
+  return DataTypeName(t);
 }
 
 bool IsSupportedSIMTFP8ContiguousLaneCount(int lanes) {
@@ -2661,10 +2694,7 @@ std::string CodeGenTileLangPTO::ScalarLoad(const BufferNode *buffer,
       return "tl.fp8_byte_load(" + GetVarID(buffer->data.get()) + ", " +
              index_str + ", " + FP8TypeName(buffer->dtype) + ")";
     }
-    if (IsInteger32(buffer->dtype)) {
-      return "pto.cast(" + value + ", " + DataTypeName(buffer->dtype) + ")";
-    }
-    return value;
+    return SimtLocalLoadAdapter(value, buffer->dtype);
   }
 
   if (scope == "shared" || scope == "shared.dyn" || scope == "global" ||
@@ -2729,9 +2759,7 @@ void CodeGenTileLangPTO::EmitScalarStore(const BufferNode *buffer,
                << FP8TypeName(buffer->dtype) << ")\n";
         return;
       }
-      if (IsInteger32(buffer->dtype)) {
-        store_value = "pto.cast(" + store_value + ", pto.i32)";
-      }
+      store_value = SimtLocalStoreAdapter(store_value, buffer->dtype);
       stream << "pto.store(" << store_value << ", "
              << GetVarID(buffer->data.get()) << ", " << index_str << ")\n";
       return;
@@ -2845,13 +2873,25 @@ void CodeGenTileLangPTO::EmitBufferAllocation(const Buffer &buffer) {
              "float32, int8, uint8, int32, uint32, and "
              "float8_e4m3fn/float8_e5m2, got "
           << buffer->dtype;
+      // Both allocation sub-branches use the same signless integer element
+      // backing for the admitted SIMT local integer types: scalar-element
+      // buffers through SIMTLocalStorageTypeName, vector-element register
+      // slots through the element type (without changing admission or
+      // claiming a supported slot read/write path).
+      auto storage_element_type = [&]() -> std::string {
+        if (!buffer->dtype.is_vector()) {
+          return SIMTLocalStorageTypeName(buffer->dtype);
+        }
+        if (tl::IsAscendVectorizableFP8(buffer->dtype)) {
+          return DataTypeName(buffer->dtype);
+        }
+        if (IsSimtLocalIntegerStorageDtype(elem)) {
+          return SimtLocalIntegerStorageTypeName(elem);
+        }
+        return ScalarType(elem);
+      };
       stream << vid << " = pto.alloc_buffer((" << opt_size.value() << ",), "
-             << (buffer->dtype.is_vector()
-                     ? (tl::IsAscendVectorizableFP8(buffer->dtype)
-                            ? DataTypeName(buffer->dtype)
-                            : ScalarType(elem))
-                     : SIMTLocalStorageTypeName(buffer->dtype))
-             << ")\n";
+             << storage_element_type() << ")\n";
     } else if (persistent) {
       ICHECK(IsFloat32(buffer->dtype))
           << "PTO persistent local allocation currently supports float32 "
@@ -7892,8 +7932,10 @@ void CodeGenTileLangPTO::EmitScalarizedLoad(const BufferLoadNode *op,
       index_str = RemoveOutermostParentheses(PrintExpr_(ramp->base));
     }
     if (scope == "local.fragment" || scope == "local") {
-      os << "pto.load(" << GetVarID(op->buffer->data.get()) << ", " << index_str
-         << ", contiguous=" << lanes << ")";
+      std::string value = "pto.load(" + GetVarID(op->buffer->data.get()) +
+                          ", " + index_str +
+                          ", contiguous=" + std::to_string(lanes) + ")";
+      os << SimtLocalLoadAdapter(value, element_dtype);
       return;
     }
     if (scope == "shared" || scope == "shared.dyn") {
@@ -8103,8 +8145,8 @@ void CodeGenTileLangPTO::EmitScalarizedStore(const BufferStoreNode *op) {
     const std::string contiguous_suffix =
         store_lanes > 1 ? ", contiguous=" + std::to_string(store_lanes) : "";
     if (scope == "local.fragment" || scope == "local") {
-      stream << "pto.store(" << value << ", "
-             << GetVarID(op->buffer->data.get()) << ", " << index_str
+      stream << "pto.store(" << SimtLocalStoreAdapter(value, buffer_dtype)
+             << ", " << GetVarID(op->buffer->data.get()) << ", " << index_str
              << contiguous_suffix << ")\n";
       return;
     }
