@@ -1912,7 +1912,14 @@ private:
     }
     if (const auto *sel = expr.as<SelectNode>()) {
 
-      PrimExpr cond = ConvertExpr(sel->condition, pre);
+      // A Select inside a Parallel body may test a lane-uniform condition
+      // (it depends only on the non-vectorized coordinates, e.g. a row
+      // index: sp4's pad mask). PTODSL has no scalar predicate, so the
+      // compare is redone in the vector domain and the result is a mask
+      // that is either all-true or all-false.
+      PrimExpr cond = RelationalCmpName(sel->condition) != nullptr
+                          ? ConvertRelationalToMask(sel->condition, pre)
+                          : ConvertExpr(sel->condition, pre);
       PrimExpr tval = ConvertExpr(sel->true_value, pre);
       PrimExpr fval = ConvertExpr(sel->false_value, pre);
       if (tval.dtype().lanes() == 1) {
@@ -1932,9 +1939,12 @@ private:
             pre);
       }
       ICHECK(cond.dtype().lanes() > 1)
-          << "[VectorizeParallelToPTO] Select condition must be a lane mask "
-             "after conversion (got scalar); Phase 1 expects lane-varying "
-             "predicates from SimdVFLowerControlFlow";
+          << "[VectorizeParallelToPTO] unsupported Select condition: a "
+             "lane-uniform condition is only supported when it is a "
+             "relational expression over lane-uniform values (e.g. "
+             "`row_flag >= 0`); got a scalar `"
+          << sel->condition->GetTypeKey()
+          << "`. Rewrite the test as a comparison, or make it lane-varying.";
       return EmitBind(
           "vsel", Call(tval.dtype(), VmiOp("vsel"), {cond, tval, fval}), pre);
     }
@@ -1959,6 +1969,71 @@ private:
     LOG(FATAL) << "[VectorizeParallelToPTO] internal error: unsupported "
                   "expression passed Verify: "
                << expr->GetTypeKey();
+  }
+
+  // Relational node -> PTODSL compare name, or nullptr for other nodes.
+  static const char *RelationalCmpName(const PrimExpr &e) {
+    if (e.as<EQNode>() != nullptr) return "eq";
+    if (e.as<NENode>() != nullptr) return "ne";
+    if (e.as<LTNode>() != nullptr) return "lt";
+    if (e.as<LENode>() != nullptr) return "le";
+    if (e.as<GTNode>() != nullptr) return "gt";
+    if (e.as<GENode>() != nullptr) return "ge";
+    return nullptr;
+  }
+
+  // Materialise a relational condition as a lane mask even when both sides
+  // are lane-uniform: broadcast the scalars and compare vector-wise. The
+  // resulting mask is all-true or all-false, which is exactly the semantics
+  // of a scalar predicate applied to a whole vector.
+  PrimExpr ConvertRelationalToMask(const PrimExpr &cond, Array<Stmt> *pre) {
+    const char *cmp = RelationalCmpName(cond);
+    ICHECK(cmp != nullptr) << "not a relational condition";
+    PrimExpr lhs;
+    PrimExpr rhs;
+    auto take = [&](const PrimExpr &a, const PrimExpr &b) {
+      lhs = a;
+      rhs = b;
+    };
+    if (const auto *eq_n = cond.as<EQNode>()) {
+      take(eq_n->a, eq_n->b);
+    } else if (const auto *ne_n = cond.as<NENode>()) {
+      take(ne_n->a, ne_n->b);
+    } else if (const auto *lt_n = cond.as<LTNode>()) {
+      take(lt_n->a, lt_n->b);
+    } else if (const auto *le_n = cond.as<LENode>()) {
+      take(le_n->a, le_n->b);
+    } else if (const auto *gt_n = cond.as<GTNode>()) {
+      take(gt_n->a, gt_n->b);
+    } else {
+      const auto *ge_n = cond.as<GENode>();
+      take(ge_n->a, ge_n->b);
+    }
+    Array<Stmt> local;
+    PrimExpr a = ConvertExpr(lhs, &local);
+    PrimExpr b = ConvertExpr(rhs, &local);
+    for (const auto &s : local) {
+      pre->push_back(s);
+    }
+    if (a.dtype().lanes() == 1) {
+      a = EmitBind(
+          "brc",
+          Call(VectorDType(a.dtype(), lanes_), VmiOp("vbrc"), {a},
+               {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+          pre);
+    }
+    if (b.dtype().lanes() == 1) {
+      b = EmitBind(
+          "brc",
+          Call(VectorDType(b.dtype(), lanes_), VmiOp("vbrc"), {b},
+               {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+          pre);
+    }
+    return EmitBind(
+        "vcmp",
+        Call(DataType::Bool(static_cast<int>(lanes_)), VmiOp("vcmp"),
+             {a, b, mask_var_, StringImm(cmp)}),
+        pre);
   }
 
   PrimExpr ConvertCompare(const PrimExpr &lhs, const PrimExpr &rhs,
