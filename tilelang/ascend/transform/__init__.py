@@ -178,6 +178,26 @@ def VectorizeParallelToPTO():
     return _ffi_api.VectorizeParallelToPTO()  # type: ignore
 
 
+def EliminateSimdVFRoundTrip():
+    """Remove provably-safe UB round-trip buffers inside PTO SimdVF regions.
+
+    A round-trip buffer only shuttles a value through UB inside one SIMD_VF
+    region (a unit stores it, a later unit loads it back). After
+    :func:`VectorizeParallelToPTO` that becomes a vstore followed by a vload in
+    the same vecscope, a UB RAW the machine-level schedule does not honour.
+    This pass removes such a buffer while the IR is still scalar parallel TIR,
+    with two conservative rules: forward retargeting of a pure-copy consumer
+    and backward copy propagation of a pure-copy producer. Only top-level,
+    adjacent, single-writer/single-reader, identity-indexed, divisible 1D units
+    with region-local buffers are rewritten; everything else is left untouched.
+
+    Must run between :func:`LegalizeParallelToPTO` and
+    :func:`VectorizeParallelToPTO`. Runs on the PTO target only; functions
+    without a PTO target pass through unchanged.
+    """
+    return _ffi_api.EliminateSimDVFRoundTrip()  # type: ignore
+
+
 def AscendThreadSync(storage_scope: str):
     """Insert thread-storage synchronization independently within each SIMT_VF."""
     return _ffi_api.AscendThreadSync(storage_scope)
@@ -290,6 +310,7 @@ __all__ = [
     "NormalizeControlFlowForSchedule",
     "NormalizeConflictHints",
     "LegalizeParallelToPTO",
+    "EliminateSimdVFRoundTrip",
     "PrepareMultiBuffer",
     "ResolveCore",
     "RewriteAscendBufferVersionLayout",

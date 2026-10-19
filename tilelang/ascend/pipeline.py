@@ -126,6 +126,11 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     if target_is_pto(target):
         mod = ascend_transform.VerifyParallelToPTO()(mod)
         mod = ascend_transform.LegalizeParallelToPTO()(mod)
+        # Remove UB round-trip buffers inside SIMD_VF regions before the
+        # vectorizer turns them into vstore/vload pairs: the machine-level
+        # schedule does not honour a same-vecscope UB RAW, so the value must
+        # not travel through UB at all.
+        mod = ascend_transform.EliminateSimdVFRoundTrip()(mod)
         mod = ascend_transform.VectorizeParallelToPTO()(mod)
     else:
         mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
