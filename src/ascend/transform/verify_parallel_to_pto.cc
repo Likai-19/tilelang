@@ -361,10 +361,41 @@ private:
     // not a whitelist. Reject those kinds explicitly.
 
     void VisitStmt_(const ForNode *op) final {
-      // No loops of any kind inside T.Parallel.
-      parent_->Fail("loop structure",
-                    "loops (serial/pipelined/while) inside T.Parallel are "
-                    "not yet supported");
+      // Loop-shell admission: a constant-bound T.serial loop inside
+      // T.Parallel is admitted as a preserved shell (Vectorize copies the
+      // loop through and converts only its body). The induction variable
+      // is lane-uniform by construction, so it is registered as a uniform
+      // definition while the body runs through the same unit-level
+      // checks. Non-serial kinds and non-constant bounds stay rejected
+      // at this stage.
+      if (op->kind != ForKind::kSerial) {
+        parent_->Fail("loop structure",
+                      "only T.serial loops inside T.Parallel are supported "
+                      "at this stage (pipelined and while loops are "
+                      "rejected)");
+      }
+      const auto *min_imm = op->min.as<IntImmNode>();
+      const auto *extent_imm = op->extent.as<IntImmNode>();
+      if (min_imm == nullptr || extent_imm == nullptr ||
+          extent_imm->value <= 0) {
+        parent_->Fail("loop structure",
+                      "T.serial inside T.Parallel must have constant bounds "
+                      "and a positive extent at this stage");
+      }
+      if (op->step.defined()) {
+        const auto *step_imm = op->step.value().as<IntImmNode>();
+        if (step_imm == nullptr || step_imm->value != 1) {
+          parent_->Fail("loop structure",
+                        "T.serial inside T.Parallel must have step 1 at "
+                        "this stage");
+        }
+      }
+      defined_loop_vars_.insert(op->loop_var.get());
+      Map<Var, Integer> saved_classified = classified_;
+      classified_.Set(op->loop_var, Integer(0));
+      StmtExprVisitor::VisitStmt_(op);
+      classified_ = std::move(saved_classified);
+      defined_loop_vars_.erase(op->loop_var.get());
     }
     void VisitStmt_(const IfThenElseNode *op) final {
       // M2 (control-flow stage): the restricted lane-varying conditional forms
@@ -579,6 +610,11 @@ private:
           return;
         }
         if (parent_->external_defs_.count(v) != 0) {
+          return;
+        }
+        if (parent_->defined_loop_vars_.count(v) != 0) {
+          // Induction variable of an admitted serial shell; it is
+          // lane-uniform and in lexical scope inside the shell body.
           return;
         }
         std::ostringstream oss;
@@ -976,6 +1012,10 @@ private:
     // vars, thread_extent bindings, binds, allocations) that is in scope
     // where the unit appears.
     std::set<const VarNode *> external_defs_;
+    // Induction variables of admitted serial loop shells (constant-bound
+    // T.serial inside T.Parallel). In scope only while the shell's body
+    // is being visited; classified as lane-uniform.
+    std::set<const VarNode *> defined_loop_vars_;
   };
 
   // ------------------------------------------------------------------
