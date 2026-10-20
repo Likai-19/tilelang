@@ -267,7 +267,15 @@ private:
   // ------------------------------------------------------------------
   Stmt VisitStmt_(const SBlockNode *op) final {
     if (op->name_hint != "SIMD_VF") {
-      return StmtExprMutator::VisitStmt_(op);
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      // A child region split hoisted its UB allocations up to this block (see
+      // TrySplitCarriedLoop); extend the rebuilt block so the split parts
+      // share one allocation.
+      if (!pending_parent_allocs_.empty()) {
+        result = AppendBlockAllocs(result, pending_parent_allocs_);
+        pending_parent_allocs_ = Array<Buffer>();
+      }
+      return result;
     }
     // Shared region scan: the same implementation Verify uses, so
     // skip/reject/convert decisions cannot drift apart.
@@ -304,9 +312,65 @@ private:
   }
 
   Stmt RebuildSBlock(const SBlockNode *op, Stmt body) {
+    if (hoisted_allocs_.empty()) {
+      return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
+                    std::move(body), op->init, op->alloc_buffers,
+                    op->match_buffers, op->annotations);
+    }
+    // P1: a split hoisted these allocations to the enclosing block; the parts
+    // must not re-declare them, otherwise each part gets its own merged UB
+    // slot and the split silently breaks the data chain.
+    Array<Buffer> alloc_buffers;
+    for (const Buffer &buffer : op->alloc_buffers) {
+      if (hoisted_allocs_.count(buffer.get()) != 0) {
+        continue;
+      }
+      alloc_buffers.push_back(buffer);
+    }
     return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
-                  std::move(body), op->init, op->alloc_buffers,
+                  std::move(body), op->init, alloc_buffers,
                   op->match_buffers, op->annotations);
+  }
+
+  // P1 (region-local split carry): extend an enclosing block with the
+  // allocations hoisted out of a split region. Appending to the block's
+  // alloc_buffers is the same shape a Kernel-scope T.alloc_shared produces
+  // (the verified sv7 carrier), so the allocation passes see exactly one
+  // owner for the whole split.
+  Stmt AppendBlockAllocs(const Stmt &stmt, const Array<Buffer> &extra) {
+    if (extra.empty()) {
+      return stmt;
+    }
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+      const SBlock &block = realize->block;
+      Array<Buffer> allocs = block->alloc_buffers;
+      for (const Buffer &buffer : extra) {
+        allocs.push_back(buffer);
+      }
+      SBlock new_block =
+          SBlock(block->iter_vars, block->reads, block->writes,
+                 block->name_hint, block->body, block->init, allocs,
+                 block->match_buffers, block->annotations);
+      return SBlockRealize(realize->iter_values, realize->predicate,
+                           new_block);
+    }
+    const auto *block = stmt.as<SBlockNode>();
+    if (block == nullptr) {
+      // No enclosing block to extend: emit explicit AllocBuffer statements,
+      // which still give one allocation per buffer.
+      Stmt out = stmt;
+      for (auto it = extra.rbegin(); it != extra.rend(); ++it) {
+        out = SeqStmt::Flatten(AllocBuffer(*it), out);
+      }
+      return out;
+    }
+    Array<Buffer> allocs = block->alloc_buffers;
+    for (const Buffer &buffer : extra) {
+      allocs.push_back(buffer);
+    }
+    return SBlock(block->iter_vars, block->reads, block->writes,
+                  block->name_hint, block->body, block->init, allocs,
+                  block->match_buffers, block->annotations);
   }
 
   // True when AnalyzeRegionCarry would promote this region (the carry path
@@ -569,6 +633,29 @@ private:
         scope_attr->attr_key != "tl.simdvf_scope") {
       scope_attr = nullptr;
     }
+    // P1 (region-local split carry): every part below is a separate block, so
+    // each would re-declare the region's allocations and MergeUBAllocations
+    // would give one logical buffer several merged slots — the parts then talk
+    // to different addresses and the data chain breaks silently. Hoist every
+    // region-local UB allocation to the enclosing block first, so all parts
+    // share one allocation (the shape sv7 already uses: carrier allocated at
+    // Kernel scope, verified 0/64).
+    //
+    // Deliberately conservative: hoisting a buffer used by a single part is
+    // semantically neutral (only the lifetime widens; MergeUB plans by alias
+    // clique, so no extra UB is consumed). Restricting the set to the "carrier"
+    // would miss the neighbouring region-local buffers that also live across
+    // the split (sv5v/sv6v `xf`): written before the loop, read inside it.
+    Array<Buffer> hoist;
+    for (const Buffer &buffer : op->alloc_buffers) {
+      const std::string &scope = buffer.scope();
+      if (scope == "shared" || scope == "shared.dyn") {
+        hoist.push_back(buffer);
+      }
+    }
+    for (const Buffer &buffer : hoist) {
+      hoisted_allocs_.insert(buffer.get());
+    }
     // Values bound outside a loop cannot cross the new region boundary
     // (VPTO treats vecscope-region data as region-local): leave such regions
     // alone instead of splitting them.
@@ -581,7 +668,20 @@ private:
     if (!outer_binds.empty()) {
       for (size_t idx : carriers) {
         if (UsesAnyVar(stmts[idx], outer_binds)) {
-          return Stmt();
+          // Fail-closed (B.7): the loop must be split — its iterations carry
+          // a buffer through UB, and one vecscope has no ordering point — but
+          // a bind from a sibling statement blocks moving the loop across the
+          // new region boundary. Converting the region as a whole is the
+          // unreliable shape (the same one Plan A exists to avoid), so reject
+          // instead of silently emitting it.
+          LOG(FATAL)
+              << "[VectorizeParallelToPTO] the serial loop at region offset "
+              << idx
+              << " carries a UB buffer across iterations but reads a value "
+                 "bound outside the loop; the vecscope split cannot move such "
+                 "a bind across the new region boundary. Compute that value "
+                 "inside the loop (or drop the bind) so the loop can be "
+                 "hoisted out of the region.";
         }
       }
     }
@@ -603,7 +703,13 @@ private:
       out.push_back(tail_region);
     }
     LOG(INFO) << "[split] vecscope split: carriers=" << carriers.size()
-              << " parts=" << out.size();
+              << " parts=" << out.size() << " hoisted=" << hoist.size();
+    hoisted_allocs_.clear();
+    // Hand the hoisted allocations to the enclosing block (consumed by its
+    // VisitStmt_); the parts no longer declare them.
+    for (const Buffer &buffer : hoist) {
+      pending_parent_allocs_.push_back(buffer);
+    }
     return SeqStmt::Flatten(out);
   }
 
@@ -2297,6 +2403,12 @@ private:
   // WrapCarryAllocIfLocal.
   std::unordered_map<const BufferNode *, tirx::Buffer> lane_scalar_vregs_;
   std::vector<tirx::Buffer> lane_scalar_allocs_;
+  // P1 (region-local split carry): UB allocations hoisted out of a split
+  // region while its parts are being built (they must not be re-declared by
+  // any part), and the hand-off list consumed by the enclosing block's
+  // VisitStmt_ once the split completes.
+  std::set<const BufferNode *> hoisted_allocs_;
+  Array<Buffer> pending_parent_allocs_;
   int tmp_counter_ = 0;
   Map<Var, PrimExpr> bind_env_; // analysis env: original var -> def expr
   Map<Var, Var> value_map_;     // value env: original var -> converted var
