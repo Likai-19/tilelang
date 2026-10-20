@@ -789,6 +789,14 @@ private:
     // cross-iteration dependencies.
     std::unordered_map<const BufferNode *, std::pair<int, int>> counts;
     for (const auto &acc : collector.accesses) {
+      // A per-lane scalar is a register, not a memory carry: its in-shell
+      // update is promoted to the vreg by ConvertBody, so it never needs a
+      // UB round-trip promotion (and must not be counted as the carried
+      // buffer, whose post-shell isolation check would then reject the
+      // legitimate reads of the final value).
+      if (IsLaneScalar(acc.buf)) {
+        continue;
+      }
       auto &c = counts[acc.buf];
       if (acc.is_store) {
         ++c.second;
@@ -921,11 +929,56 @@ private:
     return s;
   }
 
+  // ------------------------------------------------------------------
+  // Per-lane scalar promotion (`T.alloc_var` in a Parallel unit)
+  // ------------------------------------------------------------------
+  // `T.alloc_var(dtype)` is a single-element `local.var` buffer. Every lane
+  // owns its own copy, so the buffer is a per-lane register rather than a
+  // lane-addressed memory object; Vectorize reads and writes it as a
+  // `local.var` vector (vreg) so the value stays in RF and a carried update
+  // inside a preserved shell becomes an ordinary SSA loop carry.
+  static bool IsLaneScalar(const Buffer &buffer) {
+    if (buffer.scope() != "local.var") {
+      return false;
+    }
+    if (buffer->shape.size() != 1) {
+      return false;
+    }
+    const auto *extent = buffer->shape[0].as<IntImmNode>();
+    return extent != nullptr && extent->value == 1;
+  }
+
+  static bool IsLaneScalar(const BufferNode *buffer) {
+    return buffer != nullptr && IsLaneScalar(GetRef<Buffer>(buffer));
+  }
+
+  // Create (once per unit) the vreg backing a per-lane scalar.
+  tirx::Buffer LaneScalarVreg(const Buffer &buffer) {
+    auto it = lane_scalar_vregs_.find(buffer.get());
+    if (it != lane_scalar_vregs_.end()) {
+      return it->second;
+    }
+    tirx::Buffer vreg = tirx::decl_buffer(
+        {IntImm(DataType::Int(32), 1)}, VectorDType(buffer->dtype, lanes_),
+        std::string(buffer->name) + "_lane", "local.var");
+    lane_scalar_vregs_[buffer.get()] = vreg;
+    lane_scalar_allocs_.push_back(vreg);
+    return vreg;
+  }
+
   // Region-level promotion owns the vreg allocation (one per region, before
   // the loop); a unit must never allocate it again inside the loop, otherwise
   // the PTODSL emission splits the carried value into two Python names and
   // the loop-carried ssa value is lost.
   Stmt WrapCarryAllocIfLocal(Stmt s) {
+    // Per-lane scalar vregs are declared at the same place as the carry vreg:
+    // inside the unit, outside the shell, so a carried update binds to one
+    // SSA name. Reversed so the first created vreg ends up outermost.
+    for (auto it = lane_scalar_allocs_.rbegin(); it != lane_scalar_allocs_.rend();
+         ++it) {
+      s = SeqStmt::Flatten(AllocBuffer(*it), std::move(s));
+    }
+    lane_scalar_allocs_.clear();
     if (unit_carry_from_region_) {
       carry_active_ = false;
       return s;
@@ -1241,6 +1294,8 @@ private:
     bind_env_.clear();
     value_map_.clear();
     tmp_counter_ = 0;
+    lane_scalar_vregs_.clear();
+    lane_scalar_allocs_.clear();
     // Keep the complete mapping (2D fields included) for the
     // per-access analysis calls in ConvertBody.
     unit_mapping_ = mapping;
@@ -1500,6 +1555,28 @@ private:
       return;
     }
     if (const auto *store = body.as<BufferStoreNode>()) {
+      // Per-lane scalar (T.alloc_var): the whole-buffer store becomes a write
+      // to the vreg. A scalar value is broadcast over the lanes; a vector
+      // value (a lane-varying load) is stored as-is.
+      if (IsLaneScalar(store->buffer)) {
+        Array<Stmt> pre;
+        PrimExpr value = ConvertExpr(store->value, &pre);
+        if (value.dtype().lanes() == 1) {
+          value = EmitBind(
+              "vbrc_lane",
+              Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"), {value},
+                   {{"size",
+                     IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+              &pre);
+        }
+        tirx::Buffer vreg = LaneScalarVreg(store->buffer);
+        for (const auto &s : pre) {
+          out->push_back(s);
+        }
+        out->push_back(BufferStore(vreg, value,
+                                   {make_zero(DataType::Int(32))}));
+        return;
+      }
       if (carry_seed_ != nullptr && store == carry_seed_) {
         // Seed of the promoted carry: forward the value into the vreg
         // buffer instead of storing to UB, so the shell's loads never
@@ -1697,6 +1774,11 @@ private:
   // ------------------------------------------------------------------
   PrimExpr ConvertExpr(const PrimExpr &expr, Array<Stmt> *pre) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
+      // Per-lane scalar (T.alloc_var): read the vreg that carries its value.
+      if (IsLaneScalar(load->buffer)) {
+        return BufferLoad(LaneScalarVreg(load->buffer),
+                          {make_zero(DataType::Int(32))});
+      }
       if (carry_active_ && IsCarryAccess(load->buffer, load->indices)) {
         // Promoted carry read: the value lives in the vreg buffer.
         return BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))});
@@ -2207,6 +2289,14 @@ private:
   // Region-level carry matches any single lane Var index (each unit has its
   // own Parallel loop var), not one fixed expression.
   bool carry_lane_var_match_ = false;
+  // Per-lane scalar promotion (`T.alloc_var` inside a Parallel unit). The
+  // single-element `local.var` buffer is a private register per lane, so each
+  // whole-buffer access becomes a `local.var` vector (vreg) access: the seed
+  // store broadcasts, later loads/stores reference the same vreg. Keyed by the
+  // source buffer node; the vregs are declared at unit scope by
+  // WrapCarryAllocIfLocal.
+  std::unordered_map<const BufferNode *, tirx::Buffer> lane_scalar_vregs_;
+  std::vector<tirx::Buffer> lane_scalar_allocs_;
   int tmp_counter_ = 0;
   Map<Var, PrimExpr> bind_env_; // analysis env: original var -> def expr
   Map<Var, Var> value_map_;     // value env: original var -> converted var

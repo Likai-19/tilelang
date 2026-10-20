@@ -1090,6 +1090,24 @@ std::pair<int64_t, int64_t> CheckedPaddingForInference(int64_t extent,
   }
 }
 
+// `T.alloc_var` materialises a single-element `local.var` buffer. Inside a
+// converting Parallel unit that buffer is a per-lane register: every lane
+// owns its own copy, so its element address is (always) the same constant and
+// carries no lane-address class. VectorizeParallelToPTO promotes the
+// whole-buffer read/write pair to a `local.var` vector (vreg), so the
+// continuous/lane-uniform classification does not apply here and must be
+// skipped instead of rejecting the access as a lane-uniform store.
+bool IsLaneScalarBuffer(const Buffer &buffer) {
+  if (buffer.scope() != "local.var") {
+    return false;
+  }
+  if (buffer->shape.size() != 1) {
+    return false;
+  }
+  const auto *extent = buffer->shape[0].as<IntImmNode>();
+  return extent != nullptr && extent->value == 1;
+}
+
 int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
                          int64_t M, int64_t N, int64_t lanes,
                          std::string *why) {
@@ -1119,6 +1137,11 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
     Var q("probe_q", dt);
     PrimExpr sel_expr = q * IntImm(dt, lanes) + lane;
     for (const auto &access : collector.accesses) {
+      // Per-lane register (T.alloc_var): no lane-address classification; the
+      // whole-buffer form is promoted to a vreg by VectorizeParallelToPTO.
+      if (IsLaneScalarBuffer(access.buffer)) {
+        continue;
+      }
       // Resolve Bind aliases per index with the shared resolver (cycle /
       // depth / loaded-value failure, 4096-node budget, error conversion)
       // against this access's program-point environment, then apply the

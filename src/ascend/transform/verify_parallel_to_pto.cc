@@ -260,8 +260,30 @@ private:
             << buffer->name << "` has scope global); stage through UB first";
         parent_->Fail("memory access", oss.str());
       }
-      // Only UB accesses are currently supported. local /
-      // local.fragment / shared.l1 (L1) and other scopes are rejected.
+      // Per-lane scalar register: `T.alloc_var` lowers to a single-element
+      // `local.var` buffer. Inside a converting unit it is a private register
+      // per lane, and VectorizeParallelToPTO promotes the whole-buffer form to
+      // a `local.var` vector (vreg), so no UB scope / address classification
+      // applies. Region-level accesses have no promotion path and stay
+      // rejected.
+      if (scope == "local.var") {
+        const bool scalar_form =
+            buffer->shape.size() == 1 &&
+            [&]() {
+              const auto *extent = buffer->shape[0].as<IntImmNode>();
+              return extent != nullptr && extent->value == 1;
+            }();
+        if (!scalar_form || !inside_parallel_unit_) {
+          std::ostringstream oss;
+          oss << "buffer `" << buffer->name << "` has scope `local.var`; only "
+                 "a single-element local.var inside a converting T.Parallel "
+                 "unit (T.alloc_var) is supported";
+          parent_->Fail("memory access", oss.str());
+        }
+        return;
+      }
+      // The remaining scopes only support UB accesses. local /
+      // local.var / shared.l1 (L1) and other scopes are rejected.
       if (scope != "shared" && scope != "shared.dyn") {
         std::ostringstream oss;
         oss << "buffer `" << buffer->name << "` has scope `" << scope
@@ -971,6 +993,23 @@ private:
                  "load/store is not yet supported";
           parent_->Fail("memory access", oss.str());
         }
+      }
+      // Per-lane scalar (T.alloc_var): a single-element local.var buffer that
+      // VectorizeParallelToPTO promotes to a local.var vector (vreg). It is a
+      // private register per lane, so no lane-address pattern applies and the
+      // lane-uniform-store rule (aimed at UB writes) must not reject it.
+      if (buffer.scope() == "local.var") {
+        const auto *extent =
+            buffer->shape.size() == 1 ? buffer->shape[0].as<IntImmNode>()
+                                      : nullptr;
+        if (extent == nullptr || extent->value != 1) {
+          std::ostringstream oss;
+          oss << "buffer `" << buffer->name
+              << "` has scope `local.var` with a non-single-element shape; "
+                 "only T.alloc_var scalars are supported";
+          parent_->Fail("memory access", oss.str());
+        }
+        return;
       }
       try {
         auto access = pto_analysis::AnalyzeBufferAccess(
