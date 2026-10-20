@@ -384,17 +384,37 @@ private:
         pto_analysis::InvertPtoLaneLayout(scan.units[0]).lanes;
     std::vector<Stmt> stmts;
     FlattenTopStmts(region, &stmts);
+    // Exactly-one-match rule, identical to AnalyzeRegionCarry: several serial
+    // loops may wrap units (sv7v has a fill loop and an accumulate loop), and
+    // only a single matching carrier may be promoted. If two loops match, the
+    // promotion would be ambiguous — AnalyzeRegionCarry then promotes nothing,
+    // so reporting `true` here would keep the whole region in one vecscope and
+    // leave both carriers on the unreliable plain path. Returning false hands
+    // the region to Plan A, which splits every carrier.
+    int matches = 0;
     for (const Stmt &s : stmts) {
       const auto *f = s.as<ForNode>();
       if (f == nullptr || f->kind != ForKind::kSerial) {
         continue;
       }
+      // Same candidate set as AnalyzeRegionCarry: a serial loop that wraps at
+      // least one parallel unit.
+      bool wraps_unit = false;
+      for (const For &u : scan.units) {
+        if (StmtHasFor(f->body, u.get())) {
+          wraps_unit = true;
+          break;
+        }
+      }
+      if (!wraps_unit) {
+        continue;
+      }
       RegionCarry scratch;
-      if (TryRegionCarry(f, stmts, scan, lanes, &scratch)) {
-        return true;
+      if (TryRegionCarry(f, stmts, scan, lanes, &scratch) && ++matches > 1) {
+        return false;
       }
     }
-    return false;
+    return matches == 1;
   }
 
   // Convert one SIMD_VF region body: mask plan, carry promotion, units.
@@ -578,34 +598,37 @@ private:
     const auto *fn = loop.as<ForNode>();
     std::vector<Stmt> stmts;
     FlattenTopStmts(fn->body, &stmts);
-    size_t nested_pos = stmts.size();
+    // Every sibling serial loop that carries a buffer through UB must get its
+    // own region: leaving two of them in one vecscope has no ordering point
+    // between their iterations (the plain path this split exists to avoid).
+    std::vector<size_t> nested;
     for (size_t i = 0; i < stmts.size(); ++i) {
       const auto *f = stmts[i].as<ForNode>();
       if (f != nullptr && f->kind == ForKind::kSerial &&
           SubtreeCarriesThroughUb(f->body)) {
-        if (nested_pos != stmts.size()) {
-          nested_pos = stmts.size();  // ambiguous: fall back to one region
-          break;
-        }
-        nested_pos = i;
+        nested.push_back(i);
       }
     }
     Array<Stmt> body;
-    if (nested_pos < stmts.size()) {
-      std::vector<Stmt> pre(stmts.begin(), stmts.begin() + nested_pos);
-      std::vector<Stmt> post(stmts.begin() + nested_pos + 1, stmts.end());
-      Stmt pre_region = MakeRegion(proto, pre, scope_attr);
-      if (pre_region.defined()) {
-        body.push_back(pre_region);
+    if (nested.empty()) {
+      body.push_back(MakeRegion(proto, stmts, scope_attr));
+    } else {
+      size_t cursor = 0;
+      for (size_t idx : nested) {
+        std::vector<Stmt> pre(stmts.begin() + cursor, stmts.begin() + idx);
+        Stmt pre_region = MakeRegion(proto, pre, scope_attr);
+        if (pre_region.defined()) {
+          body.push_back(pre_region);
+        }
+        body.push_back(TransformCarryLoop(
+            GetRef<For>(stmts[idx].as<ForNode>()), proto, scope_attr));
+        cursor = idx + 1;
       }
-      body.push_back(TransformCarryLoop(
-          GetRef<For>(stmts[nested_pos].as<ForNode>()), proto, scope_attr));
+      std::vector<Stmt> post(stmts.begin() + cursor, stmts.end());
       Stmt post_region = MakeRegion(proto, post, scope_attr);
       if (post_region.defined()) {
         body.push_back(post_region);
       }
-    } else {
-      body.push_back(MakeRegion(proto, stmts, scope_attr));
     }
     return For(fn->loop_var, fn->min, fn->extent, ForKind::kSerial,
                SeqStmt::Flatten(body));
@@ -702,7 +725,7 @@ private:
     if (tail_region.defined()) {
       out.push_back(tail_region);
     }
-    LOG(INFO) << "[split] vecscope split: carriers=" << carriers.size()
+    VLOG(1) << "[split] vecscope split: carriers=" << carriers.size()
               << " parts=" << out.size() << " hoisted=" << hoist.size();
     hoisted_allocs_.clear();
     // Hand the hoisted allocations to the enclosing block (consumed by its
@@ -1239,14 +1262,27 @@ private:
       }
       ShellAccessCollector ua;
       ua(static_cast<const Stmt &>(u.as<ForNode>()->body));
+      // The carried index must be this unit's own lane variable. A bare Var is
+      // not enough: `m_ub[t]` (t an enclosing serial variable) is also a
+      // single-Var index and passes Verify as a lane-uniform load, but
+      // redirecting it to the vreg would turn one lane's value into a
+      // whole-vector read — a silent semantic error.
+      std::set<const VarNode *> unit_vars;
+      unit_vars.insert(u->loop_var.get());
+      if (const auto *inner_par = u->body.as<ForNode>()) {
+        if (inner_par->kind == ForKind::kParallel) {
+          unit_vars.insert(inner_par->loop_var.get());
+        }
+      }
       int stores = 0;
       int loads = 0;
       for (const auto &a : ua.accesses) {
         if (a.buf != carried) {
           continue;
         }
-        if (a.indices.size() != 1 ||
-            a.indices[0].as<VarNode>() == nullptr) {
+        const auto *iv = a.indices.size() == 1 ? a.indices[0].as<VarNode>()
+                                               : nullptr;
+        if (iv == nullptr || unit_vars.count(iv) == 0) {
           return false;
         }
         a.is_store ? ++stores : ++loads;
@@ -1371,7 +1407,7 @@ private:
       region_carry_ = rc;
     }
     if (region_carry_.active) {
-      LOG(INFO) << "[rc] ACCEPT carry buffer " << region_carry_.src->name;
+      VLOG(1) << "[rc] ACCEPT carry buffer " << region_carry_.src->name;
     }
   }
 
@@ -1476,7 +1512,7 @@ private:
       carry_vreg_ = region_carry_.vreg;
       carry_lane_var_match_ = true;
       carry_active_ = true;
-      LOG(INFO) << "[rc] unit matched region carry, seed="
+      VLOG(1) << "[rc] unit matched region carry, seed="
                 << (loop.get() == region_carry_.seed);
     } else {
       // Loop shells: analyze the unit body for preserved serial loops
