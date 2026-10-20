@@ -159,6 +159,8 @@ private:
       }
       StmtExprVisitor::VisitExpr_(op);
     }
+    bool inside_parallel_unit() const { return parallel_depth_ > 0; }
+
     void VisitExpr_(const CallNode *op) final {
       if (const auto *op_node = op->op.as<OpNode>()) {
         std::string name = op_node->name;
@@ -236,7 +238,15 @@ private:
         oss << ")";
         parent_->Fail("region", oss.str());
       }
+      // Track unit scope: a nested Parallel (2D unit) stays inside the unit.
+      const bool parallel = op->kind == ForKind::kParallel;
+      if (parallel) {
+        ++parallel_depth_;
+      }
       StmtExprVisitor::VisitStmt_(op);
+      if (parallel) {
+        --parallel_depth_;
+      }
     }
 
   private:
@@ -273,7 +283,7 @@ private:
               const auto *extent = buffer->shape[0].as<IntImmNode>();
               return extent != nullptr && extent->value == 1;
             }();
-        if (!scalar_form || !inside_parallel_unit_) {
+        if (!scalar_form || !inside_parallel_unit()) {
           std::ostringstream oss;
           oss << "buffer `" << buffer->name << "` has scope `local.var`; only "
                  "a single-element local.var inside a converting T.Parallel "
@@ -300,6 +310,7 @@ private:
       }
     }
     VerifyParallelToPTOImpl *parent_;
+    int parallel_depth_ = 0;
   };
 
   // ------------------------------------------------------------------

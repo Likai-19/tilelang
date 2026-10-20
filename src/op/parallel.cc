@@ -1304,10 +1304,13 @@ ParallelOpNode::InferPtoSimdLayout(const LayoutInferArgs &layout_args) const {
         << " for loop " << iv->var->name_hint;
     extents.push_back(*ext);
   }
-  ICHECK(loop_vars_.size() == 1u || loop_vars_.size() == 2u)
-      << "[PTO layout inference] supports a 1D T.Parallel or a two-layer "
-         "Parallel nest; got "
-      << loop_vars_.size() << " layers";
+  if (loop_vars_.size() != 1u && loop_vars_.size() != 2u) {
+    // User-facing: an unsupported input shape, not an internal invariant.
+    LOG(FATAL) << "[PTO layout inference] a T.Parallel nest with "
+               << loop_vars_.size()
+               << " layers is not supported; flatten it to 1D or split it "
+                  "into at most two tightly nested T.Parallel units";
+  }
 
   // 1D mapping: t = i, lane = i % L,
   // forward_index = [i // L]. A non-divisible extent E is padded to
