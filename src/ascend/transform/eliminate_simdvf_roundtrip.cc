@@ -73,11 +73,6 @@ namespace pto_analysis = ::tvm::tl::pto;
 
 namespace {
 
-/*! Iteration budget for the rewrite loop. Each rule deletes exactly one
- * top-level statement, so the loop is bounded by the region size; the guard
- * only protects against an unexpected non-shrinking rewrite. */
-constexpr int kMaxRewriteRounds = 64;
-
 Stmt NoOpStmt() { return Evaluate(make_zero(DataType::Int(32))); }
 
 void FlattenSeq(const Stmt &stmt, std::vector<Stmt> *out) {
@@ -396,7 +391,7 @@ class RegionLocalityScan final : public StmtExprVisitor {
 
  private:
   void VisitStmt_(const SBlockNode *op) final {
-    if (op->name_hint == "SIMD_VF") {
+    if (op->name_hint == pto_analysis::kSimdVfBlockName) {
       const SBlockNode *prev = current_;
       current_ = op;
       StmtExprVisitor::VisitStmt_(op);
@@ -440,7 +435,7 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {
-    if (op->name_hint != "SIMD_VF") {
+    if (op->name_hint != pto_analysis::kSimdVfBlockName) {
       return StmtExprMutator::VisitStmt_(op);
     }
     Stmt region = op->body;
@@ -456,7 +451,14 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
  private:
   Stmt EliminateInRegion(const Stmt &region, const SBlockNode *block) {
     Stmt current = region;
-    for (int round = 0; round < kMaxRewriteRounds; ++round) {
+    // Iteration budget: each rule deletes exactly one top-level statement
+    // (the copy unit is erased and its neighbour replaced in place), so the
+    // initial statement count is a correct upper bound on the number of
+    // rounds — it never silently truncates a region with many round trips
+    // (the previous fixed cap of 64 could). The budget only guards against
+    // an unexpected non-shrinking rewrite.
+    const int max_rounds = static_cast<int>(RegionStatements(region).size());
+    for (int round = 0; round < max_rounds; ++round) {
       RegionModel model = BuildRegionModel(current);
       Stmt next;
       if (TryForwardRetarget(model, block, &next)) {
@@ -473,13 +475,13 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
   }
 
   bool DeclaredAndLocal(const UnitShape &unit, const SBlockNode *block,
-                        std::unordered_set<const VarNode *> *declared) const {
+                        const std::unordered_set<const VarNode *> &declared) const {
     if (!unit.exists || !unit.one_store || !unit.store_identity ||
         !unit.store_unpredicated) {
       return false;
     }
     const VarNode *t = unit.store->buffer->data.get();
-    return declared->count(t) != 0 && locality_.LocalTo(t, block);
+    return declared.count(t) != 0 && locality_.LocalTo(t, block);
   }
 
   /*! True when every load recorded for the buffer belongs to one unit. The
@@ -503,6 +505,42 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
     return declared;
   }
 
+  /*! The shared guard of the two rules over one adjacent producer /
+   * consumer pair: the producer's buffer T is written by exactly one
+   * unpredicated identity store (the producer itself, on a declared
+   * region-local buffer), both units are 1D and divisible with equal
+   * extents, and T is read only by the consumer (identity loads, no
+   * other use, nothing predicated). Returns T's data var when every
+   * shared guard passes, nullptr otherwise; the rule-specific checks
+   * (each side's copy shape and the OUT/S records) stay with the
+   * callers. */
+  const VarNode *MatchAdjacentTempPair(
+      const UnitShape &producer, const UnitShape &consumer,
+      const SBlockNode *block,
+      const std::unordered_set<const VarNode *> &declared,
+      const RegionModel &model) const {
+    if (!DeclaredAndLocal(producer, block, declared)) {
+      return nullptr;
+    }
+    if (!producer.one_d || !producer.divisible || !consumer.one_d ||
+        !consumer.divisible || producer.extent != consumer.extent) {
+      return nullptr;
+    }
+    const VarNode *t = producer.store->buffer->data.get();
+    auto tit = model.access.find(t);
+    if (tit == model.access.end()) {
+      return nullptr;
+    }
+    const BufferAccessRecord &t_rec = tit->second;
+    if (t_rec.predicated || t_rec.other != 0 || t_rec.loads < 1 ||
+        !t_rec.loads_identity || t_rec.stores != 1 ||
+        t_rec.store_units[0] != producer.ordinal ||
+        !AllLoadsIn(t_rec, consumer.ordinal)) {
+      return nullptr;
+    }
+    return t;
+  }
+
   /*! Store forwarding: `T[i] = expr` + adjacent `OUT[i] = T[i]` ->
    * `OUT[i] = expr`. */
   bool TryForwardRetarget(const RegionModel &model, const SBlockNode *block,
@@ -514,33 +552,22 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
       if (producer == nullptr || consumer == nullptr) {
         continue;
       }
-      if (!DeclaredAndLocal(*producer, block, &declared) ||
-          !consumer->one_store || !consumer->store_identity ||
+      // This rule's shape: the consumer is the pure copy `OUT[i] = T[i]`.
+      if (!consumer->one_store || !consumer->store_identity ||
           !consumer->store_unpredicated || !consumer->pure_copy) {
         continue;
       }
-      if (!producer->one_d || !producer->divisible || !consumer->one_d ||
-          !consumer->divisible || producer->extent != consumer->extent) {
+      const VarNode *t =
+          MatchAdjacentTempPair(*producer, *consumer, block, declared, model);
+      if (t == nullptr) {
         continue;
       }
-      const VarNode *t = producer->store->buffer->data.get();
       if (consumer->copy_source->data.get() != t) {
         continue;
       }
       Buffer out_buffer = consumer->store->buffer;
       const VarNode *o = out_buffer->data.get();
       if (o == t || out_buffer->dtype != producer->store->buffer->dtype) {
-        continue;
-      }
-      auto tit = model.access.find(t);
-      if (tit == model.access.end()) {
-        continue;
-      }
-      const BufferAccessRecord &t_rec = tit->second;
-      if (t_rec.predicated || t_rec.other != 0 || t_rec.loads < 1 ||
-          !t_rec.loads_identity || t_rec.stores != 1 ||
-          t_rec.store_units[0] != producer->ordinal ||
-          !AllLoadsIn(t_rec, consumer->ordinal)) {
         continue;
       }
       // `OUT` carries exactly the consumer's copy and nothing else in the
@@ -575,27 +602,17 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
       if (producer == nullptr || consumer == nullptr) {
         continue;
       }
-      if (!DeclaredAndLocal(*producer, block, &declared) || !producer->pure_copy) {
+      // This rule's shape: the producer is the pure copy `T[i] = S[i]`.
+      if (!producer->pure_copy) {
         continue;
       }
-      if (!producer->one_d || !producer->divisible || !consumer->one_d ||
-          !consumer->divisible || producer->extent != consumer->extent) {
+      const VarNode *t =
+          MatchAdjacentTempPair(*producer, *consumer, block, declared, model);
+      if (t == nullptr) {
         continue;
       }
-      const VarNode *t = producer->store->buffer->data.get();
       const VarNode *s = producer->copy_source->data.get();
       if (s == t || producer->copy_source->dtype != producer->store->buffer->dtype) {
-        continue;
-      }
-      auto tit = model.access.find(t);
-      if (tit == model.access.end()) {
-        continue;
-      }
-      const BufferAccessRecord &t_rec = tit->second;
-      if (t_rec.predicated || t_rec.other != 0 || t_rec.loads < 1 ||
-          !t_rec.loads_identity || t_rec.stores != 1 ||
-          t_rec.store_units[0] != producer->ordinal ||
-          !AllLoadsIn(t_rec, consumer->ordinal)) {
         continue;
       }
       // Reading `S` at the consumer must observe the value the copy captured:

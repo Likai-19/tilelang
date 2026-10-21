@@ -15,6 +15,7 @@
 #include <functional>
 #include <set>
 #include <sstream>
+#include <utility>
 
 namespace tvm {
 namespace tl {
@@ -39,6 +40,52 @@ std::string AccessPatternToString(AccessPattern pattern) {
 // SubstituteVar, ResolveIndexAliases and IsSupportedAddressExpr moved to
 // src/op/pto_index_analysis.cc: the layout-planning code in
 // src/op and the consumers here share that single implementation.
+
+// ---------------------------------------------------------------------------
+// Shared frontend-op-name -> VMI-op-name tables: one table per concept so
+// the expression whitelist, the lane-use classification and the pass-side
+// dispatch (Verify admission / Vectorize rewriting) cannot drift apart.
+// ---------------------------------------------------------------------------
+
+const char *MaskLogicVmiOpName(const std::string &tir_op_name) {
+  // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
+  // tirx.bitwise_* calls (plus the tir.bitwise_* and tir.And/Or/Not
+  // spellings); Vectorize rewrites them to the mapped mask op.
+  static const std::pair<const char *, const char *> kMaskLogicTable[] = {
+      {"tirx.bitwise_and", "mask_and"},
+      {"tir.bitwise_and", "mask_and"},
+      {"tir.And", "mask_and"},
+      {"tirx.bitwise_or", "mask_or"},
+      {"tir.bitwise_or", "mask_or"},
+      {"tir.Or", "mask_or"},
+      {"tirx.bitwise_not", "mask_not"},
+      {"tir.bitwise_not", "mask_not"},
+      {"tir.Not", "mask_not"},
+  };
+  for (const auto &entry : kMaskLogicTable) {
+    if (tir_op_name == entry.first) {
+      return entry.second;
+    }
+  }
+  return nullptr;
+}
+
+const char *VectorUnaryVmiOpName(const std::string &tirx_op_name) {
+  // Hardware-backed unary math: fabs/exp/log/sqrt map to the VMI
+  // vabs/vexp/vln/vsqrt instructions.
+  static const std::pair<const char *, const char *> kUnaryMathTable[] = {
+      {"tirx.fabs", "vabs"},
+      {"tirx.exp", "vexp"},
+      {"tirx.log", "vln"},
+      {"tirx.sqrt", "vsqrt"},
+  };
+  for (const auto &entry : kUnaryMathTable) {
+    if (tirx_op_name == entry.first) {
+      return entry.second;
+    }
+  }
+  return nullptr;
+}
 
 PtoInverseMapping InvertPtoLaneLayout(const For &loop) {
   auto anno = loop->annotations.Get(attr::kPtoParallelLoopLayout);
@@ -632,11 +679,9 @@ public:
       const std::string &name = call_op.value()->name;
       // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
       // tirx.bitwise_* (not And/Or/Not nodes). Verify admits them; Vectorize
-      // rewrites them to mask_and/mask_or/mask_not.
-      if (name == "tirx.bitwise_and" || name == "tirx.bitwise_or" ||
-          name == "tirx.bitwise_not" || name == "tir.bitwise_and" ||
-          name == "tir.bitwise_or" || name == "tir.bitwise_not" ||
-          name == "tir.And" || name == "tir.Or" || name == "tir.Not") {
+      // rewrites them to mask_and/mask_or/mask_not (the shared
+      // MaskLogicVmiOpName table).
+      if (MaskLogicVmiOpName(name) != nullptr) {
         for (const auto &arg : op->args) {
           VisitExpr(arg);
         }
@@ -649,10 +694,10 @@ public:
         return;
       }
       // Hardware-backed unary math. fabs/exp/log/sqrt map to the VMI
-      // vabs/vexp/vln/vsqrt instructions; the dtype matrix mirrors the
-      // ISA documentation (see IsSupportedVectorUnaryOp).
-      if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
-          name == "tirx.sqrt") {
+      // vabs/vexp/vln/vsqrt instructions (the shared VectorUnaryVmiOpName
+      // table); the dtype matrix mirrors the ISA documentation (see
+      // IsSupportedVectorUnaryOp).
+      if (VectorUnaryVmiOpName(name) != nullptr) {
         if (op->args.size() != 1U) {
           if (!unsupported.has_value()) {
             unsupported = name + " expects exactly one operand";
@@ -857,6 +902,42 @@ PtoRegionScan ScanPtoRegion(const Stmt &region) {
   return scan;
 }
 
+bool IsNoOpStmt(const Stmt &stmt) {
+  // A no-op statement carries no work: an Evaluate of an IntImm constant
+  // (e.g. a simplified identity else store; treating it as "no else"
+  // yields the correct masked-update form), an empty SeqStmt, or a SeqStmt
+  // whose every element is itself a no-op. One shared implementation so
+  // the branch shapes Verify admits are exactly the ones Legalize
+  // rewrites.
+  if (const auto *eval = stmt.as<EvaluateNode>()) {
+    return eval->value.as<IntImmNode>() != nullptr;
+  }
+  if (const auto *seq = stmt.as<SeqStmtNode>()) {
+    for (const Stmt &s : seq->seq) {
+      if (!IsNoOpStmt(s)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+bool RegionContainsParallel(const Stmt &body) {
+  bool found = false;
+  PostOrderVisit(body, [&](const ObjectRef &node) {
+    if (found) {
+      return;
+    }
+    if (const auto *for_node = node.as<ForNode>()) {
+      if (for_node->kind == ForKind::kParallel) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
 std::string LaneUseToString(LaneUse use) {
   switch (use) {
   case LaneUse::kUniform:
@@ -983,12 +1064,12 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     }
   }
   // Hardware-backed unary math shares the whitelist's contract (float32
-  // tirx.fabs/exp/log/sqrt): recurse into the single operand.
+  // tirx.fabs/exp/log/sqrt; the shared VectorUnaryVmiOpName table):
+  // recurse into the single operand.
   if (const auto *call = expr.as<CallNode>()) {
     if (auto call_op = call->op.as<Op>()) {
       const std::string &name = call_op.value()->name;
-      if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
-          name == "tirx.sqrt") {
+      if (VectorUnaryVmiOpName(name) != nullptr) {
         return AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
       }
     }
@@ -1092,10 +1173,7 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
       name = op_node->name;
     }
     auto is_mask_logic = [&](const std::string &n) {
-      return n == "tirx.bitwise_and" || n == "tirx.bitwise_or" ||
-             n == "tirx.bitwise_not" || n == "tir.bitwise_and" ||
-             n == "tir.bitwise_or" || n == "tir.bitwise_not" ||
-             n == "tir.And" || n == "tir.Or" || n == "tir.Not";
+      return MaskLogicVmiOpName(n) != nullptr;
     };
     if (is_mask_logic(name)) {
       if (call->args.empty()) {
@@ -1167,19 +1245,19 @@ LaneUse AnalyzeLaneUseMeta(const PrimExpr &expr, LaneUseContext *ctx,
 bool IsSupportedVectorUnaryOp(const std::string &tirx_op, DataType dtype) {
   // Per the VMI ISA documentation: vabs admits f16/bf16/f32 (the vabs
   // instruction also takes si8/si16/si32, but the frontend abs() lowers
-  // integers to Select — PR-2 territory — and returns unsigned inputs
-  // unchanged, so integer dtypes never reach this gate); vexp/vln/vsqrt
-  // admit f16/f32 only.
+  // integers to Select and returns unsigned inputs unchanged, so integer
+  // dtypes never reach this gate); vexp/vln/vsqrt admit f16/f32 only.
+  // The op-name admission is the shared VectorUnaryVmiOpName table.
+  if (VectorUnaryVmiOpName(tirx_op) == nullptr) {
+    return false;
+  }
   const int bits = dtype.bits();
   if (tirx_op == "tirx.fabs") {
     return (dtype.is_float() || dtype.is_bfloat16()) &&
            (bits == 16 || bits == 32);
   }
-  if (tirx_op == "tirx.exp" || tirx_op == "tirx.log" ||
-      tirx_op == "tirx.sqrt") {
-    return dtype.is_float() && (bits == 16 || bits == 32);
-  }
-  return false;
+  // The remaining mapped names (exp/log/sqrt).
+  return dtype.is_float() && (bits == 16 || bits == 32);
 }
 
 bool ExprUsesVar(const PrimExpr &expr, const VarNode *var) {

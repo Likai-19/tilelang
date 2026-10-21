@@ -36,6 +36,7 @@
 #include <sstream>
 #include <vector>
 
+#include "parallel_to_pto_utils.h"
 #include "support/check.h"
 
 #include "../target_utils.h"
@@ -67,8 +68,6 @@ bool SameAccess(const BufferStoreNode *a, const BufferStoreNode *b) {
   return true;
 }
 
-bool IsNoOpStmt(const Stmt &stmt);
-
 // Collect a flat list of BufferStores from a stmt (single store or Seq of
 // stores). Nested Seq allowed; anything that is neither store nor no-op aborts
 // collection.
@@ -78,7 +77,7 @@ bool CollectStores(const Stmt &stmt,
     out->push_back(store);
     return true;
   }
-  if (IsNoOpStmt(stmt)) {
+  if (pto::IsNoOpStmt(stmt)) {
     return true;
   }
   if (const auto *seq = stmt.as<SeqStmtNode>()) {
@@ -92,36 +91,14 @@ bool CollectStores(const Stmt &stmt,
   return false;
 }
 
-// Evaluate of a constant carries no work (e.g. a simplified identity else
-// store); treating it as "no else" yields the correct masked-update form.
-bool IsNoOpStmt(const Stmt &stmt) {
-  if (const auto *eval = stmt.as<EvaluateNode>()) {
-    if (eval->value.as<IntImmNode>()) {
-      return true;
-    }
-  }
-  if (const auto *seq = stmt.as<SeqStmtNode>()) {
-    if (seq->seq.empty()) {
-      return true;
-    }
-    for (const Stmt &s : seq->seq) {
-      if (!IsNoOpStmt(s)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  return false;
-}
-
-bool IsMaskLogicCall(const CallNode *call, const char *tail) {
+// True when \p call is one of the boolean mask-combine ops that
+// VectorizeParallelToPTO lowers to the VMI op \p vmi_name ("mask_and" /
+// "mask_or" / "mask_not"): the shared name table carries every admitted
+// spelling (tirx./tir. bitwise_* and tir.And|Or|Not).
+bool IsMaskLogicCall(const CallNode *call, const char *vmi_name) {
   if (const auto *op = call->op.as<OpNode>()) {
-    const std::string &name = op->name;
-    return name == std::string("tirx.") + tail ||
-           name == std::string("tir.") + tail ||
-           (std::string(tail) == "bitwise_and" && name == "tir.And") ||
-           (std::string(tail) == "bitwise_or" && name == "tir.Or") ||
-           (std::string(tail) == "bitwise_not" && name == "tir.Not");
+    const char *mapped = pto::MaskLogicVmiOpName(op->name);
+    return mapped != nullptr && std::string(mapped) == vmi_name;
   }
   return false;
 }
@@ -145,40 +122,25 @@ PrimExpr ExpandPredSelect(const PrimExpr &cond, const PrimExpr &tval,
     return ExpandPredSelect(notn->a, fval, tval);
   }
   if (const auto *call = cond.as<CallNode>()) {
-    if (IsMaskLogicCall(call, "bitwise_and") && call->args.size() == 2) {
+    if (IsMaskLogicCall(call, "mask_and") && call->args.size() == 2) {
       return ExpandPredSelect(
           call->args[0], ExpandPredSelect(call->args[1], tval, fval), fval);
     }
-    if (IsMaskLogicCall(call, "bitwise_or") && call->args.size() == 2) {
+    if (IsMaskLogicCall(call, "mask_or") && call->args.size() == 2) {
       return ExpandPredSelect(call->args[0], tval,
                               ExpandPredSelect(call->args[1], tval, fval));
     }
-    if (IsMaskLogicCall(call, "bitwise_not") && call->args.size() == 1) {
+    if (IsMaskLogicCall(call, "mask_not") && call->args.size() == 1) {
       return ExpandPredSelect(call->args[0], fval, tval);
     }
   }
   return Select(cond, tval, fval);
 }
 
-bool ContainsParallel(const Stmt &body) {
-  bool found = false;
-  PostOrderVisit(body, [&](const ObjectRef &node) {
-    if (found) {
-      return;
-    }
-    if (const auto *for_node = node.as<ForNode>()) {
-      if (for_node->kind == ForKind::kParallel) {
-        found = true;
-      }
-    }
-  });
-  return found;
-}
-
 class ControlFlowMutator : public StmtExprMutator {
 public:
   Stmt VisitStmt_(const SBlockNode *op) final {
-    if (op->name_hint != "SIMD_VF") {
+    if (op->name_hint != pto::kSimdVfBlockName) {
       // Enclosing blocks (root/tilelang_root/VECTOR/...) are traversed so the
       // SIMD_VF region is reached, but `in_simd_vf_` stays false: nothing
       // outside a converting region is rewritten.
@@ -188,7 +150,7 @@ public:
     // that holds a T.Parallel unit. A SIMD_VF block without T.Parallel
     // (hand-written VMI) is returned unchanged, so its Min/Max keep their
     // code shape.
-    if (!ContainsParallel(op->body)) {
+    if (!pto::RegionContainsParallel(op->body)) {
       return GetRef<Stmt>(op);
     }
     bool saved = in_simd_vf_;
