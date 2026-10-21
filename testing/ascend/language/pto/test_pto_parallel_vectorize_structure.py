@@ -372,10 +372,9 @@ def test_real_stride_addresses_survive_vectorization():
 
 @pytest.mark.pto
 def test_explicit_padding_legalizes_after_the_control_flow_stage():
-    """Stage-4 status: the explicit padding form
-    (``T.Parallel(P)`` with ``if i < E ... else ...``) used to be rejected
-    while LegalizeParallelToPTO was the stage-1 identity stub. With the
-    control-flow stage in place the guard is legalized into the Select form
+    """The explicit padding form
+    (``T.Parallel(P)`` with ``if i < E ... else ...``) is legalized
+    into the Select form by LegalizeParallelToPTO
     and the else branch survives (the detailed assertions live in
     ``test_simdvf_parallel_control_flow.py``)."""
 

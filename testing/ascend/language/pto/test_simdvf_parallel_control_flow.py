@@ -1,11 +1,11 @@
-"""Stage-4 PTO Parallel control-flow tests (Gate E, task 5).
+"""PTO Parallel control-flow tests.
 
 Hardware independent: each case lowers TileLang IR for the PTO target with
 :func:`tilelang.engine.lower.lower` and inspects the module produced by
 ``LegalizeParallelToPTO`` / the final lowering (no PTOAS/Bisheng device
 compile, no device execution unless the case is explicitly a numeric one).
 
-Expected contract after the stage-4 migration:
+Expected contract:
 
 * a lane-varying ``if`` / ``if``-``else`` under ``T.Parallel`` is rewritten by
   Legalize into the safe scalar ``Select`` form: both-arms stores become one
@@ -497,8 +497,7 @@ def test_boolean_mask_value_lowers_to_mask_and_and_vand():
 @pytest.mark.pto
 def test_lane_uniform_store_is_still_rejected():
     """A store whose address does not vary with the lane stays out of scope:
-    Verify rejects it and Legalize never materialises the PR262 scratch +
-    reducer specialization (registered as D1/D4-MIX)."""
+    Verify rejects it and Legalize never materialises a reducer for it."""
 
     E, lanes = 128, 128
 

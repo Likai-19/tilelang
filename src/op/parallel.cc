@@ -1093,10 +1093,10 @@ std::pair<int64_t, int64_t> CheckedPaddingForInference(int64_t extent,
 // `T.alloc_var` materialises a single-element `local.var` buffer. Inside a
 // converting Parallel unit that buffer is a per-lane register: every lane
 // owns its own copy, so its element address is (always) the same constant and
-// carries no lane-address class. VectorizeParallelToPTO promotes the
-// whole-buffer read/write pair to a `local.var` vector (vreg), so the
-// continuous/lane-uniform classification does not apply here and must be
-// skipped instead of rejecting the access as a lane-uniform store.
+// carries no lane-address class. The continuous/lane-uniform classification
+// does not apply to such accesses, so the layout classifier must skip them;
+// VectorizeParallelToPTO promotes the whole-buffer read/write pair to a
+// per-lane vreg (`local.var` vector).
 bool IsLaneScalarBuffer(const Buffer &buffer) {
   if (buffer.scope() != "local.var") {
     return false;

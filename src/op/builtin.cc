@@ -179,9 +179,9 @@ TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vmin).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vand).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vor).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vxor).set_num_inputs(-1);
-// M2 (control-flow stage): PR262's boolean mask-combine ops. They keep their
-// own TileLang names (the control-flow / vectorize passes emit them) while the
-// PTO codegen maps them onto the current PTODSL bitwise surface
+// Boolean mask-combine ops. They keep their own TileLang names (the
+// control-flow / vectorize passes emit them) while the PTO codegen maps them
+// onto the current PTODSL bitwise surface
 // (vand/vor/vnot on !pto.vmi.mask<Lxpred>).
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(mask_and).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(mask_or).set_num_inputs(-1);

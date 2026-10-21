@@ -43,6 +43,13 @@ namespace pto_analysis = ::tvm::tl::pto;
 
 namespace {
 
+// Shared tail of the runtime lane-uniform float dtype diagnostic (used
+// by both the unary and the binary op checks).
+static const char *kLaneUniformRuntimeMsg =
+    " is a runtime lane-uniform float computation; it stays "
+    "scalar inside SIMD_VF (no scalar float ALU by design). "
+    "Compute it outside the SimdVF region.";
+
 class VerifyParallelToPTOImpl : public StmtExprVisitor {
 public:
   void Verify(const PrimFunc &f) {
@@ -293,7 +300,7 @@ private:
         return;
       }
       // The remaining scopes only support UB accesses. local /
-      // local.var / shared.l1 (L1) and other scopes are rejected.
+      // shared.l1 (L1) and other scopes are rejected.
       if (scope != "shared" && scope != "shared.dyn") {
         std::ostringstream oss;
         oss << "buffer `" << buffer->name << "` has scope `" << scope
@@ -431,8 +438,8 @@ private:
       defined_loop_vars_.erase(op->loop_var.get());
     }
     void VisitStmt_(const IfThenElseNode *op) final {
-      // M2 (control-flow stage): the restricted lane-varying conditional forms
-      // are admitted. LegalizeParallelToPTO rewrites them into the Select form
+      // The restricted lane-varying conditional forms are admitted.
+      // LegalizeParallelToPTO rewrites them into the Select form
       // before VectorizeParallelToPTO runs, so the admitted shape is exactly
       // what Legalize can rewrite: buffer stores, no-ops, a SeqStmt of those,
       // or a nested conditional whose destinations are lane-varying
@@ -736,7 +743,7 @@ private:
           check(cast->value);
           return;
         }
-        // M2: Select and the relational / boolean ops that Legalize and
+        // Select and the relational / boolean ops that Legalize and
         // Vectorize express as vcmp+vsel / mask_and|or|not. Operands recurse
         // through the same check, so lane classification and dtype rules still
         // apply to whatever feeds them.
@@ -793,8 +800,8 @@ private:
         if (const auto *call = e.as<CallNode>()) {
           if (auto call_op = call->op.as<Op>()) {
             const std::string &name = call_op.value()->name;
-            // M2: boolean mask-combine calls (tirx.bitwise_* / tir.And|Or|Not)
-            // and the topk_gate -T.infinity() constant.
+            // Boolean mask-combine calls (tirx.bitwise_* / tir.And|Or|Not)
+            // and the tl/tir.infinity() constant.
             if (name.find("bitwise_and") != std::string::npos ||
                 name.find("bitwise_or") != std::string::npos ||
                 name.find("bitwise_not") != std::string::npos ||
@@ -854,11 +861,7 @@ private:
       if (pto_analysis::IsFloatFamily(dtype) &&
           pto_analysis::ContainsRuntimeValue(arg)) {
         std::ostringstream oss;
-        oss << op_name << " on " << dtype
-            << " is a runtime lane-uniform float computation; it stays "
-               "scalar inside SIMD_VF (no scalar float ALU by design). "
-               "Compute it outside the SimdVF region, or wait for the "
-               "gather/scatter milestone for vector write-back";
+        oss << op_name << " on " << dtype << kLaneUniformRuntimeMsg;
         parent_->Fail("dtype", oss.str());
       }
     }
@@ -909,11 +912,7 @@ private:
           (pto_analysis::ContainsRuntimeValue(lhs) ||
            pto_analysis::ContainsRuntimeValue(rhs))) {
         std::ostringstream oss;
-        oss << op_name << " on " << dtype
-            << " is a runtime lane-uniform float computation; it stays "
-               "scalar inside SIMD_VF (no scalar float ALU by design). "
-               "Compute it outside the SimdVF region, or wait for the "
-               "gather/scatter milestone for vector write-back";
+        oss << op_name << " on " << dtype << kLaneUniformRuntimeMsg;
         parent_->Fail("dtype", oss.str());
       }
       // Pure scalar op: base dtype legality only (int8 scalar mul is

@@ -606,12 +606,12 @@ public:
   void VisitExpr_(const ModNode *) final { MarkUnsupported("Mod"); }
   void VisitExpr_(const FloorDivNode *) final { MarkUnsupported("FloorDiv"); }
   void VisitExpr_(const FloorModNode *) final { MarkUnsupported("FloorMod"); }
-  // M2 (control-flow stage): Min/Max are admitted here — Verify runs before
+  // Min/Max are admitted here — Verify runs before
   // LegalizeParallelToPTO, which rewrites them into the Select form before
   // VectorizeParallelToPTO consumes the unit.
   void VisitExpr_(const MinNode *op) final { ExprVisitor::VisitExpr_(op); }
   void VisitExpr_(const MaxNode *op) final { ExprVisitor::VisitExpr_(op); }
-  // M2: Select + relational ops (the shape Legalize produces and Vectorize
+  // Select + relational ops (the shape Legalize produces and Vectorize
   // lowers to vcmp/vcmps + vsel).
   void VisitExpr_(const EQNode *op) final { ExprVisitor::VisitExpr_(op); }
   void VisitExpr_(const NENode *op) final { ExprVisitor::VisitExpr_(op); }
@@ -630,7 +630,7 @@ public:
   void VisitExpr_(const CallNode *op) final {
     if (auto call_op = op->op.as<Op>()) {
       const std::string &name = call_op.value()->name;
-      // M2: TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
+      // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
       // tirx.bitwise_* (not And/Or/Not nodes). Verify admits them; Vectorize
       // rewrites them to mask_and/mask_or/mask_not.
       if (name == "tirx.bitwise_and" || name == "tirx.bitwise_or" ||
@@ -642,8 +642,9 @@ public:
         }
         return;
       }
-      // TileKernels topk_gate pad/kill uses -T.infinity(...), which lowers to
-      // Mul(Call(tl.infinity, dtype), -1). Treat infinity as a float constant.
+      // The frontend -T.infinity(...) sentinel lowers to
+      // Mul(Call(tl.infinity, dtype), -1); infinity is a compile-time float
+      // constant and lane-uniform.
       if (name == "tl.infinity" || name == "tir.infinity") {
         return;
       }
@@ -1027,7 +1028,7 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     b = &fmod->b;
     known_op = metadata_mode;
   } else if (const auto *minn = expr.as<MinNode>()) {
-    // Stage 4: Min/Max classify like the comparisons in value mode too;
+    // Min/Max classify like the comparisons in value mode too;
     // LegalizeParallelToPTO rewrites them into Select before Vectorize.
     a = &minn->a;
     b = &minn->b;
@@ -1039,7 +1040,7 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   } else if (const auto *lt = expr.as<LTNode>()) {
     a = &lt->a;
     b = &lt->b;
-    known_op = true; // Phase 1: cmp -> vcmp/vcmps
+    known_op = true; // cmp -> vcmp/vcmps
   } else if (const auto *len = expr.as<LENode>()) {
     a = &len->a;
     b = &len->b;
@@ -1063,7 +1064,7 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   } else if (const auto *andn = expr.as<AndNode>()) {
     a = &andn->a;
     b = &andn->b;
-    known_op = true; // Phase 2
+    known_op = true;
   } else if (const auto *orn = expr.as<OrNode>()) {
     a = &orn->a;
     b = &orn->b;
@@ -1116,13 +1117,12 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
       }
       return acc;
     }
-    // -T.infinity -> Mul(tl.infinity, -1); infinity itself is lane-uniform.
     if (name == "tl.infinity" || name == "tir.infinity") {
       return LaneUse::kUniform;
     }
   }
   if (const auto *sel = expr.as<SelectNode>()) {
-    // Phase 1: Select(cond, t, f) -> vsel; lane use is varying if any arm is.
+    // Select(cond, t, f) -> vsel; lane use is varying if any arm is.
     LaneUse c = AnalyzeLaneUseImpl(sel->condition, ctx, reason, metadata_mode);
     LaneUse tv =
         AnalyzeLaneUseImpl(sel->true_value, ctx, reason, metadata_mode);

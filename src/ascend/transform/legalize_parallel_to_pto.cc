@@ -15,18 +15,13 @@
  * forms). A shape whose condition semantics cannot be preserved by the
  * rewrite is reported instead of being silently widened.
  *
- * The lane-uniform store specialisation (PR262's scratch buffer +
- * `tl.tileop.reduce` commit) is intentionally NOT part of this pass: it stays
- * registered as D1/D4-MIX, Verify already rejects lane-uniform stores, and
- * this pass fails defensively on that shape instead of materialising a
- * reducer.
+ * The lane-uniform store specialisation is intentionally NOT part of this
+ * pass: Verify already rejects lane-uniform stores, and this pass fails
+ * defensively on that shape instead of materialising a reducer.
  *
- * Unlike PR262's `SimdVFLowerControlFlow`, this pass descends only into
- * SIMD_VF blocks that contain a `T.Parallel` unit (the converting regions —
- * the same predicate Verify uses). Non-converting regions (SIMT_VF blocks and
- * hand-written VMI SIMD_VF regions) are returned unchanged, so their Min/Max
- * keep their code shape; the D8 upstream regression recorded for the PR262
- * pass is therefore not reproduced by construction.
+ * This pass descends only into converting SIMD_VF blocks (those containing
+ * a `T.Parallel` unit — the same predicate Verify uses); non-converting
+ * regions are returned unchanged, so their Min/Max keep their code shape.
  */
 
 #include <tvm/runtime/logging.h>
@@ -95,8 +90,8 @@ bool CollectStores(const Stmt &stmt,
   return false;
 }
 
-// AutoSchedule / Simplify turn identity else stores (x[i] = x[i]) into
-// Evaluate(0). Treat that as "no else" (masked update via BufferLoad).
+// Evaluate of a constant carries no work (e.g. a simplified identity else
+// store); treating it as "no else" yields the correct masked-update form.
 bool IsNoOpStmt(const Stmt &stmt) {
   if (const auto *eval = stmt.as<EvaluateNode>()) {
     if (eval->value.as<IntImmNode>()) {
@@ -332,15 +327,15 @@ private:
         indices = el->indices;
       }
 
-      // Lane-uniform destinations stay out of scope (D1/D4-MIX): the PR262
-      // scratch + tl.tileop.reduce commit is not migrated, and Verify
-      // already rejected this shape.
+      // Lane-uniform destinations are out of scope; Verify rejects them
+      // and this pass fails defensively instead of materialising a
+      // reducer.
       if (!IndexDependsOnParallelVar(indices)) {
         std::ostringstream oss;
         oss << "lane-uniform store into buffer `" << buf->name
-            << "` under T.Parallel cannot be legalized at this stage "
-               "(lane-uniform store specialization is registered as "
-               "D1/D4-MIX)";
+            << "` under T.Parallel is not supported at this stage; make "
+               "the store lane-varying or hoist the computation out of "
+               "the SimdVF region";
         Fail(oss.str());
       }
 

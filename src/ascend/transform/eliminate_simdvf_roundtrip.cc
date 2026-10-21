@@ -10,22 +10,22 @@
  * UB inside one SIMD_VF region: unit A stores it, a later unit loads it back.
  * After VectorizeParallelToPTO such a buffer becomes a vstore followed by a
  * vload in the same vecscope, and the machine-level schedule does not honour
- * that UB RAW (measured on device: the load may observe the previous UB
- * contents). The value never needed UB in the first place, so this pass
- * removes the buffer while the IR is still scalar parallel TIR, which keeps
- * the vectorizer (and VMI) unchanged.
+ * that UB RAW (the load may observe the previous UB contents). The value
+ * never needed UB in the first place, so this pass removes the buffer while
+ * the IR is still scalar parallel TIR, which keeps the vectorizer (and VMI)
+ * unchanged.
  *
  * Pipeline position: `VerifyParallelToPTO -> LegalizeParallelToPTO ->
  * EliminateSimdVFRoundTrip -> VectorizeParallelToPTO` (PTO target only).
  *
  * Two conservative rules, applied to top-level sequential units only:
  *
- *  - Rule 2 (forward retargeting): `T[i] = expr` followed by the immediately
+ *  - Store forwarding: `T[i] = expr` followed by the immediately
  *    adjacent pure copy `OUT[i] = T[i]` becomes `OUT[i] = expr` and the copy
  *    unit is deleted. `T` must be region-local, written only by the producer
  *    and read only by that copy; `OUT` must have no other writer and no read
  *    inside the region.
- *  - Rule 1 (backward copy propagation): the pure copy producer
+ *  - Copy propagation: the pure copy producer
  *    `T[i] = S[i]` followed by the immediately adjacent consumer unit that
  *    loads `T[i]` becomes a direct read of `S[i]`, and the copy unit is
  *    deleted. `T` must be region-local, single-writer and single-reader;
@@ -503,7 +503,8 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
     return declared;
   }
 
-  /*! Rule 2: `T[i] = expr` + adjacent `OUT[i] = T[i]` -> `OUT[i] = expr`. */
+  /*! Store forwarding: `T[i] = expr` + adjacent `OUT[i] = T[i]` ->
+   * `OUT[i] = expr`. */
   bool TryForwardRetarget(const RegionModel &model, const SBlockNode *block,
                           Stmt *out) const {
     std::unordered_set<const VarNode *> declared = DeclaredBuffers(block);
@@ -563,8 +564,8 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
     return false;
   }
 
-  /*! Rule 1: copy `T[i] = S[i]` + adjacent consumer of `T[i]` -> consumer
-   * reads `S[i]`. */
+  /*! Copy propagation: `T[i] = S[i]` + adjacent consumer of `T[i]` ->
+   * consumer reads `S[i]`. */
   bool TryBackwardCopyProp(const RegionModel &model, const SBlockNode *block,
                            Stmt *out) const {
     std::unordered_set<const VarNode *> declared = DeclaredBuffers(block);

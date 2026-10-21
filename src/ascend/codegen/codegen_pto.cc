@@ -291,9 +291,9 @@ std::string PtoIntegerVectorInterpretTarget(DataType element) {
 }
 
 // The TileLang-side name of a VMI call maps to the PTODSL surface name. The
-// PR262 boolean mask-combine ops have no PTODSL counterpart under their own
+// boolean mask-combine ops have no PTODSL counterpart under their own
 // names; the current PTOAS surface exposes the same operation as the bitwise
-// vector ops on mask registers, verified by the stage-4 ABI probe:
+// vector ops on mask registers. ABI surface:
 //   pto.vmi.vand %a, %b : mask<128xpred>, mask<128xpred> -> mask<128xpred>
 //   pto.vmi.vor  (same shape) / pto.vmi.vnot : mask -> mask
 std::string PtoVmiEmitName(const std::string &op_name) {
