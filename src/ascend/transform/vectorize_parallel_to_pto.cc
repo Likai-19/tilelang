@@ -1048,6 +1048,11 @@ private:
                 "immediately before the T.serial loop");
     }
     const auto *seed = stmts[shell_pos - 1].as<BufferStoreNode>();
+    if (seed != nullptr && seed->predicate.defined()) {
+      ShellFail("the seed store of the carried buffer must be "
+                "unconditional; a conditional seed cannot be promoted to a "
+                "register and has no ordered UB form inside a vecscope");
+    }
     if (seed == nullptr || seed->buffer.get() != carried ||
         seed->indices.size() != ref.size()) {
       ShellFail("the loop carry needs a seed store to the carried buffer "
@@ -1731,6 +1736,17 @@ private:
       return;
     }
     if (const auto *store = body.as<BufferStoreNode>()) {
+      // A one-sided conditional write arrives as a predicated store: only
+      // the lanes the predicate selects may be written and the destination
+      // is never read back. Register targets turn the predicate into a
+      // select against the register's current value; memory targets turn it
+      // into a store mask.
+      const bool predicated = store->predicate.defined();
+      Array<Stmt> pred_pre;
+      PrimExpr pred_mask;
+      if (predicated) {
+        pred_mask = ConvertPredicateToMask(store->predicate.value(), &pred_pre);
+      }
       // Per-lane scalar (T.alloc_var): the whole-buffer store becomes a write
       // to the vreg. A scalar value is broadcast over the lanes; a vector
       // value (a lane-varying load) is stored as-is.
@@ -1741,6 +1757,17 @@ private:
           value = BroadcastToLanes("vbrc_lane", value, &pre);
         }
         tirx::Buffer vreg = LaneScalarVreg(store->buffer);
+        for (const auto &s : pred_pre) {
+          pre.push_back(s);
+        }
+        if (predicated) {
+          value = EmitBind(
+              "vsel",
+              Call(value.dtype(), VmiOp("vsel"),
+                   {pred_mask, value,
+                    BufferLoad(vreg, {make_zero(DataType::Int(32))})}),
+              &pre);
+        }
         for (const auto &s : pre) {
           out->push_back(s);
         }
@@ -1791,6 +1818,19 @@ private:
           // into the vector carrier, so broadcast it first.
           value = BroadcastToLanes("vbrc_val", value, &pre);
         }
+        for (const auto &s : pred_pre) {
+          pre.push_back(s);
+        }
+        if (predicated) {
+          // A conditional carry update keeps the register value on the
+          // lanes the predicate does not select.
+          value = EmitBind(
+              "vsel",
+              Call(value.dtype(), VmiOp("vsel"),
+                   {pred_mask, value,
+                    BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))})}),
+              &pre);
+        }
         for (const auto &s : pre) {
           out->push_back(s);
         }
@@ -1817,12 +1857,25 @@ private:
                  {BufferLoad(store->buffer, start_idx),
                   IntImm(DataType::Int(32), static_cast<int>(lanes_)),
                   IntImm(DataType::Int(32), 2)});
+        for (const auto &s : pred_pre) {
+          pre.push_back(s);
+        }
+        // One-sided write: AND the predicate into the chunk's valid mask so
+        // the lanes the source condition did not select stay untouched.
+        PrimExpr store_mask = mask_var_;
+        if (predicated) {
+          store_mask = EmitBind(
+              "mand",
+              Call(DataType::Bool(static_cast<int>(lanes_)),
+                   VmiOp("mask_and"), {mask_var_, pred_mask}),
+              &pre);
+        }
         for (const auto &s : pre) {
           out->push_back(s);
         }
         out->push_back(Evaluate(
             Call(DataType::Void(), VmiOp("vstore"),
-                 {value, ptr, IntImm(DataType::Int(32), 0), mask_var_})));
+                 {value, ptr, IntImm(DataType::Int(32), 0), store_mask})));
       } else {
         // Verify rejects lane-uniform stores (the current
         // support boundary), so this branch is unreachable. Treat any
@@ -2175,6 +2228,28 @@ private:
   static const char *RelationalCmpName(const PrimExpr &e) {
     const RelationalKind *rel = MatchRelational(e, nullptr, nullptr);
     return rel != nullptr ? rel->cmp : nullptr;
+  }
+
+  // Materialise a store predicate as a lane mask. A relational predicate
+  // goes through the compare path (broadcast + vcmp) so a lane-uniform
+  // test still yields an all-true / all-false mask; anything else is
+  // converted as a value, and a scalar result is broadcast to a mask.
+  PrimExpr ConvertPredicateToMask(const PrimExpr &pred, Array<Stmt> *pre) {
+    PrimExpr mask;
+    if (RelationalCmpName(pred) != nullptr) {
+      mask = ConvertRelationalToMask(pred, pre);
+    } else {
+      mask = ConvertExpr(pred, pre);
+      if (mask.dtype().lanes() == 1) {
+        mask = BroadcastToLanes("brc_pred", mask, pre);
+      }
+    }
+    ICHECK(mask.dtype().lanes() > 1)
+        << "[VectorizeParallelToPTO] unsupported store predicate: expected a "
+           "lane mask, got a scalar `"
+        << pred->GetTypeKey()
+        << "`. Rewrite the condition as a comparison, or make it lane-varying.";
+    return mask;
   }
 
   // Materialise a relational condition as a lane mask even when both sides

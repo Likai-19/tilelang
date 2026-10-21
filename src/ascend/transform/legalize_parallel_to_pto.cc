@@ -6,15 +6,16 @@
  * Pipeline position: `VerifyParallelToPTO -> LegalizeParallelToPTO ->
  * VectorizeParallelToPTO` (target-gated on PTO). The pass rewrites the
  * scalar parallel TIR and produces scalar parallel TIR: lane-varying
- * If/Then/Else become the Select form, Min/Max become comparisons +
- * Select, and the tl/tir.infinity() constant becomes FloatImm, so the
- * vectorizer only needs vcmp/vcmps + vsel. It never emits
- * VMI, never calls a reducer, and never turns a conditional load into an
- * unconditional access outside the caller's full-width/masked load contract
- * (the rewrite keeps the load inside a Select arm, pre-evaluated under the
- * input program's memory contract, exactly like the other admitted Select
- * forms). A shape whose condition semantics cannot be preserved by the
- * rewrite is reported instead of being silently widened.
+ * If/Then/Else become either a value choice (both arms write the same
+ * destination) or a predicated store (one-sided branch; nested conditions
+ * conjoin their predicates), Min/Max become comparisons + Select, and the
+ * tl/tir.infinity() constant becomes FloatImm, so the vectorizer only
+ * needs vcmp/vcmps + vsel + a masked vstore. A one-sided branch never reads
+ * its destination: a vecscope has no ordering point, so a read of the
+ * destination would observe stale UB whenever the buffer had been written
+ * earlier in the same scope. It never emits VMI and never calls a reducer.
+ * A shape whose condition semantics cannot be preserved by the rewrite is
+ * reported instead of being silently widened.
  *
  * The lane-uniform store specialisation is intentionally NOT part of this
  * pass: Verify already rejects lane-uniform stores, and this pass fails
@@ -286,23 +287,40 @@ private:
       PrimExpr else_value;
       Buffer buf;
       Array<PrimExpr> indices;
-      if (th != nullptr && el != nullptr) {
-        // The caller pairs by SameAccess, so both arms share one Select.
-        then_value = th->value;
-        else_value = el->value;
-        buf = th->buffer;
-        indices = th->indices;
-      } else if (th != nullptr) {
-        then_value = th->value;
-        else_value = BufferLoad(th->buffer, th->indices);
-        buf = th->buffer;
-        indices = th->indices;
-      } else {
-        then_value = BufferLoad(el->buffer, el->indices);
-        else_value = el->value;
-        buf = el->buffer;
-        indices = el->indices;
+      if (th == nullptr || el == nullptr) {
+        // One-sided branch: only the lanes the condition selects may be
+        // written, so the branch becomes a predicated store. Reading the
+        // destination back (a Select over a load of the store's own
+        // address) would add a UB read the source program does not have,
+        // and a vecscope has no ordering point that could make that read
+        // observe an earlier write to the same buffer in this scope.
+        const BufferStoreNode *one = th != nullptr ? th : el;
+        if (!IndexDependsOnParallelVar(one->indices)) {
+          std::ostringstream oss;
+          oss << "lane-uniform store into buffer `" << one->buffer->name
+              << "` under T.Parallel is not supported at this stage; make "
+                 "the store lane-varying or hoist the computation out of "
+                 "the SimdVF region";
+          Fail(oss.str());
+        }
+        PrimExpr value = VisitExpr(one->value);
+        PrimExpr pred = th != nullptr ? cond : Not(cond);
+        if (one->predicate.defined()) {
+          // A nested one-sided branch already composes its own predicate;
+          // the outer condition has to be conjoined with it.
+          pred = And(pred, VisitExpr(one->predicate.value()));
+        }
+        out_stores.push_back(
+            BufferStore(one->buffer, value, one->indices, pred));
+        return;
       }
+
+      // Both arms write the same destination: a plain value choice, the
+      // destination is never read.
+      then_value = th->value;
+      else_value = el->value;
+      buf = th->buffer;
+      indices = th->indices;
 
       // Lane-uniform destinations are out of scope; Verify rejects them
       // and this pass fails defensively instead of materialising a
@@ -321,6 +339,7 @@ private:
       PrimExpr selected = ExpandPredSelect(cond, then_v, else_v);
       out_stores.push_back(BufferStore(buf, selected, indices));
     };
+
 
     if (then_noop) {
       for (const BufferStoreNode *el : else_stores) {

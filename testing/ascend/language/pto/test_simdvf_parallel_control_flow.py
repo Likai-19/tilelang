@@ -120,6 +120,18 @@ def _collect(mod, predicate):
     return found
 
 
+def _expr_loads(expr):
+    """Buffer names read by an expression (no module wrapper)."""
+    found = []
+
+    def visit(node):
+        if isinstance(node, tvm.tirx.BufferLoad):
+            found.append(node.buffer.name)
+
+    tvm.tirx.stmt_functor.post_order_visit(expr, visit)
+    return set(found)
+
+
 def _vmi_call_names(mod):
     names = {}
 
@@ -304,27 +316,43 @@ def test_if_else_legalizes_to_select_without_residual_branch():
     assert "tl.vmi.mask_and" not in names, "this case must not need mask_and"
 
 
+def _predicated_stores(stmt):
+    return [
+        n
+        for n in _collect(stmt, lambda n: isinstance(n, tvm.tirx.BufferStore))
+        if n.predicate is not None
+    ]
+
+
 @pytest.mark.pto
-def test_single_sided_if_reads_the_old_value_on_the_false_lane():
+def test_single_sided_if_becomes_a_predicated_store():
+    """A one-sided branch writes only the lanes the condition selects, so it
+    must lower to a store predicate. It must not read the destination back: a
+    vecscope has no ordering point, so such a read would observe stale UB
+    whenever the buffer had been written earlier in the same scope."""
     E, lanes = 150, 128
     stages, _ = _lower_capture(_k_single_sided(E, lanes))
 
     legalized = stages["legalize"]
     assert not _if_then_elses(legalized), "Legalize must remove the single-sided IfThenElse"
-    selects = _selects(legalized)
-    assert selects, "a single-sided if must become Select(cond, new, old)"
 
-    def _has_old_value_load(node):
-        loads = []
+    stores = _predicated_stores(legalized)
+    assert len(stores) == 1, f"the one-sided branch must be one predicated store, got {len(stores)}"
+    assert stores[0].buffer.name == "b"
 
-        def visit(inner):
-            if isinstance(inner, tvm.tirx.BufferLoad):
-                loads.append(inner)
+    for store in stores:
+        readback = _expr_loads(store.value)
+        assert store.buffer.name not in readback, (
+            f"the store value must not read its own destination, got {sorted(readback)}"
+        )
 
-        tvm.tirx.stmt_functor.post_order_visit(node, visit)
-        return bool(loads)
+    vectorized = stages["vectorize"]
+    names = _vmi_call_names(vectorized)
+    assert "tl.vmi.vstore" in names, "the predicated store must lower to vstore"
+    assert "tl.vmi.mask_and" in names, "the predicate must be conjoined into the store mask"
 
-    assert any(_has_old_value_load(select) for select in selects), "the false arm must read the old destination value"
+    stores_v = _collect(vectorized, lambda n: isinstance(n, tvm.tirx.BufferStore))
+    assert not any(s.buffer.name == "b" for s in stores_v), "no scalar store to the destination may survive"
 
 
 @pytest.mark.pto
@@ -410,11 +438,10 @@ def test_conditional_load_pre_evaluates_under_the_caller_contract():
 
 
 @pytest.mark.pto
-def test_divergent_branch_destinations_pair_by_address():
-    """Arms that write different destinations are paired per written
-    address: each destination keeps the other arm's value as a load of the
-    same address — the same masked-update form a one-sided branch
-    produces."""
+def test_divergent_branch_destinations_become_predicated_stores():
+    """Arms that write different destinations are each one-sided for their
+    own buffer, so each becomes its own predicated store. Neither destination
+    is read back."""
 
     E, lanes = 150, 128
     P = (E + lanes - 1) // lanes * lanes
@@ -444,20 +471,21 @@ def test_divergent_branch_destinations_pair_by_address():
             T.copy(c, C)
 
     stages, error = _lower_capture(main)
-    assert error is None, f"divergent destinations must pair by address: {error}"
+    assert error is None, f"divergent destinations must become predicated stores: {error}"
     legalized = stages["legalize"]
     assert not _if_then_elses(legalized), "the branch must be legalized away"
-    selects = _selects(legalized)
-    assert len(selects) == 2, (
-        f"each destination gets its own Select, got {len(selects)}"
-    )
-    loaded = {
-        n.buffer.name
-        for n in _collect(legalized, lambda n: isinstance(n, tvm.tirx.BufferLoad))
-    }
-    assert "b" in loaded and "c" in loaded, (
-        f"both destinations must be read for the old value, got {sorted(loaded)}"
-    )
+
+    stores = _predicated_stores(legalized)
+    assert len(stores) == 2, f"each destination gets its own predicated store, got {len(stores)}"
+    assert {s.buffer.name for s in stores} == {"b", "c"}
+    # The two predicates are complementary: exactly one writes each lane.
+    assert stores[0].predicate is not stores[1].predicate
+
+    for store in stores:
+        readback = _expr_loads(store.value)
+        assert store.buffer.name not in readback, (
+            f"neither store value may read its own destination, got {sorted(readback)}"
+        )
 
 
 @pytest.mark.pto
