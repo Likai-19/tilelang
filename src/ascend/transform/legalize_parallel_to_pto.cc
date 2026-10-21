@@ -6,8 +6,9 @@
  * Pipeline position: `VerifyParallelToPTO -> LegalizeParallelToPTO ->
  * VectorizeParallelToPTO` (target-gated on PTO). The pass rewrites the
  * scalar parallel TIR and produces scalar parallel TIR: lane-varying
- * If/Then/Else become the Select form and Min/Max become comparisons +
- * Select, so the vectorizer only needs vcmp/vcmps + vsel. It never emits
+ * If/Then/Else become the Select form, Min/Max become comparisons +
+ * Select, and the tl/tir.infinity() constant becomes FloatImm, so the
+ * vectorizer only needs vcmp/vcmps + vsel. It never emits
  * VMI, never calls a reducer, and never turns a conditional load into an
  * unconditional access outside the caller's full-width/masked load contract
  * (the rewrite keeps the load inside a Select arm, pre-evaluated under the
@@ -31,6 +32,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -255,6 +257,22 @@ public:
     return Select(a > b, a, b);
   }
 
+  // The frontend infinity() sentinel is a compile-time +inf constant of its
+  // dtype; rewrite it to FloatImm so Vectorize's constant handling covers it
+  // without a frontend-op-name case.
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (in_parallel_) {
+      if (const auto *op_node = op->op.as<OpNode>()) {
+        const std::string &name = op_node->name;
+        if (name == "tl.infinity" || name == "tir.infinity") {
+          return FloatImm(op->dtype,
+                          std::numeric_limits<double>::infinity());
+        }
+      }
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
 private:
   bool IndexDependsOnParallelVar(const Array<PrimExpr> &indices) const {
     if (!parallel_var_.defined()) {
@@ -307,10 +325,7 @@ private:
       Buffer buf;
       Array<PrimExpr> indices;
       if (th != nullptr && el != nullptr) {
-        if (!SameAccess(th, el)) {
-          Fail("paired then/else stores must write the same buffer indices "
-               "(the Select form has one destination)");
-        }
+        // The caller pairs by SameAccess, so both arms share one Select.
         then_value = th->value;
         else_value = el->value;
         buf = th->buffer;
@@ -354,27 +369,24 @@ private:
         emit_select_store(th, nullptr);
       }
     } else {
-      if (then_stores.size() != else_stores.size()) {
-        std::vector<bool> else_used(else_stores.size(), false);
-        for (const BufferStoreNode *th : then_stores) {
-          const BufferStoreNode *matched = nullptr;
-          for (size_t j = 0; j < else_stores.size(); ++j) {
-            if (!else_used[j] && SameAccess(th, else_stores[j])) {
-              matched = else_stores[j];
-              else_used[j] = true;
-              break;
-            }
-          }
-          emit_select_store(th, matched);
-        }
+      // Pair stores by written address (buffer + indices); a store with no
+      // counterpart keeps the other arm's value as a load of the same
+      // address — the same masked-update form a one-sided branch produces.
+      std::vector<bool> else_used(else_stores.size(), false);
+      for (const BufferStoreNode *th : then_stores) {
+        const BufferStoreNode *matched = nullptr;
         for (size_t j = 0; j < else_stores.size(); ++j) {
-          if (!else_used[j]) {
-            emit_select_store(nullptr, else_stores[j]);
+          if (!else_used[j] && SameAccess(th, else_stores[j])) {
+            matched = else_stores[j];
+            else_used[j] = true;
+            break;
           }
         }
-      } else {
-        for (size_t i = 0; i < then_stores.size(); ++i) {
-          emit_select_store(then_stores[i], else_stores[i]);
+        emit_select_store(th, matched);
+      }
+      for (size_t j = 0; j < else_stores.size(); ++j) {
+        if (!else_used[j]) {
+          emit_select_store(nullptr, else_stores[j]);
         }
       }
     }

@@ -802,9 +802,9 @@ private:
             const std::string &name = call_op.value()->name;
             // Boolean mask-combine calls (tirx.bitwise_* / tir.And|Or|Not)
             // and the tl/tir.infinity() constant.
-            if (name.find("bitwise_and") != std::string::npos ||
-                name.find("bitwise_or") != std::string::npos ||
-                name.find("bitwise_not") != std::string::npos ||
+            if (name == "tirx.bitwise_and" || name == "tir.bitwise_and" ||
+                name == "tirx.bitwise_or" || name == "tir.bitwise_or" ||
+                name == "tirx.bitwise_not" || name == "tir.bitwise_not" ||
                 name == "tir.And" || name == "tir.Or" || name == "tir.Not") {
               for (const auto &arg : call->args) {
                 check(arg);

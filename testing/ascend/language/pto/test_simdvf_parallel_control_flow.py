@@ -8,22 +8,21 @@ compile, no device execution unless the case is explicitly a numeric one).
 Expected contract:
 
 * a lane-varying ``if`` / ``if``-``else`` under ``T.Parallel`` is rewritten by
-  Legalize into the safe scalar ``Select`` form: both-arms stores become one
-  ``Select``; a single-sided ``if`` becomes ``Select(cond, new, old_value)``;
+  Legalize into the safe scalar ``Select`` form: stores are paired by written
+  address, and a store without a counterpart in the other arm keeps the old
+  value (``Select(cond, new, old_value)`` — the same form a single-sided
+  ``if`` produces);
 * comparisons, ``T.min``/``T.max`` and boolean operators follow the same
   admission rules and end as ``vcmp``/``vsel`` (or are rejected with a
   diagnostic when the source semantics cannot be preserved);
+* the frontend ``-T.infinity()`` sentinel is rewritten to a ``FloatImm``
+  constant, so no frontend op name survives Legalize;
 * explicit padding (``T.Parallel(P)`` with ``if i < E ... else ...``) keeps its
   ``else`` branch and legalizes to the Select form;
 * Legalize itself never emits VMI and never widens a conditional load: the
   runtime address safety of full-width/masked loads stays the caller's
   contract, and a lowering that cannot preserve the source condition is
-  rejected (D5 diagnostic name).
-
-Boolean-expression coverage (``a & b``, ``a | b``, ``not a`` over lane masks)
-is intentionally absent: those lower to ``tl.vmi.mask_and/or/not``, which are
-unregistered on this baseline (see the run's issue-P1 record); the cases land
-after that decision.
+  rejected with a diagnostic.
 """
 
 from __future__ import annotations
@@ -411,10 +410,11 @@ def test_conditional_load_pre_evaluates_under_the_caller_contract():
 
 
 @pytest.mark.pto
-def test_mismatched_branch_destinations_are_rejected():
-    """A conditional whose arms write different destinations cannot be
-    expressed as one Select destination; the lowering refuses to change the
-    source's conditional semantics and reports instead."""
+def test_divergent_branch_destinations_pair_by_address():
+    """Arms that write different destinations are paired per written
+    address: each destination keeps the other arm's value as a load of the
+    same address — the same masked-update form a one-sided branch
+    produces."""
 
     E, lanes = 150, 128
     P = (E + lanes - 1) // lanes * lanes
@@ -422,6 +422,8 @@ def test_mismatched_branch_destinations_are_rejected():
     @T.prim_func
     def main(
         A: T.Tensor((P,), "float32"),
+        B_init: T.Tensor((P,), "float32"),
+        C_init: T.Tensor((P,), "float32"),
         B: T.Tensor((P,), "float32"),
         C: T.Tensor((P,), "float32"),
     ):
@@ -430,6 +432,8 @@ def test_mismatched_branch_destinations_are_rejected():
             b = T.alloc_shared((P,), "float32")
             c = T.alloc_shared((P,), "float32")
             T.copy(A, a)
+            T.copy(B_init, b)
+            T.copy(C_init, c)
             with T.SimdVF(lanes=lanes):
                 for i in T.Parallel(E):
                     if a[i] > 0:
@@ -439,12 +443,59 @@ def test_mismatched_branch_destinations_are_rejected():
             T.copy(b, B)
             T.copy(c, C)
 
-    _, error = _lower_capture(main, expect_error=True)
-    assert error is not None, "mismatched branch destinations must be rejected"
-    message = str(error)
-    assert "same buffer indices" in message or "must write the same buffer" in message, (
-        f"expected the destination-mismatch diagnostic, got: {message}"
+    stages, error = _lower_capture(main)
+    assert error is None, f"divergent destinations must pair by address: {error}"
+    legalized = stages["legalize"]
+    assert not _if_then_elses(legalized), "the branch must be legalized away"
+    selects = _selects(legalized)
+    assert len(selects) == 2, (
+        f"each destination gets its own Select, got {len(selects)}"
     )
+    loaded = {
+        n.buffer.name
+        for n in _collect(legalized, lambda n: isinstance(n, tvm.tirx.BufferLoad))
+    }
+    assert "b" in loaded and "c" in loaded, (
+        f"both destinations must be read for the old value, got {sorted(loaded)}"
+    )
+
+
+@pytest.mark.pto
+def test_infinity_constant_legalizes_to_floatimm():
+    """The frontend ``-T.infinity()`` sentinel is rewritten to a FloatImm
+    constant by Legalize; Vectorize's constant handling covers it and no
+    frontend op name survives into the vectorized IR."""
+
+    E, lanes = 150, 128
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((P,), "float32"),
+        B: T.Tensor((P,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((P,), "float32")
+            b = T.alloc_shared((P,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if a[i] > 0:
+                        b[i] = a[i]
+                    else:
+                        b[i] = -T.infinity("float32")
+            T.copy(b, B)
+
+    stages, error = _lower_capture(main)
+    assert error is None, f"infinity must lower as a constant: {error}"
+    for stage in ("legalize", "vectorize"):
+        text = _body_of(stages[stage]).__str__()
+        assert "infinity" not in text, (
+            f"the frontend infinity op must not survive {stage}"
+        )
+    names = _vmi_call_names(stages["vectorize"])
+    assert names.get("tl.vmi.vsel") == 1, f"the Select must lower to vsel, got {names}"
+    assert names.get("tl.vmi.vbrc", 0) >= 1, "the constant must reach a vbrc"
 
 
 def _k_boolean_mask(E, lanes, dtype="float32"):

@@ -2001,11 +2001,6 @@ private:
       if (const auto *op_node = call->op.as<OpNode>()) {
         name = op_node->name;
       }
-      if (name == "tl.infinity" || name == "tir.infinity") {
-        // Lane-uniform +inf scalar (frontend -T.infinity is Mul(inf, -1)).
-        // Keep the Call; vbrc / Mul / Select consume it like a FloatImm.
-        return GetRef<PrimExpr>(call);
-      }
       if (name == "tirx.bitwise_and" || name == "tir.bitwise_and" ||
           name == "tir.And") {
         ICHECK_EQ(call->args.size(), 2);
