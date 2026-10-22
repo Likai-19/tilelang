@@ -1489,6 +1489,40 @@ tvm::transform::Pass AutoSchedule() {
     if (target_opt.defined()) {
       target = target_opt.value();
     }
+    // U3 premise: the slot reservation is budgeted per kernel root
+    // (each root may deduct the full unified buffer), while the final
+    // capacity check in MergeUBAllocations sums the whole function
+    // against one physical cap. With more than one kernel root the two
+    // scopes can silently disagree, so slot kernels require a single
+    // root (full per-root accounting is a registered follow-up).
+    {
+      class RootAndPlanCounter : public tirx::StmtVisitor {
+      public:
+        void VisitStmt_(const tirx::SBlockNode *op) final {
+          if (op->name_hint == "tilelang_root") {
+            ++roots;
+          }
+          if (op->annotations.count(kPtoSlotPlan)) {
+            has_slot_plan = true;
+          }
+          tirx::StmtVisitor::VisitStmt_(op);
+        }
+        int roots = 0;
+        bool has_slot_plan = false;
+      };
+      RootAndPlanCounter counter;
+      counter(func->body);
+      if (counter.roots > 1 && counter.has_slot_plan) {
+        std::ostringstream oss;
+        oss << "[AutoSchedule] PTO slot storage requires a single kernel "
+               "root per function: this function has "
+            << counter.roots
+            << " tilelang_root blocks and reserves fragment backings; the "
+               "per-root budget and the function-wide capacity check "
+               "would cover different scopes";
+        LOG(FATAL) << oss.str();
+      }
+    }
     return RewriteTilelangKernels(
         std::move(func), "AutoSchedule",
         [&](const TilelangKernelContext &context) {

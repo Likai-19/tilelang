@@ -516,10 +516,7 @@ private:
   Stmt ConvertRegionBody(const Stmt &region) {
     // Reset the region-level slot state: every local.fragment buffer of
     // this converting region maps to one reserved backing (shared by all
-    // sequential units — e.g. an accumulator kept across units). The WAR
-    // tracker is per region: an earlier vecscope's trailing reads are
-    // ordered by the vecscope boundary, not by a bar inside this one.
-    backing_reads_since_bar_ = false;
+    // sequential units — e.g. an accumulator kept across units).
     BuildSlotState();
     pto_analysis::PtoRegionScan scan = pto_analysis::ScanPtoRegion(region);
     ICHECK(!scan.units.empty())
@@ -607,30 +604,12 @@ private:
     }
     for (size_t i = 0; i < scan.units.size(); ++i) {
       Stmt converted = ConvertUnit(scan.units[i], mappings[i], region);
-      // A unit that writes a fragment backing is followed by a vecscope
-      // mem_bar: the next unit's backing loads are a RAW dependency
-      // through UB, and TileLang does not rely on a backend
-      // auto-inserting the barrier. The mem-to-value promotion deletes
-      // the bar again whenever it forwards the round trip.
-      //
-      // Cross-unit WAR is ordered symmetrically: a writing unit whose
-      // predecessors read the backing since the last bar gets a VLD_VST
-      // bar *before* it, so its vstore cannot overtake an earlier unit's
-      // vload of the same entry.
-      if (unit_wrote_backing_ && backing_reads_since_bar_) {
-        converted = SeqStmt::Flatten(
-            Evaluate(Call(DataType::Void(), tl::simd_mem_bar(),
-                          {StringImm("VLD_VST")})),
-            converted);
-      }
-      if (unit_wrote_backing_) {
-        converted = SeqStmt::Flatten(
-            converted, Evaluate(Call(DataType::Void(), tl::simd_mem_bar(),
-                                     {StringImm("VST_VLD")})));
-        backing_reads_since_bar_ = false;
-      } else if (unit_read_backing_) {
-        backing_reads_since_bar_ = true;
-      }
+      // No TileLang-side backing mem_bar: ordering of backing accesses
+      // (cross-unit RAW/WAR, in-shell cross-iteration RAW) is the
+      // toolchain's responsibility — PR307's automatic vecscope barriers
+      // model the affine-address, constant-bound forms this pass emits.
+      // The toolchain floor is the pr274-pr307-merge lineage; validated
+      // by the device suites.
       new_region = ReplaceStmt(new_region, scan.units[i], converted);
     }
     if (region_carry_.active) {
@@ -2151,7 +2130,6 @@ private:
     lane_scalar_vregs_.clear();
     lane_scalar_allocs_.clear();
     unit_wrote_backing_ = false;
-    unit_read_backing_ = false;
     outer_loop_ranges_ = EnclosingSerialRanges(region_body, loop.get());
     // Serial loops in scope outside the region (kernel level) and the
     // loops the vecscope split hoisted outside the part being converted:
@@ -2655,22 +2633,9 @@ private:
         outer_loop_ranges_.Set(
             loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
       }
-      // A shell whose body writes a fragment backing needs an ordering
-      // point between its own iterations: iteration k's vstore and
-      // iteration k+1's vload on the same entry have nothing between them
-      // (the unit-level bar fires only after the whole unit, and inside
-      // one vecscope the machine does not honour the UB RAW). Track
-      // precisely whether this body wrote the backing, then close every
-      // writing iteration with its own VST_VLD bar.
-      const bool saved_wrote_backing = unit_wrote_backing_;
-      unit_wrote_backing_ = false;
+      // In-shell backing accesses are ordered by the toolchain's
+      // automatic vecscope barriers (same policy as the unit level).
       ConvertBody(loop->body, &inner);
-      const bool shell_wrote_backing = unit_wrote_backing_;
-      unit_wrote_backing_ = saved_wrote_backing || shell_wrote_backing;
-      if (shell_wrote_backing) {
-        inner.push_back(Evaluate(Call(DataType::Void(), tl::simd_mem_bar(),
-                                      {StringImm("VST_VLD")})));
-      }
       outer_loop_ranges_ = std::move(saved_ranges);
       carry_active_ = saved_carry;
       bind_env_ = std::move(saved_env);
@@ -2739,7 +2704,6 @@ private:
     // No CSE and no cross-access reuse: every textual fragment read is its
     // own vload on the handle (memory semantics; merging and the
     // store->load forwarding are PTOAS's decisions).
-    unit_read_backing_ = true;
     return EmitBind(
         "vload",
         Call(VectorDType(load->dtype, lanes_), VmiOp("vload"),
@@ -3247,10 +3211,6 @@ private:
   // True when the unit being converted wrote to a fragment backing (drives
   // the ordering mem_bar appended after the unit).
   bool unit_wrote_backing_ = false;
-  bool unit_read_backing_ = false;
-  /*! True when a converted unit read the backing without an intervening
-   * bar: the next backing-writing unit needs a WAR (VLD_VST) bar. */
-  bool backing_reads_since_bar_ = false;
 
   // Per-unit state.
   Var loop_var_;

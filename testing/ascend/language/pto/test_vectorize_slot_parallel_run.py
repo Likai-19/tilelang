@@ -72,8 +72,10 @@ def _assert_backing_source():
         assert "pto.memref_declare(" in source, (
             "fragment storage must be declared through pto.memref_declare"
         )
-        assert "pto.mem_bar" in source, "backing-writing units must be ordered by mem_bar"
         assert "with pto.vecscope():" in source
+        # No TileLang-side mem_bar: backing ordering (cross-unit RAW/WAR
+        # and in-shell cross-iteration RAW) is delegated to the
+        # toolchain's automatic vecscope barriers (PR307).
 
     return check
 
@@ -302,6 +304,63 @@ def _unaligned_fill(E, lanes):
     return main
 
 
+def _multi_chunk_ragged(M, N, lanes):
+    """[M, N] with N > VL and N not divisible by VL ([4, 136] @ 64: three
+    chunks per row, an 8-lane ragged tail): whole-entry granularity and
+    tail masking must both hold. N keeps the 32B row-stride alignment
+    contract (136 x 4B = 544B) so the masked UB store stays provable —
+    the case under test is the fragment's own ragged multi-entry
+    layout."""
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((M * N,), "float32"),
+        Out: T.Buffer((M * N,), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((M * N,), "float32")
+            out_ub = T.alloc_shared((M * N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((M, N), "float32")
+                for i, j in T.Parallel(M, N):
+                    keep[i, j] = a_ub[i * N + j] * T.float32(2.0)
+                for i, j in T.Parallel(M, N):
+                    out_ub[i * N + j] = keep[i, j] + T.float32(1.0)
+            T.copy(out_ub, Out)
+
+    return main
+
+
+def _shell_accumulator(K, lanes):
+    """A [VL] fragment accumulator updated inside an in-unit T.serial
+    loop: with no TileLang-side bars, cross-iteration ordering rests on
+    the toolchain's automatic vecscope barriers (PR307) — this numeric
+    pins that delegation."""
+
+    @T.prim_func
+    def main(
+        W: T.Buffer((K,), "float32"),
+        Out: T.Buffer((lanes,), "float32"),
+    ):
+        with T.Kernel(1):
+            w_ub = T.alloc_shared((K,), "float32")
+            out_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(W, w_ub)
+            with T.SimdVF(lanes=lanes):
+                acc = T.alloc_fragment((lanes,), "float32")
+                for i in T.Parallel(lanes):
+                    acc[i] = T.float32(0.0)
+                for i in T.Parallel(lanes):
+                    for k in T.serial(K):
+                        acc[i] = acc[i] + w_ub[k]
+                for i in T.Parallel(lanes):
+                    out_ub[i] = acc[i]
+            T.copy(out_ub, Out)
+
+    return main
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -420,6 +479,34 @@ def test_unaligned_fill_numeric(npu, lanes):
         (a.to(npu),),
         expected,
         source_checks=_assert_backing_source(),
+    )
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("lanes", [64])
+def test_multi_chunk_ragged_numeric(npu, lanes):
+    M, N = 4, 2 * lanes + 8  # three entries per row, 8-lane ragged tail
+    a = torch.randn(M * N)
+    _run_and_check(
+        _multi_chunk_ragged(M, N, lanes),
+        (a.to(npu),),
+        a * 2.0 + 1.0,
+        source_checks=_assert_backing_source(),
+    )
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("lanes", [128])
+def test_shell_accumulator_numeric(npu, lanes):
+    K = 7
+    w = torch.randn(K)
+    expected = w.sum().expand(lanes)
+    _run_and_check(
+        _shell_accumulator(K, lanes),
+        (w.to(npu),),
+        expected,
+        source_checks=_assert_backing_source(),
+        atol=1e-3,
     )
 
 

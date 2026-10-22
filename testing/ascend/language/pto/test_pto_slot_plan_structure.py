@@ -409,12 +409,11 @@ def test_vectorize_slot_roundtrip_2d():
     for call in loads + stores:
         assert f"i * {lanes}" in str(call), str(call)
 
-    # A vecscope mem_bar orders every backing-writing unit before the next
-    # unit's backing reads (two writing units here: zero-init and the
-    # accumulation loop).
+    # No TileLang-side backing mem_bar: ordering of backing accesses is
+    # the toolchain's responsibility (PR307 automatic vecscope barriers);
+    # the emitted TileLang source carries no bars of its own.
     bars = _mem_bars(mod)
-    assert len(bars) == 2, [str(b) for b in bars]
-    assert all(str(b) == 'T.tl.simd.mem_bar("VST_VLD")' for b in bars)
+    assert len(bars) == 0, [str(b) for b in bars]
 
     # No fragment access survives conversion; the fragment allocation is
     # consumed while the backing stays.
@@ -547,10 +546,9 @@ def test_fragment_fill_expands_to_slot_store():
     # read-out round: 1 load.
     assert len(stores) == 2, [str(s) for s in stores]
     assert len(loads) == 2, [str(l) for l in loads]
-    # Two units write the backing (the fill unit and the RMW unit), so two
-    # ordering mem_bars.
+    # No TileLang-side backing mem_bar (ordering is the toolchain's).
     bars = _mem_bars(mod)
-    assert len(bars) == 2, [str(b) for b in bars]
+    assert len(bars) == 0, [str(b) for b in bars]
 
 
 @pytest.mark.pto
@@ -1060,27 +1058,11 @@ def test_fragment_shell_accumulator_converts_via_slot():
     assert len(_slot_vmi_calls(mod, "vload", handle)) == 2
     assert not _collect_stores(mod, "local.fragment")
     assert not _collect_loads(mod, "local.fragment")
-    # Two unit-level bars (init unit, shell unit) plus one bar inside the
-    # shell body — the per-iteration ordering point.
+    # No TileLang-side bars anywhere (unit level and shell iterations
+    # alike): in-shell cross-iteration ordering is the toolchain's
+    # responsibility, pinned by the device numerics in the run suite.
     bars = _mem_bars(mod)
-    assert len(bars) == 3, [str(b) for b in bars]
-    bars_inside_for = []
-
-    def check_for(node):
-        if isinstance(node, tvm.tirx.For):
-            tvm.tirx.stmt_functor.post_order_visit(
-                node.body,
-                lambda n: bars_inside_for.append(n)
-                if isinstance(n, tvm.tirx.Call)
-                and getattr(getattr(n, "op", None), "name", "")
-                == "tl.simd.mem_bar"
-                else None,
-            )
-
-    _visit(mod, check_for)
-    assert bars_inside_for, (
-        "a backing-writing shell must close each iteration with a mem_bar"
-    )
+    assert len(bars) == 0, [str(b) for b in bars]
 
 
 @pytest.mark.pto
@@ -1355,10 +1337,11 @@ def test_kernel_level_loop_fragment_entry_ok():
 
 
 @pytest.mark.pto
-def test_cross_unit_war_bar():
-    """A1: a unit that only reads the backing followed by a unit that
-    writes it gets a WAR (VLD_VST) bar before the writer, in addition to
-    the writer's trailing VST_VLD."""
+def test_no_tilelang_side_backing_bars():
+    """A read unit followed by a writing unit on the same backing: no
+    TileLang-side VLD_VST/VST_VLD bar is emitted — cross-unit WAR and RAW
+    ordering alike are delegated to the toolchain's automatic vecscope
+    barriers (PR307; merged-lineage toolchain floor)."""
     lanes = 128
 
     @T.prim_func
@@ -1381,12 +1364,7 @@ def test_cross_unit_war_bar():
 
     mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
     bars = [str(b) for b in _mem_bars(mod)]
-    assert any("VLD_VST" in b for b in bars), bars
-    # Unit sequence: write(init), read, write(needs WAR before + RAW
-    # after), read. Expected: VST_VLD after init; VLD_VST before the
-    # third; VST_VLD after the third.
-    assert len([b for b in bars if "VLD_VST" in b]) == 1, bars
-    assert len([b for b in bars if "VST_VLD" in b]) == 2, bars
+    assert len(bars) == 0, bars
 
 
 @pytest.mark.pto
@@ -1440,6 +1418,134 @@ def test_unaligned_ub_to_fragment_copy_rejected():
     assert error is not None
     text = str(error)
     assert "unaligned fragment region" in text, text
+
+
+# ---------------------------------------------------------------------------
+# Solver determinism: fixed solution sets (byte-minimal and tie-break)
+# and 1D-unit lane pinning
+# ---------------------------------------------------------------------------
+
+
+def _region_layouts(mod, region_index=0):
+    """The solved Fragment layouts recorded on the converting region's
+    layout_map annotation, keyed by buffer name."""
+    simdvf = _simdvf_block(mod)
+    assert simdvf is not None
+    anno = simdvf.annotations.get("layout_map")
+    assert anno is not None, "region must carry its layout_map"
+    out = {}
+    for buffer, layout in anno.items():
+        out[buffer.name] = layout
+    return out
+
+
+@pytest.mark.pto
+def test_solver_fixed_solution_byte_minimal():
+    """A reverse-linked pair (g[j, i] = f[i, j]) in a UB-free unit leaves
+    both roots valid; the byte-minimal one wins deterministically.
+    f[128,4] + g[4,128] at VL=128: the chosen root reserves 4 + 4
+    entries, the flipped root 128 + 128 — assert the exact counts."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                f = T.alloc_fragment((128, 4), "float32")
+                g = T.alloc_fragment((4, 128), "float32")
+                # A converting UB unit so the region is a real kernel.
+                for i in T.Parallel(lanes):
+                    b_ub[i] = a_ub[i]
+                # The reverse-linked pair: UB-free unit, both directions
+                # feasible with flipped lane dims.
+                for i, j in T.Parallel(128, 4):
+                    g[j, i] = f[i, j] + T.float32(1.0)
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "PlanPtoSlotStorage")
+    layouts = _region_layouts(mod)
+    counts = {name: int(layout.get_output_shape()[0])
+              for name, layout in layouts.items()
+              if hasattr(layout, "get_output_shape")}
+    assert counts.get("f") == 4, counts
+    assert counts.get("g") == 4, counts
+
+
+@pytest.mark.pto
+def test_solver_tie_break_first_unit_inner():
+    """Equal-byte tie (f[128,128] + g[4,128]-shaped pair at VL=128 where
+    both roots cost the same): the source-order-first free unit takes
+    the inner direction, and the tie is resolved to a fixed solution —
+    both counts equal and the converted offsets carry both loop terms
+    (a flipped pick would erase one of them)."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                f = T.alloc_fragment((128, 128), "float32")
+                g = T.alloc_fragment((128, 128), "float32")
+                for i in T.Parallel(lanes):
+                    b_ub[i] = a_ub[i]
+                for i, j in T.Parallel(128, 128):
+                    g[j, i] = f[i, j] + T.float32(1.0)
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "PlanPtoSlotStorage")
+    layouts = _region_layouts(mod)
+    counts = {name: int(layout.get_output_shape()[0])
+              for name, layout in layouts.items()
+              if hasattr(layout, "get_output_shape")}
+    assert counts.get("f") == 128, counts
+    assert counts.get("g") == 128, counts
+    # The tie pick (first free unit -> inner) keeps both loop terms in
+    # the converted f-store offset; the flipped pick would collapse one.
+    # The tie pick is pinned by the lane dims: first free unit takes the
+    # inner direction, so f's storage lane is the inner input dim (_j)
+    # and g's is the outer (_i); the flipped pick would swap them.
+    f_thread = str(layouts["f"].forward_thread)
+    g_thread = str(layouts["g"].forward_thread)
+    assert f_thread == "_j", f_thread
+    assert g_thread == "_i", g_thread
+
+
+@pytest.mark.pto
+def test_solver_1d_unit_pins_dim0():
+    """A 1D unit accessing f[i, 0] (design §4 case 2): the dependency
+    pins the lane dim to 0; f[256, 4] at VL=128 reserves ceil(256/128)*4
+    = 8 entries. All units are 1D so no 2D readout can contradict the
+    pin."""
+    lanes = 128
+    M, N = 256, 4
+
+    @T.prim_func
+    def main(A: T.Tensor((M,), "float32"), B: T.Tensor((M,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((M,), "float32")
+            b_ub = T.alloc_shared((M,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((M, N), "float32")
+                for i in T.Parallel(M):
+                    keep[i, 0] = a_ub[i]
+                for i in T.Parallel(M):
+                    b_ub[i] = keep[i, 0]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "PlanPtoSlotStorage")
+    plans = _slot_plans(mod)
+    assert len(plans) == 1
+    assert plans[0][1].count == 2 * N, (
+        f"lane dim 0 for f[{M},{N}] at VL={lanes} reserves "
+        f"ceil({M}/{lanes})*{N} = {2 * N} entries, got {plans[0][1].count}"
+    )
 
 
 if __name__ == "__main__":
