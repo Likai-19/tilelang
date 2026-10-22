@@ -1221,6 +1221,30 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     return LaneUse::kUnknown;
   }
   if (const auto *load = expr.as<BufferLoadNode>()) {
+    // Fragment loads in value positions classify through the fragment
+    // access proof when a solved layout is in scope (R4 §3.6): the UB
+    // address proof cannot see the slot backing's layout and would
+    // misclassify legal whole-entry reads. Storage lane == execution
+    // lane -> Varying; anything else reports the fragment reason.
+    if (load->buffer.scope() == "local.fragment" &&
+        ctx->fragment_layout_lookup != nullptr) {
+      Optional<Fragment> layout_opt = ctx->fragment_layout_lookup(load->buffer);
+      if (layout_opt.has_value()) {
+        try {
+          AnalyzeFragmentAccess(load->buffer, load->indices,
+                                /*is_write=*/false, ctx->loop_var,
+                                ctx->mapping, layout_opt.value(),
+                                ctx->analyzer, ctx->bind_env,
+                                ctx->outer_loop_ranges);
+          return LaneUse::kVarying;
+        } catch (const PtoAnalysisError &err) {
+          if (reason != nullptr) {
+            *reason = err.what();
+          }
+          return LaneUse::kUnknown;
+        }
+      }
+    }
     try {
       auto access = AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, ctx->loop_var,

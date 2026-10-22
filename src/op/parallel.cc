@@ -21,6 +21,7 @@
 
 #include "../layout/layout.h"
 #include "../layout/utils.h"
+#include "../ascend/transform/pto_fragment_layout_solver.h"
 #include "../transform/loop_partition.h"
 #include "../transform/loop_vectorize.h"
 #include "arith/int_operator.h"
@@ -1137,7 +1138,7 @@ std::pair<int64_t, int64_t> CheckedPaddingForInference(int64_t extent,
 
 int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
                          int64_t M, int64_t N, int64_t lanes,
-                         std::string *why) {
+                         const LayoutMap &solved_layouts, std::string *why) {
   PtoAccessCollector collector;
   collector(root->body);
 
@@ -1167,6 +1168,44 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
       // Per-lane register (T.alloc_var): no lane-address classification; the
       // whole-buffer form is promoted to a vreg by VectorizeParallelToPTO.
       if (pto::IsLaneScalarBuffer(access.buffer)) {
+        continue;
+      }
+      // Fragment buffers exit the continuity proof: their logical
+      // row-major strides say nothing about the slot backing's layout.
+      // The jointly solved layout (injected ahead of inference, R4 §3.7)
+      // instead constrains the direction: exactly the layout's lane dim
+      // may depend on the candidate's vectorized coordinate. A fragment
+      // without a solved layout falls back to the legacy continuity
+      // proof below (it keeps pre-solver inputs buildable).
+      const bool is_fragment = access.buffer.scope() == "local.fragment";
+      if (is_fragment && solved_layouts.count(access.buffer) != 0) {
+        const Fragment solved = solved_layouts[access.buffer].as<Fragment>().value();
+        const int lane_dim = pto::PtoFragmentLaneDim(solved);
+        ICHECK_GE(lane_dim, 0)
+            << "[PTO layout inference] the solved layout for fragment `"
+            << access.buffer->name
+            << "` lost its canonical single-dim lane form";
+        int deps = 0;
+        int dep_dim = -1;
+        for (size_t d = 0; d < access.indices.size(); ++d) {
+          if (tirx::UsesVar(access.indices[d], [&](const VarNode *var_node) {
+                return var_node == sel_var.get();
+              })) {
+            ++deps;
+            dep_dim = static_cast<int>(d);
+          }
+        }
+        if (deps != 1 || dep_dim != lane_dim) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << access.buffer->name
+              << "` is accessed with indices " << access.indices
+              << ", which do not address the solved layout's lane "
+                 "dimension "
+              << lane_dim << " under the "
+              << (select_inner ? "inner (j)" : "outer (i)") << " mapping";
+          *why = oss.str();
+          return false;
+        }
         continue;
       }
       // Resolve Bind aliases per index with the shared resolver (cycle /
@@ -1379,8 +1418,9 @@ ParallelOpNode::InferPtoSimdLayout(const LayoutInferArgs &layout_args) const {
     const Var &i_var = loop_vars_[0]->var;
     const Var &j_var = loop_vars_[1]->var;
     std::string candidate_why;
-    int required =
-        PtoRequiredVectorDim(root_, i_var, j_var, M, N, lanes, &candidate_why);
+    int required = PtoRequiredVectorDim(root_, i_var, j_var, M, N,
+                                         lanes, layout_args.layout_map,
+                                         &candidate_why);
     if (required < 0) {
       // Both candidates failed (an access that is neither continuous nor a
       // lane-uniform load under the padded domain). Report the concrete
@@ -1475,6 +1515,14 @@ ParallelOpNode::InferPtoSimdLayout(const LayoutInferArgs &layout_args) const {
   LayoutMap buffer_layouts;
   for (const Buffer &buffer : access_order_) {
     if (!IsFragmentBuffer(buffer)) {
+      continue;
+    }
+    // The joint solver already fixed this buffer's layout and injected
+    // it ahead of inference (R4 §3.5): the injected entry is the fact
+    // the dimension selection consumed, so re-proposing here could only
+    // disagree with it at the merge point. Skip; the access proofs in
+    // Verify/Vectorize check every concrete access against it.
+    if (layout_args.layout_map.count(buffer) != 0) {
       continue;
     }
     const auto &access = GetAccessInfo(buffer);

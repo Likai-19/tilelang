@@ -353,8 +353,10 @@ private:
         if (!parent_->FindSlotPlanInScope(buffer).has_value()) {
           std::ostringstream oss;
           oss << "fragment buffer `" << buffer->name
-              << "` has no tl.pto_slot_plan record in scope; "
-                 "PlanPtoSlotStorage must run before VerifyParallelToPTO";
+              << "` has no slot plan in scope. Either the buffer is "
+                 "shared across SIMD_VF regions (a fragment must stay "
+                 "inside the single region that owns it), or the "
+                 "PlanPtoSlotStorage stage was dropped from the pipeline";
           parent_->Fail("fragment access", oss.str());
         }
         if (!pto_analysis::IsSupportedElementDType(buffer->dtype)) {
@@ -626,6 +628,13 @@ private:
       ctx.analyzer = &analyzer_;
       ctx.bind_env = bind_env_;
       ctx.external_defs = external_defs_;
+      // Fragment loads in value positions classify against the solved
+      // slot layout in scope (R4 §3.6) instead of the UB address proof,
+      // with the same outer-loop ranges the access check binds.
+      ctx.fragment_layout_lookup = [this](const tirx::Buffer &buffer) {
+        return parent_->FindFragmentLayoutInScope(buffer);
+      };
+      ctx.outer_loop_ranges = outer_loop_ranges_;
       ctx.classified = classified_;
       return ctx;
     }
@@ -1180,7 +1189,17 @@ private:
     if (op->kind != ForKind::kParallel) {
       std::set<const VarNode *> saved = defs_;
       defs_.insert(op->loop_var.get());
+      // Kernel-level serial loops stay in scope for nested regions: bind
+      // the range so a fragment entry depending on them (f[b, j]) proves
+      // its interval exactly as WalkRegion's region-level wrappers do.
+      Map<Var, Range> saved_ranges = region_loop_ranges_;
+      if (op->min.as<IntImmNode>() != nullptr &&
+          op->extent.as<IntImmNode>() != nullptr) {
+        region_loop_ranges_.Set(
+            op->loop_var, Range::FromMinExtent(op->min, op->extent));
+      }
       StmtExprVisitor::VisitStmt_(op);
+      region_loop_ranges_ = std::move(saved_ranges);
       defs_ = std::move(saved);
       return;
     }

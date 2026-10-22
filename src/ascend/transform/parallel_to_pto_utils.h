@@ -20,6 +20,7 @@
 
 #include <optional>
 #include <set>
+#include <functional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -352,6 +353,16 @@ struct LaneUseContext {
   std::set<const VarNode *> visiting;
   /*! Recursion budget for on-demand bind analysis. */
   int budget = 256;
+  /*! Fragment-layout lookup for value classification (R4 §3.6): when
+   * set, a local.fragment BufferLoad classifies through the fragment
+   * access proof (storage lane == execution lane -> Varying) instead of
+   * the UB address proof, which cannot see the slot backing's layout.
+   * Null when the caller has no fragment layouts in scope. */
+  std::function<Optional<Fragment>(const tirx::Buffer &)> fragment_layout_lookup;
+  /*! Serial loop ranges in scope at the classified access (the same set
+   * the access check binds), so the fragment dispatch proves the same
+   * entry interval. */
+  Map<Var, Range> outer_loop_ranges;
 };
 
 /*! Classify \p expr bottom-up. Constants and *known*

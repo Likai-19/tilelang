@@ -27,6 +27,7 @@
 #include "arith/ir_visitor_with_analyzer.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
+#include "ascend/transform/pto_fragment_layout_solver.h"
 #include "ascend/transform/vf_regions.h"
 #include "backend/common/target_utils.h"
 #include "config.h"
@@ -553,6 +554,16 @@ public:
                    in_queue);
     }
   };
+
+  /*! Inject the PTO-solved fragment layouts into the initial layout
+   * map so the engine treats them as pre-determined facts (strict
+   * semantics; step 0's floating seed skips buffers that already have a
+   * layout). Called between Collect() and Run(). */
+  void InjectInitialLayouts(const LayoutMap &layouts) {
+    for (const auto &[buffer, layout] : layouts) {
+      annotated_layout_map_.Set(buffer, layout);
+    }
+  }
 
   LayoutInferenceResult Run() {
     // Basic consistency check: infer_list_ and thread_index_vec_ should have
@@ -1493,6 +1504,13 @@ private:
   std::vector<std::unique_ptr<arith::Analyzer>> analyzer_vec_;
   L0SFBindings l0_sf_bindings_;
   Target target_;
+public:
+  const LayoutMap &annotated_layout_map() const {
+    return annotated_layout_map_;
+  }
+  bool target_is_pto() const { return target_is_pto_; }
+
+private:
   LayoutMap annotated_layout_map_;
 
   std::vector<TileOperator> BackupInferList() {
@@ -1803,14 +1821,22 @@ public:
     BufferUseDefCollector collector;
     collector.Collect(f);
 
-    /* The PTO-side multi-subscript collection opt-in lives in
-    BufferUseDefCollector's Parallel visitor (ParallelOp construction with
-    InsidePtoSimdVF). The parity layout solver from R4 v5 is NOT wired in
-    here: its edge encoding produced contradictory constraints (every
-    f[i,j] access reported a parity conflict) and most of the designed
-    pre-scan contract was missing, so it was withdrawn. Re-land it as a
-    pre-solve step at exactly this position (between Collect() and Run())
-    once it is rewritten per the R4 design. */
+    // PTO fragment layout pre-solve (R4 §3.0): after the whole function
+    // is collected (kernel-level annotations loaded) and before the
+    // engine's staged inference, jointly derive every converting region's
+    // fragment layouts — pre-scan rejections (out-of-region access, view
+    // sharing, annotation forms), the parity solve, and the canonical
+    // layouts injected as pre-determined facts. InferPtoSimdLayout skips
+    // re-proposing injected entries and consumes them as direction
+    // constraints in its dimension selection.
+    if (collector.target_is_pto()) {
+      auto pto_layouts =
+          pto::SolvePtoFragmentLayouts(f->body, /*target_is_pto=*/true,
+                                       collector.annotated_layout_map());
+      if (pto_layouts.has_value()) {
+        collector.InjectInitialLayouts(pto_layouts.value());
+      }
+    }
     auto result = collector.Run();
     LayoutInferencer substituter(result, &analyzer);
     fptr->body = substituter.VisitStmt(f->body);
