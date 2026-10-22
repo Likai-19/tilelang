@@ -332,7 +332,10 @@ def test_ordinary_broadcast_keeps_conservative_extent(dtype, size):
     # The declaration is not re-expressed as a broadcast output width: it stays
     # `size` address elements (a conservative over-report).
     assert _descriptor(artifact, "tl.vmi.vload") == (64, size, 1, 0)
-    assert 'dist_mode="brc"' in artifact.kernel_source
+    # PTODSL removed dist_mode: the broadcast is a one-element load plus
+    # vbrc (PTOAS !293 migration contract).
+    assert 'dist_mode' not in artifact.kernel_source
+    assert "pto.vmi.vbrc(pto.vmi.vload(" in artifact.kernel_source
 
     kernel = _compile_pto(main)
     assert "pto.vmi.vload(" in kernel.get_kernel_source()
@@ -406,10 +409,11 @@ def test_dintlv_store_declares_full_two_input_span(mask_lanes):
     assert _descriptor(artifact, "tl.vmi.vstore") == (192, 128, 2, 0)
 
     source = artifact.kernel_source
-    vstore_line = next(ln.strip() for ln in source.splitlines() if "vmi.vstore" in ln)
-    # IR/API keep "dintlv"; only the PTODSL attribute is mapped to "intlv".
-    assert 'dist_mode="intlv"' in vstore_line, vstore_line
-    assert 'dist_mode="dintlv"' not in vstore_line, vstore_line
+    # PTODSL removed dist_mode: the interleaved store is vintlv followed
+    # by two contiguous vstores (PTOAS !293 migration contract).
+    assert 'dist_mode' not in source
+    assert "pto.vmi.vintlv(" in source
+    assert source.count("pto.vmi.vstore(") >= 2
     _, store_call = _single(artifact, "tl.vmi.vstore")
     assert store_call.annotations["dist_mode"].value == "dintlv"
 

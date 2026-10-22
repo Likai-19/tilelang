@@ -252,6 +252,56 @@ def _multi_chunk_keep(M, N, lanes):
     return main
 
 
+def _first_dim_lanes(M, N, lanes):
+    """B1 shape: lanes fall on the FIRST logical dimension (the UB access
+    is transposed): the joint solver picks lane dim 0 and the whole
+    round trip must carry the transposition."""
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((N, M), "float32"),
+        Out: T.Buffer((N, M), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((N, M), "float32")
+            out_ub = T.alloc_shared((N, M), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((M, N), "float32")
+                for i, j in T.Parallel(M, N):
+                    keep[i, j] = a_ub[j, i]
+                for i, j in T.Parallel(M, N):
+                    out_ub[j, i] = keep[i, j] * T.float32(2.0)
+            T.copy(out_ub, Out)
+
+    return main
+
+
+def _unaligned_fill(E, lanes):
+    """G2 shape: an unaligned fill region initializes the middle chunk;
+    lanes outside the region keep the fragment's previous value."""
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((E,), "float32"),
+        Out: T.Buffer((E,), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((E,), "float32")
+            out_ub = T.alloc_shared((E,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((E,), "float32")
+                for i in T.Parallel(E):
+                    keep[i] = a_ub[i]
+                T.fill(keep[lanes // 2 : lanes // 2 + lanes], T.float32(7.0))
+                for i in T.Parallel(E):
+                    out_ub[i] = keep[i]
+            T.copy(out_ub, Out)
+
+    return main
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -341,6 +391,34 @@ def test_multi_chunk_keep_numeric(npu, lanes):
         _multi_chunk_keep(M, N, lanes),
         (a.to(npu),),
         a * 2.0 + 1.0,
+        source_checks=_assert_backing_source(),
+    )
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("lanes", [128])
+def test_first_dim_lanes_numeric(npu, lanes):
+    M, N = 256, 4
+    a = torch.randn(N, M)
+    _run_and_check(
+        _first_dim_lanes(M, N, lanes),
+        (a.to(npu),),
+        a * 2.0,
+        source_checks=_assert_backing_source(),
+    )
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("lanes", [128])
+def test_unaligned_fill_numeric(npu, lanes):
+    E = 2 * lanes
+    a = torch.randn(E)
+    expected = a.clone()
+    expected[lanes // 2 : lanes // 2 + lanes] = 7.0
+    _run_and_check(
+        _unaligned_fill(E, lanes),
+        (a.to(npu),),
+        expected,
         source_checks=_assert_backing_source(),
     )
 

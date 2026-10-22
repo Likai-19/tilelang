@@ -498,11 +498,13 @@ def test_region_level_fragment_access_rejected():
     _, error = _lower_capture(main, "VectorizeParallelToPTO", expect_error=True)
     assert error is not None
     text = str(error)
-    # The bare region-level statement is wrapped by the frontend into an
-    # implicit extent-1 unit, so it may hit either the region-level
-    # fragment rule or the pre-existing lane-uniform store rejection — both
-    # are correct rejections of the single-element fragment extract.
-    assert "outside the converting T.Parallel bodies" in text or "not yet supported" in text, text
+    # The layout pre-scan rejects region-level fragment access ahead of
+    # Verify (A2). The bare statement is wrapped by the frontend into an
+    # implicit extent-1 unit, so it lands either on the out-of-unit rule
+    # or on the whole-entry dependency conflict — both name the buffer
+    # and reject the single-element extract.
+    assert ("accessed outside a converting T.Parallel body" in text or
+            "cannot be served by whole-entry addressing" in text), text
 
 
 @pytest.mark.pto
@@ -639,7 +641,11 @@ def test_fragment_crossing_two_regions_rejected():
     _, error = _lower_capture(main, "VectorizeParallelToPTO", expect_error=True)
     assert error is not None
     text = str(error)
-    assert "no tl.pto_slot_plan record in scope" in text or "no layout_map entry" in text, text
+    # The layout pre-scan rejects cross-region fragment use up front with
+    # the ownership message (the old Verify message fired after planning).
+    assert "more than one SIMD_VF region" in text or (
+        "no slot plan in scope" in text and "shared across SIMD_VF" in text
+    ), text
 
 
 @pytest.mark.pto
@@ -1178,6 +1184,262 @@ def test_split_region_fragment_entry_ok():
     # The split produced more than one vecscope: each part declares its own
     # handle over the shared backing.
     assert len(_declares(mod)) >= 2, [str(d) for d in _declares(mod)]
+
+
+# ---------------------------------------------------------------------------
+# Joint layout solver (R4): B1 lane-on-first-dim, B5 floating, A2
+# out-of-region access, proven conflicts, kernel-level entry ranges,
+# cross-unit WAR bars, unaligned fill/copy expansion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.pto
+def test_solver_lane_dim_on_first_logical_dim():
+    """B1: orientation-consistent access with lanes on the FIRST logical
+    dimension (in_ub[j, i] forces the unit to vectorize along i). The
+    joint solver picks lane dim 0 — 8 entries for f[256, 4] at VL=128
+    (the byte-minimal choice; lane dim 1 would need 256)."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((4, 256), "float32"), B: T.Tensor((4, 256), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((4, 256), "float32")
+            b_ub = T.alloc_shared((4, 256), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((256, 4), "float32")
+                for i, j in T.Parallel(256, 4):
+                    keep[i, j] = a_ub[j, i]
+                for i, j in T.Parallel(256, 4):
+                    b_ub[j, i] = keep[i, j] * T.float32(2.0)
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "PlanPtoSlotStorage")
+    plans = _slot_plans(mod)
+    assert len(plans) == 1
+    assert plans[0][1].count == 8, (
+        f"lane dim 0 reserves ceil(256/128)*4 = 8 entries, got {plans[0][1].count}"
+    )
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    assert not _collect_stores(mod, "local.fragment")
+    assert not _collect_loads(mod, "local.fragment")
+    handle = "keep_fragment_mem"
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 1
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 1
+
+
+@pytest.mark.pto
+def test_solver_floating_fragment_gets_layout():
+    """B5: an allocated-but-unaccessed fragment (floating) gets a solved
+    layout ahead of the engine's step 0, so the FullyReplicated seed and
+    the merge-point FATAL are unreachable."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((lanes,), "float32")
+                unused = T.alloc_fragment((4, 128), "float32")
+                for i in T.Parallel(lanes):
+                    keep[i] = a_ub[i]
+                for i in T.Parallel(lanes):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    # Only the accessed fragment gets a plan/declaration; the floating one
+    # just needs a layout to exist (no FATAL during inference).
+    assert len(_declares(mod)) == 1
+
+
+@pytest.mark.pto
+def test_solver_kernel_scope_fragment_access_rejected():
+    """A2: a fragment used inside a converting region and also at kernel
+    scope (outside any region) is rejected by the pre-scan with the
+    ownership message."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((1,), "float32")
+            T.copy(A, a_ub)
+            keep = T.alloc_fragment((lanes,), "float32")
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(lanes):
+                    keep[i] = a_ub[i]
+            b_ub[0] = keep[0]
+            T.copy(b_ub, B)
+
+    _, error = _lower_capture(main, "VectorizeParallelToPTO", expect_error=True)
+    assert error is not None
+    text = str(error)
+    assert "accessed outside a converting T.Parallel body" in text, text
+
+
+@pytest.mark.pto
+def test_solver_proven_conflict_diagnosed():
+    """Two units sharing one fragment but forced onto opposite
+    vectorization directions by their UB accesses: a proven parity
+    conflict with the originating unit in the message."""
+    lanes = 128
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((128, 128), "float32"),
+        C: T.Tensor((128, 128), "float32"),
+        D: T.Tensor((128, 128), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((128, 128), "float32")
+            c_ub = T.alloc_shared((128, 128), "float32")
+            d_ub = T.alloc_shared((128, 128), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((128, 128), "float32")
+                # a[i, j] is continuous along j: forces the inner
+                # direction, so keep's lane dim must be 1.
+                for i, j in T.Parallel(128, 128):
+                    keep[i, j] = a_ub[i, j]
+                # c[j, i] is continuous along i only: forces the outer
+                # direction, so keep's lane dim must be 0 — a proven
+                # conflict with the first unit.
+                for i, j in T.Parallel(128, 128):
+                    c_ub[j, i] = keep[i, j]
+                for i, j in T.Parallel(128, 128):
+                    d_ub[i, j] = T.float32(0.0)
+            T.copy(c_ub, C)
+            T.copy(d_ub, D)
+
+    _, error = _lower_capture(main, "VectorizeParallelToPTO", expect_error=True)
+    assert error is not None
+    text = str(error)
+    assert "proven layout conflict" in text, text
+
+
+@pytest.mark.pto
+def test_kernel_level_loop_fragment_entry_ok():
+    """A4 (extended): a fragment entry depending on a serial loop at
+    KERNEL scope (outside the region) proves its interval on both sides —
+    previously rejected because neither side bound the range."""
+    lanes = 128
+    K = 4
+
+    @T.prim_func
+    def main(A: T.Tensor((K * lanes,), "float32"), B: T.Tensor((K * lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((K * lanes,), "float32")
+            b_ub = T.alloc_shared((K * lanes,), "float32")
+            T.copy(A, a_ub)
+            keep = T.alloc_fragment((K, lanes), "float32")
+            with T.SimdVF(lanes=lanes):
+                for b in T.serial(K):
+                    for j in T.Parallel(lanes):
+                        keep[b, j] = a_ub[b * lanes + j]
+                for b in T.serial(K):
+                    for j in T.Parallel(lanes):
+                        b_ub[b * lanes + j] = keep[b, j]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    handle = "keep_fragment_mem"
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 1
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 1
+    assert not _collect_stores(mod, "local.fragment")
+
+
+@pytest.mark.pto
+def test_cross_unit_war_bar():
+    """A1: a unit that only reads the backing followed by a unit that
+    writes it gets a WAR (VLD_VST) bar before the writer, in addition to
+    the writer's trailing VST_VLD."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((lanes,), "float32")
+                for i in T.Parallel(lanes):
+                    keep[i] = a_ub[i]
+                for i in T.Parallel(lanes):
+                    b_ub[i] = keep[i] + T.float32(1.0)
+                for i in T.Parallel(lanes):
+                    keep[i] = b_ub[i] * T.float32(2.0)
+                for i in T.Parallel(lanes):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    bars = [str(b) for b in _mem_bars(mod)]
+    assert any("VLD_VST" in b for b in bars), bars
+    # Unit sequence: write(init), read, write(needs WAR before + RAW
+    # after), read. Expected: VST_VLD after init; VLD_VST before the
+    # third; VST_VLD after the third.
+    assert len([b for b in bars if "VLD_VST" in b]) == 1, bars
+    assert len([b for b in bars if "VST_VLD" in b]) == 2, bars
+
+
+@pytest.mark.pto
+def test_unaligned_fill_expands_predicated():
+    """G2: an unaligned fill region (min 64 at VL=128) expands to the
+    predicated whole-entry form instead of being rejected."""
+    lanes = 128
+
+    @T.prim_func
+    def main(B: T.Tensor((2 * lanes,), "float32")):
+        with T.Kernel(1):
+            b_ub = T.alloc_shared((2 * lanes,), "float32")
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((2 * lanes,), "float32")
+                T.fill(keep[lanes // 2 : lanes // 2 + lanes], T.float32(7.0))
+                for i in T.Parallel(lanes):
+                    keep[i] = keep[i] + T.float32(1.0)
+                for i in T.Parallel(2 * lanes):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    handle = "keep_fragment_mem"
+    # predicated fill round: 1 store (mask guards the unaligned head);
+    # RMW round: 1 load + 1 store; read-out: 1 load.
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 2
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 2
+    assert not _collect_stores(mod, "local.fragment")
+
+
+@pytest.mark.pto
+def test_unaligned_ub_to_fragment_copy_rejected():
+    """G2: an unaligned fragment destination in a UB-to-fragment copy
+    cannot stay whole-entry without reading past the source — rejected."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((2 * lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((2 * lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((2 * lanes,), "float32")
+                T.copy(a_ub[0:lanes], keep[lanes // 2 : lanes // 2 + lanes])
+                for i in T.Parallel(2 * lanes):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    _, error = _lower_capture(main, "ExpandPtoFragmentFillCopy", expect_error=True)
+    assert error is not None
+    text = str(error)
+    assert "unaligned fragment region" in text, text
 
 
 if __name__ == "__main__":
