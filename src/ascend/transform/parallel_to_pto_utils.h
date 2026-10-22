@@ -176,6 +176,41 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
                                  arith::Analyzer *analyzer,
                                  const Map<Var, PrimExpr> &bind_env = {});
 
+/*! \brief Result of the shared fragment-buffer (local.fragment) access
+ * analysis against the buffer's slot layout.
+ *
+ * Verify consumes the legality proofs (storage lane == execution lane,
+ * entry free of the lane coordinate); Vectorize additionally consumes
+ * entry_expr to index the slot (after binding lane=0 and chunk=q).
+ */
+struct FragmentAccess {
+  Buffer buffer;
+  /*! The buffer's entry/lane layout from the SBlock layout_map. */
+  Fragment layout;
+  /*! Entry index expression over (chunk, lane, kept coordinates) after the
+   * inverse lane substitution; lane-free by proof. */
+  PrimExpr entry_expr;
+  bool is_write = false;
+};
+
+/*! Classify one local.fragment buffer access against its slot layout.
+ * \p layout is the buffer's Fragment from the enclosing SBlock's
+ * layout_map (forward_thread = storage lane, forward_index[0] = slot
+ * entry, both over the buffer's logical coordinates). The helper resolves
+ * bind aliases, substitutes the inverse lane mapping into the access
+ * indices, and proves with the analyzer over the full lane range that
+ * (a) the layout's forward_thread of the accessed element equals the
+ * execution lane and (b) the entry expression does not depend on the
+ * lane. Returns a fully populated FragmentAccess or throws
+ * PtoAnalysisError with the reason. */
+FragmentAccess AnalyzeFragmentAccess(const Buffer &buffer,
+                                     const Array<PrimExpr> &indices,
+                                     bool is_write, const Var &loop_var,
+                                     const PtoInverseMapping &mapping,
+                                     const Fragment &layout,
+                                     arith::Analyzer *analyzer,
+                                     const Map<Var, PrimExpr> &bind_env = {});
+
 /*! Check whether a dtype is supported by the unified element
  * addressing convention: the buffer element dtype itself must not carry
  * vector lanes and must not be a packed sub-byte type (FP4 etc.).

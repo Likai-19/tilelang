@@ -85,6 +85,13 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = ascend_transform.UnrollLoopSkipVF()(mod)
     mod = tilelang.transform.Simplify()(mod)
 
+    if target_is_pto(target):
+        # Rewrite fragment-touching T.fill/T.copy inside converting SIMD_VF
+        # regions into T.Parallel loops before inference, so their accesses
+        # join the ordinary PTO unit conversion (entry/lane layout, chunk
+        # masks, slot emission) instead of the tileop fill/copy lowering.
+        mod = ascend_transform.ExpandPtoFragmentFillCopy()(mod)
+
     mod = ascend_transform.AscendLayoutInference()(mod)
     mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
     LayoutVisual(mod)

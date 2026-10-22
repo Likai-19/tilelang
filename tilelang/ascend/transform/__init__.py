@@ -201,6 +201,19 @@ def PlanPtoSlotStorage():
     return _ffi_api.PlanPtoSlotStorage()  # type: ignore
 
 
+def ExpandPtoFragmentFillCopy():
+    """Expand fragment-touching T.fill/T.copy into T.Parallel loops.
+
+    Runs on the PTO target only, before layout inference: inside a
+    converting SimdVF region, a fill or copy call that touches a
+    local.fragment buffer is rewritten in place into its equivalent
+    parallel loops, so the accesses join the ordinary PTO unit conversion
+    (entry/lane layout, chunk masks, slot emission) instead of the tileop
+    fill/copy lowering. Calls that touch no fragment buffer are left
+    untouched.
+    """
+    return _ffi_api.ExpandPtoFragmentFillCopy()  # type: ignore
+
 
 def VectorizeParallelToPTO():
     """Rewrite verified T.Parallel loops inside PTO SIMD_VF blocks into

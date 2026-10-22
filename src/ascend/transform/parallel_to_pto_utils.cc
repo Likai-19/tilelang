@@ -572,6 +572,131 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
   throw PtoAnalysisError(oss.str());
 }
 
+FragmentAccess AnalyzeFragmentAccess(const Buffer &buffer,
+                                     const Array<PrimExpr> &indices,
+                                     bool is_write, const Var &loop_var,
+                                     const PtoInverseMapping &mapping,
+                                     const Fragment &layout,
+                                     arith::Analyzer *analyzer,
+                                     const Map<Var, PrimExpr> &bind_env) {
+  FragmentAccess access;
+  access.buffer = buffer;
+  access.layout = layout;
+  access.is_write = is_write;
+
+  ICHECK(layout.defined())
+      << "AnalyzeFragmentAccess requires a layout for buffer " << buffer->name;
+  ICHECK_EQ(layout->GetForwardIndex().size(), 1u)
+      << "fragment layout for buffer `" << buffer->name
+      << "` must have exactly one entry dimension, got "
+      << layout->GetForwardIndex().size();
+  if (indices.size() != layout->InputDim()) {
+    std::ostringstream oss;
+    oss << "fragment buffer `" << buffer->name << "` access has "
+        << indices.size() << " indices but its layout is " << layout->InputDim()
+        << "D";
+    throw PtoAnalysisError(oss.str());
+  }
+
+  // Resolve bind aliases and reject opaque address terms, exactly like the
+  // UB access analysis (the same reasons apply: alias chains hide lane
+  // dependence, loaded values would make the entry data-dependent).
+  Array<PrimExpr> resolved;
+  for (const auto &idx : indices) {
+    auto opt = ResolveIndexAliases(idx, bind_env);
+    if (!opt.has_value()) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name
+          << "`: bind alias chain in index is too deep, cyclic, or "
+             "depends on a loaded value (data-dependent slot entries are "
+             "not yet supported)";
+      throw PtoAnalysisError(oss.str());
+    }
+    resolved.push_back(opt.value());
+  }
+  for (const auto &idx : resolved) {
+    if (!IsSupportedAddressExpr(idx)) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name
+          << "`: address expression contains a loaded value or an "
+             "unsupported call (loaded values and opaque/extern calls "
+             "cannot appear in slot addresses)";
+      throw PtoAnalysisError(oss.str());
+    }
+  }
+
+  // Substitute the inverse lane mapping into the access indices, then
+  // evaluate the layout's forward maps over the substituted logical
+  // coordinates.
+  Array<PrimExpr> indices_after_inverse;
+  for (const auto &idx : resolved) {
+    indices_after_inverse.push_back(analyzer->Simplify(
+        SubstituteVar(idx, loop_var.get(), mapping.index_expr)));
+  }
+
+  // The layout's forward expressions are over InputPlaceholder(i); a
+  // storage-lane / entry pair for this concrete access is their
+  // substitution with the (inverse-mapped) access indices.
+  Map<Var, PrimExpr> coord_map;
+  for (size_t i = 0; i < indices_after_inverse.size(); ++i) {
+    coord_map.Set(InputPlaceholder(i), indices_after_inverse[i]);
+  }
+  PrimExpr storage_lane =
+      analyzer->Simplify(Substitute(layout->GetForwardThread(), coord_map));
+  PrimExpr entry_expr =
+      analyzer->Simplify(Substitute(layout->GetForwardIndex()[0], coord_map));
+
+  // Proof domain identical to AnalyzeBufferAccess: full lane range,
+  // per-row chunk range, kept-coordinate range.
+  arith::Analyzer proof;
+  proof.Bind(
+      mapping.lane_var,
+      Range::FromMinExtent(make_zero(mapping.lane_var->dtype),
+                           IntImm(mapping.lane_var->dtype, mapping.lanes)));
+  proof.Bind(mapping.chunk_var,
+             Range::FromMinExtent(
+                 make_zero(mapping.chunk_var->dtype),
+                 IntImm(mapping.chunk_var->dtype, mapping.chunk_count)));
+  if (mapping.is_2d && mapping.serial_var() != nullptr) {
+    const VarNode *serial = mapping.serial_var();
+    const int64_t kept_extent =
+        mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
+    proof.Bind(GetRef<Var>(serial),
+               Range::FromMinExtent(make_zero(serial->dtype),
+                                    IntImm(serial->dtype, kept_extent)));
+  }
+
+  // (a) storage lane == execution lane. A shifted access (B[i, j+1]) or a
+  // cross-lane permutation (B[VL-1-lane]) fails here.
+  if (!proof.CanProveEqual(storage_lane, mapping.lane_var)) {
+    std::ostringstream oss;
+    oss << "fragment buffer `" << buffer->name
+        << "`: the accessed element's storage lane (" << storage_lane
+        << ") does not equal the execution lane; accesses that shift or "
+           "permute lanes across the slot layout have no lowering";
+    throw PtoAnalysisError(oss.str());
+  }
+
+  // (b) the entry is uniform across this round's lanes (dynamic chunk /
+  // kept-coordinate terms are fine — they address different entries per
+  // round, never per lane).
+  {
+    PrimExpr at_zero = proof.Simplify(SubstituteVar(
+        entry_expr, mapping.lane_var.get(), make_zero(entry_expr.dtype())));
+    if (!proof.CanProveEqual(entry_expr, at_zero)) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name << "`: the slot entry index ("
+          << entry_expr
+          << ") depends on the lane coordinate; a whole-entry slot "
+             "read/write cannot express lanes spread across entries";
+      throw PtoAnalysisError(oss.str());
+    }
+  }
+
+  access.entry_expr = entry_expr;
+  return access;
+}
+
 bool IsSupportedElementDType(DataType dtype) {
   // No packed sub-byte element types (FP4 etc.), no
   // buffer-element dtypes that already carry vector lanes, and no FP64
