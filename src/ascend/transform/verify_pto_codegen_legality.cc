@@ -1079,10 +1079,24 @@ private:
     }
     if (IsDeclareBackedPointer(op->args[1])) {
       // A fragment storage handle: the backing is reserved with the
-      // merge alignment and every access is a whole entry
-      // (entry * lanes elements) from the declared base, so the store is
-      // aligned by construction and there is no pointer expression to
-      // resolve.
+      // merge alignment, so alignment reduces to the element offset
+      // addressing whole entries (entry * lanes elements — a multiple of
+      // lanes * element bytes, hence of 32). Prove the offset's
+      // granularity here instead of trusting the pointer's origin.
+      const int64_t lanes = DeclareBackedLanes(op->args[1]);
+      ICHECK_GT(lanes, 0)
+          << "fragment storage handle lost its declaration while "
+             "checking the store";
+      if (!IsWholeEntryMultiple(op->args[2], lanes)) {
+        std::ostringstream oss;
+        oss << "explicit-mask vstore on a fragment storage handle uses "
+               "element offset "
+            << op->args[2]
+            << ", which is not a whole-entry (entry * lanes) offset; the "
+               "store would tear an entry and lose the declared "
+               "alignment";
+        LOG(FATAL) << oss.str();
+      }
       return;
     }
     const size_t store_index = next_store_index_++;
@@ -1145,6 +1159,60 @@ private:
     const auto *call = current->as<CallNode>();
     return call != nullptr &&
            call->op.same_as(tl::vmi_declare_fragment_buffer());
+  }
+
+  // Recover the declaration's lane count from a declare-backed pointer:
+  // walk the pointer bind chain to the tl.vmi.declare_fragment_buffer
+  // call and read its lanes argument. -1 when the chain does not end in
+  // a declaration (the caller's provenance check already ran).
+  int64_t DeclareBackedLanes(const PrimExpr &ptr) const {
+    const PrimExpr *current = &ptr;
+    std::unordered_set<const VarNode *> visited;
+    while (const auto *var = current->as<VarNode>()) {
+      if (!visited.insert(var).second) {
+        return -1;
+      }
+      auto it = pointer_defs_.find(var);
+      if (it == pointer_defs_.end()) {
+        return -1;
+      }
+      current = &it->second;
+    }
+    const auto *call = current->as<CallNode>();
+    if (call == nullptr ||
+        !call->op.same_as(tl::vmi_declare_fragment_buffer())) {
+      return -1;
+    }
+    const auto *lanes = call->args[2].as<IntImmNode>();
+    return lanes != nullptr ? lanes->value : -1;
+  }
+
+  // Recursive divisibility proof: the simplified offset expression must
+  // be a multiple of lanes (constants, products with a divisible const
+  // factor, sums of multiples). Anything else fails closed.
+  static bool IsWholeEntryMultiple(const PrimExpr &expr, int64_t lanes) {
+    if (const int64_t *constant = as_const_int(expr)) {
+      return *constant % lanes == 0;
+    }
+    if (const auto *mul = expr.as<MulNode>()) {
+      const int64_t *lhs = as_const_int(mul->a);
+      const int64_t *rhs = as_const_int(mul->b);
+      if ((lhs != nullptr && *lhs % lanes == 0) ||
+          (rhs != nullptr && *rhs % lanes == 0)) {
+        return true;
+      }
+      return IsWholeEntryMultiple(mul->a, lanes) &&
+             IsWholeEntryMultiple(mul->b, lanes);
+    }
+    if (const auto *add = expr.as<AddNode>()) {
+      return IsWholeEntryMultiple(add->a, lanes) &&
+             IsWholeEntryMultiple(add->b, lanes);
+    }
+    if (const auto *sub = expr.as<SubNode>()) {
+      return IsWholeEntryMultiple(sub->a, lanes) &&
+             IsWholeEntryMultiple(sub->b, lanes);
+    }
+    return false;
   }
 
   std::unordered_set<const VarNode *> ub_roots_;

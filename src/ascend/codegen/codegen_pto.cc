@@ -5543,15 +5543,45 @@ void CodeGenTileLangPTO::PrintPtoMemrefDeclare_(const CallNode *op,
   std::string address;
   int64_t constant_index = 0;
   if (TryGetConstInt(elem_index, &constant_index)) {
+    ICHECK_GE(constant_index, 0)
+        << "tl.vmi.declare_fragment_buffer backing offset must be "
+           "non-negative, got "
+        << constant_index;
     address = std::to_string(constant_index * elem_bytes);
   } else {
-    address = "(" + RemoveOutermostParentheses(PrintExpr_(elem_index)) +
+    // Dynamic backing offset: print the element index and scale in one
+    // expression. int() keeps the printed Python arithmetic exact (the
+    // TIR index may be int32; Python integers are unbounded), matching
+    // the byte-wide multiply the constant path performs.
+    address = "int(" + RemoveOutermostParentheses(PrintExpr_(elem_index)) +
               ") * " + std::to_string(elem_bytes);
   }
   os << "pto.memref_declare(" << address << ", (" << count->value *
                                                      lanes->value
      << ",), " << ScalarType(elem_dtype) << ")";
 }
+
+namespace {
+// The dist_mode annotation of a tl.vmi call, "" when absent.
+std::string VmiDistModeOf_(const CallNode *op) {
+  auto it = op->annotations.find("dist_mode");
+  if (it == op->annotations.end()) {
+    return "";
+  }
+  const auto *mode = (*it).second.as<StringImmNode>();
+  ICHECK(mode != nullptr) << "dist_mode annotation must be a string";
+  return mode->value;
+}
+
+// The size annotation of a tl.vmi call (the vector lane count).
+int64_t VmiSizeOf_(const CallNode *op) {
+  auto it = op->annotations.find("size");
+  ICHECK(it != op->annotations.end()) << "tl.vmi call requires a size";
+  const auto *size = (*it).second.as<IntImmNode>();
+  ICHECK(size != nullptr) << "tl.vmi size annotation must be an integer";
+  return size->value;
+}
+}  // namespace
 
 void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
                                           std::ostream &os) {
@@ -5566,6 +5596,12 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
   for (const auto &[key, value] : op->annotations) {
     std::string key_str = key;
     if (key_str == "loc" || key_str == "ip") {
+      continue;
+    }
+    // dist_mode no longer exists in PTODSL (removed by PTOAS!293); every
+    // form is composed at emission (see the vload/vstore branches below),
+    // and "continuous" is the default load behavior.
+    if (key_str == "dist_mode" && op_name == "tl.vmi.vload") {
       continue;
     }
     kwargs.emplace_back(std::move(key_str), value);
@@ -5642,6 +5678,63 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
       (op_name == "tl.vmi.vci" ||
        (op_name == "tl.vmi.vbrc" && !integer_source_literal)) &&
       scalar_integer_input && integer_data_result;
+
+  // Composed dist_mode forms (PTODSL removed the dist_mode kwarg,
+  // PTOAS!293): emit before the generic call prefix opens, each branch
+  // prints its own complete expression and returns.
+  auto pto_ptr_with_offset = [&](const PrimExpr &ptr,
+                                 const PrimExpr &offset) -> std::string {
+    if (is_zero(offset)) {
+      return PrintExpr_(ptr);
+    }
+    return "pto.addptr(" + PrintExpr_(ptr) + ", " +
+           RemoveOutermostParentheses(PrintExpr_(offset)) + ")";
+  };
+  if (op_name == "tl.vmi.vload" || op_name == "tl.vmi.vstore") {
+    const std::string dist_mode = VmiDistModeOf_(op);
+    if (op_name == "tl.vmi.vload" && dist_mode == "brc") {
+      // A broadcast load is a one-element load followed by vbrc.
+      ICHECK_EQ(op->args.size(), 2U) << "tl.vmi.vload expects (ptr, offset)";
+      os << "pto.vmi.vbrc(pto.vmi.vload(" << pto_ptr_with_offset(op->args[0], op->args[1])
+         << ", size=1), size=" << VmiSizeOf_(op) << ")";
+      return;
+    }
+    if (op_name == "tl.vmi.vload" && dist_mode == "dintlv") {
+      // A deinterleaved load is two contiguous loads plus vdintlv with
+      // the full mask (loads stay unmasked in the VMI contract).
+      ICHECK_EQ(op->args.size(), 2U) << "tl.vmi.vload expects (ptr, offset)";
+      const int64_t size = VmiSizeOf_(op);
+      const std::string off =
+          RemoveOutermostParentheses(PrintExpr_(op->args[1]));
+      os << "pto.vmi.vdintlv(";
+      os << "pto.vmi.vload(" << pto_ptr_with_offset(op->args[0], op->args[1])
+         << ", size=" << size << "), ";
+      os << "pto.vmi.vload(pto.addptr(" << PrintExpr_(op->args[0]) << ", ("
+         << off << ") + " << size << "), size=" << size << "), ";
+      os << "pto.vmi.create_mask(" << size << ", size=" << size << "))";
+      return;
+    }
+    if (op_name == "tl.vmi.vstore" && dist_mode == "dintlv") {
+      // An interleaved store is vintlv followed by two contiguous
+      // stores, emitted as one statement sequence (vintlv's result is an
+      // indexable pair).
+      ICHECK_GE(op->args.size(), 5U)
+          << "tl.vmi.vstore with dist_mode=dintlv expects (even, odd, ptr, "
+             "offset, mask)";
+      const int64_t size = op->args[0].dtype().lanes();
+      const std::string off =
+          RemoveOutermostParentheses(PrintExpr_(op->args[2]));
+      const std::string mask = PrintExpr_(op->args[4]);
+      os << "_di = pto.vmi.vintlv(" << PrintExpr_(op->args[0]) << ", "
+         << PrintExpr_(op->args[1]) << ", " << mask << "); ";
+      os << "pto.vmi.vstore(_di[0], "
+         << pto_ptr_with_offset(op->args[2], op->args[3]) << ", " << mask
+         << "); ";
+      os << "pto.vmi.vstore(_di[1], pto.addptr(" << PrintExpr_(op->args[2])
+         << ", (" << off << ") + " << size << "), " << mask << ")";
+      return;
+    }
+  }
 
   if (bridge_integer_source) {
     os << "pto.vmi.vinterpret_cast(";

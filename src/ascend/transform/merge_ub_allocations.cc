@@ -464,7 +464,10 @@ void CheckPtoSlotUnifiedBufferCapacity(const Stmt &body) {
           elements *= *v;
         }
         if (all_constant) {
-          total += elements * ((op->buffer->dtype.bits() + 7) / 8);
+          // Element bytes follow the element type including any packing
+          // lanes (a vector dtype occupies lanes × scalar bytes).
+          total += elements * ((op->buffer->dtype.bits() + 7) / 8) *
+                   op->buffer->dtype.lanes();
         }
       }
       tirx::StmtVisitor::VisitStmt_(op);
@@ -472,9 +475,15 @@ void CheckPtoSlotUnifiedBufferCapacity(const Stmt &body) {
   };
   DynShmemSizeCollector collector;
   collector(body);
-  ICHECK(collector.all_constant)
-      << "[MergeUBAllocations] PTO slot kernels with dynamic shared.dyn "
-         "allocations are not supported yet";
+  if (!collector.all_constant) {
+    std::ostringstream oss;
+    oss << "[MergeUBAllocations] this kernel reserves PTO slot storage "
+           "but also has a shared.dyn allocation with a symbolic shape; "
+           "the final unified-buffer capacity cannot be checked. Use "
+           "compile-time constant buffer shapes for kernels with "
+           "T.alloc_fragment";
+    LOG(FATAL) << oss.str();
+  }
   ICHECK_LE(collector.total, limit)
       << "[MergeUBAllocations] the merged unified-buffer allocation of "
       << collector.total << " bytes exceeds the target capacity of " << limit

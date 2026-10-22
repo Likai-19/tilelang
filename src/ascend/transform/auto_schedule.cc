@@ -929,8 +929,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
             << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
             << "\" capacity is negative (" << capacity
             << "). Non-eligible and fixed-version buffers already exceed"
-            << " the memory limit. Try using T.annotate_unlimit_memory(\""
-            << group_scopes[g] << "\") or reduce buffer sizes.";
+            << " the memory limit; reduce buffer sizes (raising the "
+               "limit only defers the failure to the final capacity "
+               "check, it does not make the kernel fit the device)";
       }
       int64_t min_usage = 0;
       for (int64_t idx : idxs) {
@@ -940,8 +941,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
         LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
                    << "\" capacity " << capacity
                    << " is insufficient for minimum buffer usage " << min_usage
-                   << ". Try using T.annotate_unlimit_memory(\""
-                   << group_scopes[g] << "\") or reduce buffer sizes.";
+                   << "; reduce buffer sizes (raising the limit only "
+                      "defers the failure to the final capacity check)";
       }
     }
   }
@@ -1423,12 +1424,18 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
       slot_bytes += plan->bytes;
     }
     if (slot_bytes > 0) {
-      ICHECK(shared_mem_limit > slot_bytes)
-          << "[AutoSchedule] PTO slot storage reserves " << slot_bytes
-          << " bytes of UB for fragment buffers kept across loops, but only "
-          << shared_mem_limit
-          << " bytes are available on this target; reduce the reserved "
-             "fragments or use T.annotate_unlimit_memory(\"shared\")";
+      if (shared_mem_limit <= slot_bytes) {
+        std::ostringstream oss;
+        oss << "[AutoSchedule] PTO slot storage reserves " << slot_bytes
+            << " bytes of UB for fragment buffers kept across loops, but "
+               "only "
+            << shared_mem_limit
+            << " bytes are available on this target; reduce the reserved "
+               "fragment sizes or counts (raising the limit only defers "
+               "the failure to the final capacity check — the reservation "
+               "must physically fit)";
+        LOG(FATAL) << oss.str();
+      }
       shared_mem_limit -= slot_bytes;
     }
   }
