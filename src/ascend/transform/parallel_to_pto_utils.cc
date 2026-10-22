@@ -578,7 +578,8 @@ FragmentAccess AnalyzeFragmentAccess(const Buffer &buffer,
                                      const PtoInverseMapping &mapping,
                                      const Fragment &layout,
                                      arith::Analyzer *analyzer,
-                                     const Map<Var, PrimExpr> &bind_env) {
+                                     const Map<Var, PrimExpr> &bind_env,
+                                     const Map<Var, Range> &outer_loop_ranges) {
   FragmentAccess access;
   access.buffer = buffer;
   access.layout = layout;
@@ -665,6 +666,14 @@ FragmentAccess AnalyzeFragmentAccess(const Buffer &buffer,
                Range::FromMinExtent(make_zero(serial->dtype),
                                     IntImm(serial->dtype, kept_extent)));
   }
+  // Bind outer serial loop variable ranges (from the caller's scope
+  // analysis) so the dual-sided entry interval is provable for entries
+  // that depend on outer loops: f[k, j] with k in [0, K).
+  for (const auto &[var, range] : outer_loop_ranges) {
+    if (range.defined()) {
+      proof.Bind(var, range);
+    }
+  }
 
   // (a) storage lane == execution lane. A shifted access (B[i, j+1]) or a
   // cross-lane permutation (B[VL-1-lane]) fails here.
@@ -689,6 +698,45 @@ FragmentAccess AnalyzeFragmentAccess(const Buffer &buffer,
           << entry_expr
           << ") depends on the lane coordinate; a whole-entry slot "
              "read/write cannot express lanes spread across entries";
+      throw PtoAnalysisError(oss.str());
+    }
+  }
+
+  // (c) dual-sided entry interval: min(entry) >= 0 and max(entry) < count.
+  // count comes from the layout's output shape (the entry count). The
+  // proof analyzer already binds lane/chunk/kept-coordinate ranges; any
+  // outer serial loop variable must be bound by the caller for the
+  // interval to be provable (the analyzer's Bind calls below use ranges
+  // from the mapping — outer variables not in the mapping are free and
+  // make the proof fail with a diagnostic, not a silent pass).
+  {
+    const Array<PrimExpr> output_shape = layout->OutputShape();
+    const int64_t *count_ptr = as_const_int(output_shape[0]);
+    ICHECK(count_ptr != nullptr && *count_ptr > 0)
+        << "fragment layout for buffer `" << buffer->name
+        << "` must have a constant positive entry count, got "
+        << output_shape[0];
+    const int64_t entry_count = *count_ptr;
+
+    // Try proving with the analyzer: entry >= 0 and entry < count.
+    PrimExpr lower_bound =
+        proof.Simplify(GE(entry_expr, make_zero(entry_expr.dtype())));
+    PrimExpr upper_bound = proof.Simplify(
+        LT(entry_expr, IntImm(entry_expr.dtype(), entry_count)));
+    bool lower_ok = is_one(lower_bound);
+    bool upper_ok = is_one(upper_bound);
+    if (!lower_ok) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name << "`: the slot entry index ("
+          << entry_expr << ") can be negative; entry offsets must stay in "
+          << "[0, " << entry_count << ")";
+      throw PtoAnalysisError(oss.str());
+    }
+    if (!upper_ok) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name << "`: the slot entry index ("
+          << entry_expr << ") can reach or exceed the entry count; entry "
+          << "offsets must stay in [0, " << entry_count << ")";
       throw PtoAnalysisError(oss.str());
     }
   }

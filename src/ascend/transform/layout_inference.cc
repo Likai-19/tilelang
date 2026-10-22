@@ -977,7 +977,7 @@ private:
 
   void VisitStmt_(const ForNode *op) final {
     if (op->kind == ForKind::kParallel) {
-      auto infer = ParallelOp(GetRef<For>(op));
+      auto infer = ParallelOp(GetRef<For>(op), InsidePtoSimdVF());
       for (const auto &buffer : infer->GetAccessOrder()) {
         addToUseList(buffer);
       }
@@ -1802,6 +1802,15 @@ public:
     fptr->body = ParallelLoopFuserSkipSimdVF::Fuse(f->body);
     BufferUseDefCollector collector;
     collector.Collect(f);
+
+    /* The PTO-side multi-subscript collection opt-in lives in
+    BufferUseDefCollector's Parallel visitor (ParallelOp construction with
+    InsidePtoSimdVF). The parity layout solver from R4 v5 is NOT wired in
+    here: its edge encoding produced contradictory constraints (every
+    f[i,j] access reported a parity conflict) and most of the designed
+    pre-scan contract was missing, so it was withdrawn. Re-land it as a
+    pre-solve step at exactly this position (between Collect() and Run())
+    once it is rewritten per the R4 design. */
     auto result = collector.Run();
     LayoutInferencer substituter(result, &analyzer);
     fptr->body = substituter.VisitStmt(f->body);

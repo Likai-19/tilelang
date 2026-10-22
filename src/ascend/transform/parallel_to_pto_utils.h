@@ -200,8 +200,13 @@ struct FragmentAccess {
  * bind aliases, substitutes the inverse lane mapping into the access
  * indices, and proves with the analyzer over the full lane range that
  * (a) the layout's forward_thread of the accessed element equals the
- * execution lane and (b) the entry expression does not depend on the
- * lane. Returns a fully populated FragmentAccess or throws
+ * execution lane, (b) the entry expression does not depend on the
+ * lane, and (c) the entry stays in [0, count) — the dual-sided
+ * interval. For (c) to be provable when the entry depends on outer
+ * serial loop variables, the caller passes their ranges via
+ * \p outer_loop_ranges (the proof analyzer binds them alongside the
+ * mapping's own lane/chunk/kept-coordinate ranges).
+ * Returns a fully populated FragmentAccess or throws
  * PtoAnalysisError with the reason. */
 FragmentAccess AnalyzeFragmentAccess(const Buffer &buffer,
                                      const Array<PrimExpr> &indices,
@@ -209,7 +214,8 @@ FragmentAccess AnalyzeFragmentAccess(const Buffer &buffer,
                                      const PtoInverseMapping &mapping,
                                      const Fragment &layout,
                                      arith::Analyzer *analyzer,
-                                     const Map<Var, PrimExpr> &bind_env = {});
+                                     const Map<Var, PrimExpr> &bind_env = {},
+                                     const Map<Var, Range> &outer_loop_ranges = {});
 
 /*! Check whether a dtype is supported by the unified element
  * addressing convention: the buffer element dtype itself must not carry

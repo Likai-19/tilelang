@@ -92,6 +92,15 @@ public:
     bool is_write = false;
   };
 
+  // PTO-only multi-subscript container: when the opt-in flag is set,
+  // RecordBufferAccess stores every distinct subscript group for a buffer
+  // instead of ICHECKing on structural inequality. The first group also
+  // lands in indice_map_ so SIMT consumers (cost model, fragment
+  // validation, LowerTileOp remapping) see unchanged values.
+  using MultiSubscriptMap =
+      std::unordered_map<Buffer, std::vector<BufferAccessInfo>,
+                         ObjectPtrHash, ObjectPtrEqual>;
+
   using BufferIndiceMap = std::unordered_map<Buffer, BufferAccessInfo,
                                              ObjectPtrHash, ObjectPtrEqual>;
 
@@ -138,8 +147,11 @@ public:
         .def_ro("predicate", &ParallelOpNode::predicate_);
   }
 
-  // Construct from a root For loop.
-  ParallelOpNode(For root);
+  // Construct from a root For loop. The pto_multi_subscript flag enables
+  // multi-subscript collection: every distinct subscript group is stored
+  // (no structural-equality ICHECK) for PTO layout solving. The flag is
+  // stored as a node member so ExpandBindValues uses the same mode.
+  ParallelOpNode(For root, bool pto_multi_subscript = false);
 
   // Lower the operator to a TIR statement.
   Stmt Lower(const LowerArgs &lower_args,
@@ -150,7 +162,8 @@ public:
                         InferLevel level) const override;
 
   // Copy constructor for ParallelOpNode.
-  ParallelOpNode(const ParallelOpNode &other) : ParallelOpNode(other.root_) {
+  ParallelOpNode(const ParallelOpNode &other)
+      : ParallelOpNode(other.root_, other.pto_multi_subscript_) {
     loop_layout_ = other.loop_layout_;
     predicate_ = other.predicate_;
     loop_layout_inferred_ = other.loop_layout_inferred_;
@@ -174,6 +187,14 @@ public:
   bool HasReducerUpdates() const { return !reducer_updates_.empty(); }
   // Get the mapping from buffer to access indices + access type.
   const BufferIndiceMap &GetIndiceMap() const { return indice_map_; }
+  // Get the multi-subscript access groups for PTO layout solving.
+  // Empty unless the PTO opt-in flag was set at construction.
+  const MultiSubscriptMap &GetMultiSubscripts() const {
+    return multi_subscripts_;
+  }
+  // Whether this operator was constructed with PTO multi-subscript
+  // collection enabled.
+  bool IsPtoMultiSubscript() const { return pto_multi_subscript_; }
   // Get buffers in the order they first appear in the loop body.
   const std::vector<Buffer> &GetAccessOrder() const { return access_order_; }
   // Get the predicate for a given logical thread index. GPU callers pass the
@@ -266,6 +287,12 @@ private:
   ParallelLoopNestVisitor V;
   // Mapping from buffer to their access indices and access type in the loop.
   BufferIndiceMap indice_map_;
+  // Multi-subscript access groups (PTO only, see MultiSubscriptMap).
+  MultiSubscriptMap multi_subscripts_;
+  // Whether PTO multi-subscript collection is enabled for this operator.
+  // Stored as a node member so ExpandBindValues (which runs during
+  // layout inference, long after construction) uses the same mode.
+  bool pto_multi_subscript_ = false;
   // Stable first-use order for indice_map_.  Layout inference must not depend
   // on std::unordered_map iteration order when selecting source buffers.
   std::vector<Buffer> access_order_;
@@ -291,8 +318,12 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ParallelOp, TileOperator,
                                              ParallelOpNode);
 
-  ParallelOp(const For &root) {
-    auto op = make_object<ParallelOpNode>(root);
+  // pto_multi_subscript: pass true only from the PTO layout inference
+  // construction point. All other callers (SIMT/CUDA/ROCm/Metal, copy/fill
+  // lowering, etc.) get the default false: behavior is byte-for-byte
+  // unchanged for non-PTO paths.
+  ParallelOp(const For &root, bool pto_multi_subscript = false) {
+    auto op = make_object<ParallelOpNode>(root, pto_multi_subscript);
     data_ = std::move(op);
   }
 };

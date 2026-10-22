@@ -45,6 +45,7 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <map>
 #include <set>
@@ -711,6 +712,16 @@ private:
         nested.push_back(i);
       }
     }
+    // The hoisted loop stays in scope for every part converted below; bind
+    // its range so fragment entries that depend on it (f[t, i]) keep the
+    // same provable interval they had in the original tree. Constant
+    // bounds only — Verify's proof bound the same and nothing looser.
+    Map<Var, Range> saved_split_ranges = split_loop_ranges_;
+    if (fn->min.as<IntImmNode>() != nullptr &&
+        fn->extent.as<IntImmNode>() != nullptr) {
+      split_loop_ranges_.Set(
+          fn->loop_var, Range::FromMinExtent(fn->min, fn->extent));
+    }
     Array<Stmt> body;
     if (nested.empty()) {
       body.push_back(MakeRegion(proto, stmts, scope_attr));
@@ -732,6 +743,7 @@ private:
         body.push_back(post_region);
       }
     }
+    split_loop_ranges_ = std::move(saved_split_ranges);
     return For(fn->loop_var, fn->min, fn->extent, ForKind::kSerial,
                SeqStmt::Flatten(body));
   }
@@ -1965,6 +1977,56 @@ private:
   // ------------------------------------------------------------------
   // Per-unit conversion
   // ------------------------------------------------------------------
+  // Ranges of the serial loops enclosing a unit inside the region, for
+  // the fragment entry-interval proof: an entry like f[k, j] with k a
+  // region-level serial var is only provable when k's range is bound, and
+  // Verify bound exactly these ranges when it accepted the program — so
+  // the same set must be reproducible here or Vectorize would reject a
+  // verified access. Only constant-bound loops bind; non-constant ones
+  // were already rejected for fragment accesses by the failing proof in
+  // Verify.
+  static Map<Var, Range> EnclosingSerialRanges(const Stmt &stmt,
+                                               const ForNode *unit) {
+    Map<Var, Range> ranges;
+    std::function<bool(const Stmt &)> visit = [&](const Stmt &s) -> bool {
+      if (s.get() == unit) {
+        return true;
+      }
+      if (const auto *f = s.as<ForNode>()) {
+        Map<Var, Range> saved = ranges;
+        if (f->kind == ForKind::kSerial && f->min.as<IntImmNode>() != nullptr &&
+            f->extent.as<IntImmNode>() != nullptr) {
+          ranges.Set(f->loop_var, Range::FromMinExtent(f->min, f->extent));
+        }
+        if (visit(f->body)) {
+          return true;
+        }
+        ranges = std::move(saved);
+        return false;
+      }
+      if (const auto *seq = s.as<SeqStmtNode>()) {
+        for (const Stmt &child : seq->seq) {
+          if (visit(child)) {
+            return true;
+          }
+        }
+        return false;
+      }
+      if (const auto *attr = s.as<AttrStmtNode>()) {
+        return visit(attr->body);
+      }
+      if (const auto *block = s.as<SBlockNode>()) {
+        return visit(block->body);
+      }
+      if (const auto *realize = s.as<SBlockRealizeNode>()) {
+        return visit(realize->block->body);
+      }
+      return false;
+    };
+    visit(stmt);
+    return ranges;
+  }
+
   Stmt ConvertUnit(const For &loop,
                    const pto_analysis::PtoInverseMapping &mapping,
                    const Stmt &region_body) {
@@ -1978,6 +2040,15 @@ private:
     lane_scalar_vregs_.clear();
     lane_scalar_allocs_.clear();
     unit_wrote_backing_ = false;
+    outer_loop_ranges_ = EnclosingSerialRanges(region_body, loop.get());
+    // Ranges of serial loops the vecscope split hoisted outside the part
+    // being converted: the part body no longer contains them, but its
+    // fragment entries may still depend on their variables (f[t, i]), and
+    // Verify proved the interval against the original tree — with these
+    // ranges bound. Seed them so Vectorize reproduces the same proof.
+    for (const auto &kv : split_loop_ranges_) {
+      outer_loop_ranges_.Set(kv.first, kv.second);
+    }
     // Keep the complete mapping (2D fields included) for the
     // per-access analysis calls in ConvertBody.
     unit_mapping_ = mapping;
@@ -2457,8 +2528,16 @@ private:
       Map<Var, PrimExpr> saved_env = bind_env_;
       Map<Var, Var> saved_map = value_map_;
       bool saved_carry = carry_active_;
+      Map<Var, Range> saved_ranges = outer_loop_ranges_;
       if (carry_loop_ != nullptr && loop == carry_loop_) {
         carry_active_ = true;
+      }
+      // Verify admitted the shell with constant bounds; bind them so the
+      // fragment entry-interval proof sees the same ranges it did.
+      if (loop->min.as<IntImmNode>() != nullptr &&
+          loop->extent.as<IntImmNode>() != nullptr) {
+        outer_loop_ranges_.Set(
+            loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
       }
       // A shell whose body writes a fragment backing needs an ordering
       // point between its own iterations: iteration k's vstore and
@@ -2476,6 +2555,7 @@ private:
         inner.push_back(Evaluate(Call(DataType::Void(), tl::simd_mem_bar(),
                                       {StringImm("VST_VLD")})));
       }
+      outer_loop_ranges_ = std::move(saved_ranges);
       carry_active_ = saved_carry;
       bind_env_ = std::move(saved_env);
       value_map_ = std::move(saved_map);
@@ -2538,7 +2618,8 @@ private:
     const SlotState &state = RequireSlotState(load->buffer);
     auto access = pto_analysis::AnalyzeFragmentAccess(
         load->buffer, load->indices, /*is_write=*/false, loop_var_,
-        CurrentMapping(), state.layout, &analyzer_, bind_env_);
+        CurrentMapping(), state.layout, &analyzer_, bind_env_,
+        outer_loop_ranges_);
     // No CSE and no cross-access reuse: every textual fragment read is its
     // own vload on the handle (memory semantics; merging and the
     // store->load forwarding are PTOAS's decisions).
@@ -2556,7 +2637,8 @@ private:
     const SlotState &state = RequireSlotState(store->buffer);
     auto access = pto_analysis::AnalyzeFragmentAccess(
         store->buffer, store->indices, /*is_write=*/true, loop_var_,
-        CurrentMapping(), state.layout, &analyzer_, bind_env_);
+        CurrentMapping(), state.layout, &analyzer_, bind_env_,
+        outer_loop_ranges_);
     // Backing writes are ordinary masked stores: the active lanes of the
     // mask (chunk mask, optionally narrowed by a recovered store
     // predicate) are updated and every other lane keeps the backing's
@@ -3076,6 +3158,14 @@ private:
   tirx::Buffer carry_vreg_{};
   Array<PrimExpr> carry_indices_{};
   bool carry_active_ = false;
+  // Ranges of serial loops in scope at the fragment access being converted
+  // (region-level wrappers from EnclosingSerialRanges plus in-unit shells
+  // bound by ConvertBody). Passed to AnalyzeFragmentAccess so the entry
+  // interval is provable for entries that depend on outer loops.
+  Map<Var, Range> outer_loop_ranges_;
+  // Serial loops hoisted out of the region by the vecscope split, in scope
+  // while the parts inside them are converted (see TransformCarryLoop).
+  Map<Var, Range> split_loop_ranges_;
   // Region-level carry promotion state (AnalyzeRegionCarry). When a unit is
   // the seed or an in-loop unit of the promoted region, its B accesses are
   // redirected to this vreg and the allocation happens once at region level

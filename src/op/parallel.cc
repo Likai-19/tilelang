@@ -172,7 +172,8 @@ void ParallelLoopNestVisitor::VisitExpr_(const CallNode *op) {
   StmtExprVisitor::VisitExpr_(op);
 }
 
-ParallelOpNode::ParallelOpNode(For root) : root_(root), V(this) {
+ParallelOpNode::ParallelOpNode(For root, bool pto_multi_subscript)
+    : root_(root), V(this), pto_multi_subscript_(pto_multi_subscript) {
   V.VisitStmt(root);
   // Cache any annotated layout/predicate on the outermost loop.
   using namespace attr;
@@ -262,11 +263,47 @@ void ParallelOpNode::ExpandBindValues(
 void ParallelOpNode::RecordBufferAccess(const Buffer &buffer,
                                         const Array<PrimExpr> &indices,
                                         bool is_write) {
+  // Multi-subscript collection is scoped to local.fragment buffers: only
+  // fragment accesses come in whole-entry-shifted groups (f[i] with
+  // f[i+VL], the expanded G2 self-copy f[i+128] = f[i]), and only they
+  // have downstream per-access proofs (lane equality, entry interval)
+  // that make each group independently safe. A non-fragment buffer with
+  // differing subscripts keeps the strict structural-equality ICHECK —
+  // the layout engine still consumes the single first group only.
+  if (pto_multi_subscript_ && buffer.scope() == "local.fragment") {
+    // Record every distinct subscript group. The first group also
+    // populates indice_map_ so SIMT consumers (cost model, fragment
+    // validation, LowerTileOp remapping) see unchanged values.
+    auto &groups = multi_subscripts_[buffer];
+    bool found = false;
+    for (auto &g : groups) {
+      if (StructuralEqual()(g.indices, indices)) {
+        if (is_write) {
+          g.is_write = true;
+        } else {
+          g.is_read = true;
+        }
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      BufferAccessInfo info;
+      info.indices = indices;
+      info.is_write = is_write;
+      info.is_read = !is_write;
+      groups.push_back(std::move(info));
+    }
+  }
   auto it = indice_map_.find(buffer);
   if (it != indice_map_.end()) {
-    ICHECK(StructuralEqual()(it->second.indices, indices))
-        << buffer << ": " << indices << " and " << it->second.indices
-        << SpanHintSuffix(buffer->span);
+    if (pto_multi_subscript_ && buffer.scope() == "local.fragment") {
+      // First group wins (recorded above); only the access kind widens.
+    } else {
+      ICHECK(StructuralEqual()(it->second.indices, indices))
+          << buffer << ": " << indices << " and " << it->second.indices
+          << SpanHintSuffix(buffer->span);
+    }
   } else {
     BufferAccessInfo info;
     info.indices = indices;

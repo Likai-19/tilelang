@@ -396,9 +396,11 @@ private:
   public:
     UnitVisitor(VerifyParallelToPTOImpl *parent, const Var &loop_var,
                 const pto_analysis::PtoInverseMapping &mapping,
-                const std::set<const VarNode *> &external_defs)
+                const std::set<const VarNode *> &external_defs,
+                const Map<Var, Range> &region_loop_ranges)
         : parent_(parent), loop_var_(loop_var), mapping_(mapping),
-          external_defs_(external_defs) {
+          external_defs_(external_defs),
+          outer_loop_ranges_(region_loop_ranges) {
       // In a 2D unit `loop_var` is the vectorized coordinate; the
       // other one is kept as a serial loop and classifies as uniform.
       if (mapping.is_2d) {
@@ -501,9 +503,13 @@ private:
       }
       defined_loop_vars_.insert(op->loop_var.get());
       Map<Var, Integer> saved_classified = classified_;
+      Map<Var, Range> saved_ranges = outer_loop_ranges_;
       classified_.Set(op->loop_var, Integer(0));
+      outer_loop_ranges_.Set(op->loop_var,
+                             Range::FromMinExtent(op->min, op->extent));
       StmtExprVisitor::VisitStmt_(op);
       classified_ = std::move(saved_classified);
+      outer_loop_ranges_ = std::move(saved_ranges);
       defined_loop_vars_.erase(op->loop_var.get());
     }
     void VisitStmt_(const IfThenElseNode *op) final {
@@ -1100,9 +1106,9 @@ private:
               << " but the unit mapping has " << mapping_.lanes;
         }
         try {
-          pto_analysis::AnalyzeFragmentAccess(buffer, indices, is_write,
-                                              loop_var_, mapping_, layout,
-                                              &analyzer_, bind_env_);
+          pto_analysis::AnalyzeFragmentAccess(
+              buffer, indices, is_write, loop_var_, mapping_, layout,
+              &analyzer_, bind_env_, outer_loop_ranges_);
         } catch (const pto_analysis::PtoAnalysisError &err) {
           parent_->Fail("fragment access", err.what());
         }
@@ -1152,6 +1158,12 @@ private:
     // T.serial inside T.Parallel). In scope only while the shell's body
     // is being visited; classified as lane-uniform.
     std::set<const VarNode *> defined_loop_vars_;
+    // Ranges of every serial loop var in scope at the current access —
+    // both the region-level wrappers around the unit (seeded from the
+    // impl at construction) and the in-unit shells (bound as their bodies
+    // are visited). The fragment entry-interval proof binds these so an
+    // entry that depends on an outer loop (f[k, j]) is provable.
+    Map<Var, Range> outer_loop_ranges_;
   };
 
   // ------------------------------------------------------------------
@@ -1469,7 +1481,8 @@ private:
             : unit->loop_var;
     // The definition snapshot at the unit's lexical position.
     const Stmt &body_to_verify = inner != nullptr ? inner->body : unit->body;
-    UnitVisitor unit_visitor(this, vector_var, mapping, defs_);
+    UnitVisitor unit_visitor(this, vector_var, mapping, defs_,
+                             region_loop_ranges_);
     unit_visitor(body_to_verify);
   }
 
@@ -1525,7 +1538,16 @@ private:
       }
       std::set<const VarNode *> saved = defs_;
       defs_.insert(for_node->loop_var.get());
+      Map<Var, Range> saved_ranges = region_loop_ranges_;
+      const auto *wrap_min = for_node->min.as<IntImmNode>();
+      const auto *wrap_extent = for_node->extent.as<IntImmNode>();
+      if (wrap_min != nullptr && wrap_extent != nullptr) {
+        region_loop_ranges_.Set(
+            for_node->loop_var,
+            Range::FromMinExtent(for_node->min, for_node->extent));
+      }
       WalkRegion(for_node->body, units, lanes, next_unit);
+      region_loop_ranges_ = std::move(saved_ranges);
       defs_ = std::move(saved);
       return;
     }
@@ -1663,6 +1685,10 @@ private:
   // (blockIdx, outer/VF-internal binds) and leaked sibling-scope loop
   // vars into every unit.
   std::set<const VarNode *> defs_;
+  // Ranges of region-level serial loops currently wrapping the unit being
+  // verified (maintained by WalkRegion with save/restore). Handed to each
+  // UnitVisitor so the fragment entry-interval proof can bind them.
+  Map<Var, Range> region_loop_ranges_;
   // Data Vars of AllocBuffers annotated tirx.volatile (collected
   // function-wide by CollectVolatileAllocs; identity-matched at every
   // access inside a converting region).
