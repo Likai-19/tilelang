@@ -194,6 +194,11 @@ private:
   std::string PrintVmiAnnotationValue(const std::string &key,
                                       const ObjectRef &value);
   void PrintPtoVmiCall_(const CallNode *op, std::ostream &os);
+  // tl.vmi.declare_fragment_buffer -> pto.memref_declare(byte_address,
+  // (count * lanes,), scalar_dtype). The byte address comes from the
+  // standard address operand (the merged UB arena is byte-addressed from
+  // zero); the element dtype is the backing's scalar type.
+  void PrintPtoMemrefDeclare_(const CallNode *op, std::ostream &os);
   // SSA provenance for PTO values.  The table maps a bound VarNode to its RHS
   // IR; only Bind/Let registration writes it.  Queries are pure: they never
   // print, emit, allocate names or modify the persistent table.

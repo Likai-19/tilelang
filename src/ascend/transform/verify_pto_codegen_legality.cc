@@ -1077,6 +1077,14 @@ private:
     if (!match.checked) {
       return;
     }
+    if (IsDeclareBackedPointer(op->args[1])) {
+      // A fragment storage handle: the backing is reserved with the
+      // merge alignment and every access is a whole entry
+      // (entry * lanes elements) from the declared base, so the store is
+      // aligned by construction and there is no pointer expression to
+      // resolve.
+      return;
+    }
     const size_t store_index = next_store_index_++;
     std::unordered_set<const VarNode *> visiting;
     ByteAddress address = ResolveAddress(op->args[1], &visiting);
@@ -1118,6 +1126,27 @@ private:
 
   std::string function_name_;
   size_t next_store_index_{0};
+
+  // True when the pointer expression is (an alias chain of) a Var bound
+  // to tl.vmi.declare_fragment_buffer: a fragment storage handle.
+  bool IsDeclareBackedPointer(const PrimExpr &ptr) const {
+    const PrimExpr *current = &ptr;
+    std::unordered_set<const VarNode *> visited;
+    while (const auto *var = current->as<VarNode>()) {
+      if (!visited.insert(var).second) {
+        return false;
+      }
+      auto it = pointer_defs_.find(var);
+      if (it == pointer_defs_.end()) {
+        return false;
+      }
+      current = &it->second;
+    }
+    const auto *call = current->as<CallNode>();
+    return call != nullptr &&
+           call->op.same_as(tl::vmi_declare_fragment_buffer());
+  }
+
   std::unordered_set<const VarNode *> ub_roots_;
   std::unordered_map<const VarNode *, PrimExpr> pointer_defs_;
   std::unordered_map<const VarNode *, PrimExpr> value_defs_;

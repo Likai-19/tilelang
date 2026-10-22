@@ -31,8 +31,10 @@
 #include <sstream>
 #include <vector>
 
+#include "../../op/operator.h"
 #include "../../transform/common/attr.h"
 #include "parallel_to_pto_utils.h"
+#include "pto_slot_plan.h"
 
 namespace tvm {
 namespace tl {
@@ -180,6 +182,29 @@ private:
         if (name == "tl.tileop.reduce") {
           parent_->Fail("expression", "cross-lane reduce is not supported");
         }
+        if (name == "tl.tileop.fill" || name == "tl.tileop.copy") {
+          // Fragment-touching fill/copy is expanded into T.Parallel loops
+          // before layout inference, so a survivor here means the
+          // expansion missed a position; initialize the fragment through a
+          // T.Parallel unit instead.
+          const Call call = GetRef<Call>(op);
+          bool touches_fragment = false;
+          PostOrderVisit(call, [&](const ObjectRef &node) {
+            if (const auto *load = node.as<BufferLoadNode>()) {
+              if (load->buffer.scope() == "local.fragment") {
+                touches_fragment = true;
+              }
+            }
+          });
+          if (touches_fragment) {
+            std::ostringstream oss;
+            oss << name
+                << " on fragment buffers reached Verify unexpanded; "
+                   "initialize the fragment through a T.Parallel unit "
+                   "instead";
+            parent_->Fail("fragment access", oss.str());
+          }
+        }
       }
       StmtExprVisitor::VisitExpr_(op);
     }
@@ -250,7 +275,15 @@ private:
       if (parallel) {
         ++parallel_depth_;
       }
+      // Fragment accesses are only admitted inside the converting Parallel
+      // unit bodies (CheckScope consumes this flag); the unit bodies are
+      // where the whole-entry slot read/write form exists.
+      const bool saved_inside_unit = inside_parallel_unit_;
+      if (parallel) {
+        inside_parallel_unit_ = true;
+      }
       StmtExprVisitor::VisitStmt_(op);
+      inside_parallel_unit_ = saved_inside_unit;
       if (parallel) {
         --parallel_depth_;
       }
@@ -267,7 +300,7 @@ private:
         std::ostringstream oss;
         oss << "buffer `" << buffer->name
             << "` is allocated with the tirx.volatile annotation; volatile "
-               "accesses are not yet supported";
+               "accesses are not supported in the first version";
         parent_->Fail("memory access", oss.str());
       }
       const std::string &scope = buffer.scope();
@@ -294,6 +327,44 @@ private:
         }
         return;
       }
+      if (scope == "local.fragment") {
+        // Slot storage path. Admitted only with a layout_map entry and a
+        // slot plan in scope, and only inside the converting Parallel unit
+        // bodies: a region-level fragment access is a single-element
+        // extract with no whole-entry slot form. The per-access entry/lane
+        // mapping proof runs in the unit visitor.
+        if (!inside_parallel_unit_) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` is accessed outside the converting T.Parallel bodies; "
+                 "region-level fragment accesses (single-element reads or "
+                 "writes) have no slot lowering";
+          parent_->Fail("fragment access", oss.str());
+        }
+        if (!parent_->FindFragmentLayoutInScope(buffer).defined()) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` has no layout_map entry in scope; the PTO layout "
+                 "inference must produce one for every fragment buffer "
+                 "accessed by a converting region";
+          parent_->Fail("fragment access", oss.str());
+        }
+        if (!parent_->FindSlotPlanInScope(buffer).has_value()) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` has no tl.pto_slot_plan record in scope; "
+                 "PlanPtoSlotStorage must run before VerifyParallelToPTO";
+          parent_->Fail("fragment access", oss.str());
+        }
+        if (!pto_analysis::IsSupportedElementDType(buffer->dtype)) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name << "` element dtype "
+              << buffer->dtype
+              << " is not supported by the unified element addressing";
+          parent_->Fail("dtype", oss.str());
+        }
+        return;
+      }
       // The remaining scopes only support UB accesses. local /
       // shared.l1 (L1) and other scopes are rejected.
       if (scope != "shared" && scope != "shared.dyn") {
@@ -313,6 +384,9 @@ private:
     }
     VerifyParallelToPTOImpl *parent_;
     int parallel_depth_ = 0;
+    /*! True while visiting the body of a Parallel For (a converting unit);
+     * fragment accesses are only legal there. */
+    bool inside_parallel_unit_ = false;
   };
 
   // ------------------------------------------------------------------
@@ -991,6 +1065,49 @@ private:
         }
         return;
       }
+      // The predicate gate above already rejected non-trivial predicates
+      // for every scope, so no conditional fragment store reaches here;
+      // only unconditional whole-entry stores are converted.
+      if (buffer.scope() == "local.fragment") {
+        const Fragment layout = parent_->FindFragmentLayoutInScope(buffer);
+        if (!layout.defined()) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` has no layout_map entry in scope";
+          parent_->Fail("fragment access", oss.str());
+        }
+        const Optional<PtoSlotPlan> plan = parent_->FindSlotPlanInScope(buffer);
+        if (!plan.has_value()) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` has no tl.pto_slot_plan record in scope";
+          parent_->Fail("fragment access", oss.str());
+        }
+        // Plan/layout consistency: both derive from the same inference
+        // (layout by InferPtoSimdLayout, plan by PlanPtoSlotStorage), so a
+        // mismatch means the pipeline reordered or mutated one of them —
+        // a defect, not a user-input error.
+        {
+          const Array<PrimExpr> output_shape = layout->OutputShape();
+          const int64_t *entry_count = as_const_int(output_shape[0]);
+          ICHECK(entry_count != nullptr && *entry_count == plan.value()->count)
+              << "[VerifyParallelToPTO] internal error: slot plan for `"
+              << buffer->name << "` reserves " << plan.value()->count
+              << " entries but its layout provides " << output_shape[0];
+          ICHECK_EQ(plan.value()->vector_lanes, mapping_.lanes)
+              << "[VerifyParallelToPTO] internal error: slot plan for `"
+              << buffer->name << "` uses lanes " << plan.value()->vector_lanes
+              << " but the unit mapping has " << mapping_.lanes;
+        }
+        try {
+          pto_analysis::AnalyzeFragmentAccess(buffer, indices, is_write,
+                                              loop_var_, mapping_, layout,
+                                              &analyzer_, bind_env_);
+        } catch (const pto_analysis::PtoAnalysisError &err) {
+          parent_->Fail("fragment access", err.what());
+        }
+        return;
+      }
       try {
         auto access = pto_analysis::AnalyzeBufferAccess(
             buffer, indices, is_write, loop_var_, mapping_, &analyzer_,
@@ -1129,11 +1246,57 @@ private:
       for (const auto &buf : op->alloc_buffers) {
         defs_.insert(buf->data.get());
       }
+      block_stack_.push_back(op);
       StmtExprVisitor::VisitStmt_(op);
+      block_stack_.pop_back();
       defs_ = std::move(saved);
       return;
     }
+    block_stack_.push_back(op);
     HandleSimdVF(op);
+    block_stack_.pop_back();
+  }
+
+  // SBlocks in lexical scope, innermost last. Fragment layouts (layout_map)
+  // and slot plans may be recorded on the converting region's own SBlock or
+  // on an ancestor; lookups walk the chain so either placement works.
+  std::vector<const SBlockNode *> block_stack_;
+
+  Fragment FindFragmentLayoutInScope(const Buffer &buffer) const {
+    for (auto it = block_stack_.rbegin(); it != block_stack_.rend(); ++it) {
+      auto value = (*it)->annotations.Get(attr::kLayoutMap);
+      if (!value.has_value()) {
+        continue;
+      }
+      auto map = value.value().try_cast<LayoutMap>();
+      if (!map.has_value()) {
+        continue;
+      }
+      if (map.value().count(buffer) != 0) {
+        auto frag = map.value()[buffer].as<Fragment>();
+        return frag.has_value() ? frag.value() : Fragment();
+      }
+    }
+    return Fragment();
+  }
+
+  Optional<PtoSlotPlan> FindSlotPlanInScope(const Buffer &buffer) const {
+    for (auto it = block_stack_.rbegin(); it != block_stack_.rend(); ++it) {
+      auto value = (*it)->annotations.Get(kPtoSlotPlan);
+      if (!value.has_value()) {
+        continue;
+      }
+      auto plans = value.value().try_cast<Array<PtoSlotPlan>>();
+      if (!plans.has_value()) {
+        continue;
+      }
+      for (const auto &plan : plans.value()) {
+        if (plan->fragment.same_as(buffer)) {
+          return plan;
+        }
+      }
+    }
+    return Optional<PtoSlotPlan>();
   }
 
   // ------------------------------------------------------------------

@@ -5385,6 +5385,11 @@ CodeGenTileLangPTO::PtoValueKind CodeGenTileLangPTO::ClassifyVmiCallResult_(
   if (name == "tl.vmi.vstore" || name == "tl.vmi.vscatter") {
     return PtoValueKind::kVoid;
   }
+  if (name == "tl.vmi.declare_fragment_buffer") {
+    // The declaration names a memory object; its handle only ever appears
+    // as a vload/vstore base, never as scalar/vector data.
+    return PtoValueKind::kHandle;
+  }
   static const std::unordered_set<std::string> kDataOps = {
       "tl.vmi.vci",      "tl.vmi.vbrc",
       "tl.vmi.vzip",     "tl.vmi.vadd",
@@ -5496,6 +5501,56 @@ void CodeGenTileLangPTO::CheckPtoVmiBridgeOperand_(
                << PtoValueKindName(source_kind) << " (" << source.dtype()
                << ", lanes=" << source.dtype().lanes() << "): " << source;
   }
+}
+
+void CodeGenTileLangPTO::PrintPtoMemrefDeclare_(const CallNode *op,
+                                                std::ostream &os) {
+  ICHECK_EQ(op->args.size(), 3U)
+      << "tl.vmi.declare_fragment_buffer expects "
+         "(backing_ptr, count, lanes), got "
+      << op->args.size() << " arguments";
+  // Element dtype comes from the typed backing address, never from the
+  // Handle. The operand is the standard address form the address passes
+  // rewrote (tl.access_ptr pre-lowering, tvm_access_ptr afterwards), so
+  // both the dtype and the element offset survive MergeUBAllocations —
+  // the merged arena must not silently retype the declaration.
+  const DataType elem_dtype =
+      GetAnnotatedPointerDtype(op->args[0], DataType());
+  // An unresolved operand keeps the invalid fallback (bits == 0).
+  ICHECK(elem_dtype.bits() > 0 && elem_dtype.is_scalar())
+      << "tl.vmi.declare_fragment_buffer requires a typed scalar backing "
+         "address, got "
+      << op->args[0];
+  const auto *count = op->args[1].as<IntImmNode>();
+  const auto *lanes = op->args[2].as<IntImmNode>();
+  ICHECK(count != nullptr && lanes != nullptr && count->value > 0 &&
+         lanes->value > 0)
+      << "tl.vmi.declare_fragment_buffer count/lanes must be positive "
+         "compile-time integers";
+  PrimExpr elem_index;
+  const VarNode *buffer_var = nullptr;
+  ICHECK(GetAddressOfIndex(op->args[0], &elem_index, &buffer_var))
+      << "tl.vmi.declare_fragment_buffer requires a standard address "
+         "operand the address passes can rewrite (tl.access_ptr / "
+         "tvm_access_ptr), got "
+      << op->args[0];
+  // The merged UB arena is emitted as castptr(const(0)), so the backing's
+  // element offset scaled to bytes is the final UB byte address. The
+  // declaration carries the backing offset; the accesses' element offsets
+  // (entry * lanes) must not add it again.
+  const int64_t elem_bytes =
+      (PhysicalElementBits(elem_dtype) + 7) / 8 * elem_dtype.lanes();
+  std::string address;
+  int64_t constant_index = 0;
+  if (TryGetConstInt(elem_index, &constant_index)) {
+    address = std::to_string(constant_index * elem_bytes);
+  } else {
+    address = "(" + RemoveOutermostParentheses(PrintExpr_(elem_index)) +
+              ") * " + std::to_string(elem_bytes);
+  }
+  os << "pto.memref_declare(" << address << ", (" << count->value *
+                                                     lanes->value
+     << ",), " << ScalarType(elem_dtype) << ")";
 }
 
 void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
@@ -7147,6 +7202,10 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
       return;
     }
     if (StartsWith(op_name, "tl.vmi.")) {
+      if (op_name == "tl.vmi.declare_fragment_buffer") {
+        PrintPtoMemrefDeclare_(op, os);
+        return;
+      }
       if (op_name == "tl.vmi.pair_get") {
         ICHECK_EQ(op->args.size(), 2U)
             << "tl.vmi.pair_get expects exactly 2 arguments";
