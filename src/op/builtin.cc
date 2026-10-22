@@ -162,6 +162,10 @@ TIR_DEFINE_TL_BUILTIN(sync_warp).set_num_inputs(-1).set_attr<TCallEffectKind>(
 // declarations in builtin.h and correspond to tilelang/ascend/language/vmi.py.
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vload).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vstore).set_num_inputs(-1);
+// Opaque like the loads/stores it feeds: the declaration is a memory object
+// identity, not a pure value (its handle must survive DCE together with the
+// accesses it anchors).
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(declare_fragment_buffer).set_num_inputs(3);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(create_mask).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vci).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vbrc).set_num_inputs(-1);

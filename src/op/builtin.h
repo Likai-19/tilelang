@@ -348,6 +348,15 @@ TVM_DLL const Op &device_assert_with_msg();
 TVM_DLL const Op &vmi_vload();
 TVM_DLL const Op &vmi_vstore();
 TVM_DLL const Op &vmi_create_mask();
+// declare_fragment_buffer(backing_ptr, count, lanes) names an already
+// reserved UB address as a fragment storage handle: count entries of
+// vector<lanes x elem>, where the element dtype comes from the typed
+// backing address operand. It binds address and storage properties only:
+// no access, no initialization, no register-residency or noalias promise.
+// Reads and writes reuse vload/vstore with the handle as the base and
+// element_offset = entry_index * lanes; the declaration address already
+// includes the backing offset, so accesses must not add it again.
+TVM_DLL const Op &vmi_declare_fragment_buffer();
 
 // -- Index / Broadcast / Rearrange
 TVM_DLL const Op &vmi_vci();
