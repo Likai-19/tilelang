@@ -33,6 +33,23 @@ Covered contract:
 * a slot reservation exceeding the unified-buffer capacity is rejected by
   the AutoSchedule budget.
 
+Review-fix regressions additionally covered at the bottom of this file:
+
+* a 2D fragment with multiple chunks per row (N = 2*VL) — whole-entry
+  granularity proven by divisibility, not by the exact ``x*L`` product
+  shape;
+* an overlapping fragment self-copy is rejected by the expand pass, a
+  disjoint one converts through the slot path;
+* a whole-entry-shifted second subscript group (``keep[i + VL]``) is
+  admitted when the shifted entry stays in range and rejected when it
+  leaves the fragment (dual-sided entry interval);
+* round-trip elimination stays enabled per buffer next to fragment
+  accesses;
+* a ``[VL]`` fragment accumulator inside an in-unit ``T.serial`` shell is
+  never promoted to a carry vreg (B2);
+* fragment entries that depend on outer serial loop variables (``f[k, j]``)
+  prove their interval with the outer ranges bound — in range passes, out
+  of range is still rejected.
 """
 
 from __future__ import annotations
@@ -773,6 +790,394 @@ def test_manual_schedule_backing_stays_unaliased():
     assert backing_entries, "the slot backing must appear in the alias map"
     for name, aliases in backing_entries.items():
         assert aliases == [], f"backing {name} must stay address-exclusive, got {aliases}"
+
+
+# ---------------------------------------------------------------------------
+# Review-fix regressions (whole-entry granularity, overlap rejection,
+# per-buffer round-trip gating, fragment shell carry, outer-loop entry
+# interval, fragment multi-subscript collection)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.pto
+def test_2d_fragment_multiple_chunks_per_row():
+    """A 2D fragment wider than one vector (N = 2*VL) vectorizes with two
+    chunks per row: the backing offset simplifies to i*(Q*L) + q*L, and the
+    declaration checker must prove whole-entry granularity by divisibility
+    instead of matching the exact ``x*L`` product shape."""
+    lanes = 128
+    M, N = 4, 2 * lanes
+
+    @T.prim_func
+    def main(A: T.Tensor((M * N,), "float32"), B: T.Tensor((M * N,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((M * N,), "float32")
+            b_ub = T.alloc_shared((M * N,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((M, N), "float32")
+                for i, j in T.Parallel(M, N):
+                    keep[i, j] = a_ub[i * N + j]
+                for i, j in T.Parallel(M, N):
+                    b_ub[i * N + j] = keep[i, j] * T.float32(2.0)
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "PlanPtoSlotStorage")
+    plans = _slot_plans(mod)
+    assert len(plans) == 1
+    assert plans[0][1].count == M * 2, "N=2*VL must reserve two entries per row"
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    handle = "keep_fragment_mem"
+    stores = _slot_vmi_calls(mod, "vstore", handle)
+    loads = _slot_vmi_calls(mod, "vload", handle)
+    assert len(stores) == 1, [str(s) for s in stores]
+    assert len(loads) == 1, [str(l) for l in loads]
+    # The distributed offset i*(Q*L) + q*L with Q=2, L=128.
+    for call in loads + stores:
+        text = str(call)
+        assert f"i * {2 * lanes}" in text or f"q * {lanes}" in text, text
+    assert not _collect_stores(mod, "local.fragment")
+    assert not _collect_loads(mod, "local.fragment")
+
+
+@pytest.mark.pto
+def test_fragment_self_copy_overlap_rejected():
+    """An overlapping fragment self-copy expands into parallel units whose
+    chunk order is undefined — a data race. ExpandPtoFragmentFillCopy
+    rejects it with a classified diagnostic before any conversion."""
+    lanes = 128
+    E = 4 * lanes
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), B: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((E,), "float32")
+            b_ub = T.alloc_shared((E,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((E,), "float32")
+                for i in T.Parallel(E):
+                    keep[i] = a_ub[i]
+                T.copy(keep[0 : 2 * lanes], keep[lanes : 3 * lanes])
+                for i in T.Parallel(E):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    _, error = _lower_capture(main, "ExpandPtoFragmentFillCopy", expect_error=True)
+    assert error is not None
+    text = str(error)
+    assert "overlapping self-copy" in text, text
+
+
+@pytest.mark.pto
+def test_fragment_disjoint_self_copy_ok():
+    """A disjoint fragment self-copy is a legal entry shift: it expands, is
+    collected as a second subscript group (no structural-equality crash),
+    and converts through the slot path."""
+    lanes = 128
+    E = 4 * lanes
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), B: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((E,), "float32")
+            b_ub = T.alloc_shared((E,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((E,), "float32")
+                for i in T.Parallel(E):
+                    keep[i] = a_ub[i]
+                T.copy(keep[0:lanes], keep[2 * lanes : 3 * lanes])
+                for i in T.Parallel(E):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    tile_ops = _no_fragment_tileops(mod, "keep")
+    assert not tile_ops, f"fragment fill/copy must not survive: {tile_ops}"
+    handle = "keep_fragment_mem"
+    # producer: 1 store; expanded self-copy: 1 load + 1 store (entry 2);
+    # read-out: 1 load.
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 2
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 2
+    assert not _collect_stores(mod, "local.fragment")
+    assert not _collect_loads(mod, "local.fragment")
+
+
+@pytest.mark.pto
+def test_fragment_entry_shift_add_ok():
+    """A whole-entry-shifted second subscript group (keep[i + VL] with the
+    shifted index still inside the fragment) is admitted: the entry is a
+    plain +1 shift, the lane is unchanged, and the interval proves."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((2 * lanes,), "float32"), B: T.Tensor((2 * lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((2 * lanes,), "float32")
+            b_ub = T.alloc_shared((2 * lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((2 * lanes,), "float32")
+                for i in T.Parallel(2 * lanes):
+                    keep[i] = a_ub[i]
+                for i in T.Parallel(lanes):
+                    keep[i] = keep[i] + keep[i + lanes]
+                for i in T.Parallel(2 * lanes):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    handle = "keep_fragment_mem"
+    # producer: 1 store; shifted add: 2 loads (entries 0 and 1) + 1 store;
+    # read-out: 1 load.
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 2
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 3
+    assert not _collect_stores(mod, "local.fragment")
+
+
+@pytest.mark.pto
+def test_fragment_entry_shift_out_of_range_rejected():
+    """The dual-sided entry interval: keep[i + VL] over the full domain
+    reads past the fragment and must be rejected by Verify (the shifted
+    entry reaches the entry count)."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((2 * lanes,), "float32"), B: T.Tensor((2 * lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((2 * lanes,), "float32")
+            b_ub = T.alloc_shared((2 * lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((2 * lanes,), "float32")
+                for i in T.Parallel(2 * lanes):
+                    keep[i] = a_ub[i]
+                for i in T.Parallel(2 * lanes):
+                    keep[i] = keep[i] + keep[i + lanes]
+                for i in T.Parallel(2 * lanes):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    _, error = _lower_capture(main, "VectorizeParallelToPTO", expect_error=True)
+    assert error is not None
+    text = str(error)
+    assert "slot entry index" in text and ("reach or exceed" in text or "negative" in text), text
+
+
+@pytest.mark.pto
+def test_ub_roundtrip_eliminated_alongside_fragment():
+    """Round-trip elimination is gated per buffer, not per region: a UB
+    temp round-trip living next to fragment accesses is still forwarded
+    (the fragment's own accesses never enter the rules)."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((lanes,), "float32"),
+             C: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            c_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((lanes,), "float32")
+                tmp = T.alloc_shared((lanes,), "float32")
+                for i in T.Parallel(lanes):
+                    keep[i] = a_ub[i]
+                for i in T.Parallel(lanes):
+                    tmp[i] = a_ub[i] * T.float32(2.0)
+                for i in T.Parallel(lanes):
+                    b_ub[i] = tmp[i]
+                for i in T.Parallel(lanes):
+                    c_ub[i] = keep[i]
+            T.copy(b_ub, B)
+            T.copy(c_ub, C)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+
+    def buffer_accesses(name):
+        hits = []
+
+        def visit(node):
+            if isinstance(node, (tvm.tirx.BufferLoad, tvm.tirx.BufferStore)):
+                if node.buffer.name == name:
+                    hits.append(node)
+
+        _visit(mod, visit)
+        return hits
+
+    # The temp's round trip is gone (store forwarded into the copy
+    # consumer); the fragment converts through its handle.
+    assert not buffer_accesses("tmp"), "the UB temp round trip must be eliminated"
+    handle = "keep_fragment_mem"
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 1
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 1
+    # The forwarded value still reaches b_ub: one plain UB store survives.
+    assert len(buffer_accesses("b_ub")) >= 1
+
+
+@pytest.mark.pto
+def test_fragment_shell_accumulator_converts_via_slot():
+    """A [VL] fragment accumulator updated inside an in-unit T.serial loop
+    is NOT a carry candidate (B2): its read-modify-write goes through the
+    slot backing, the shell is preserved, and no carry vreg/writeback is
+    produced for it. The shell's own iterations are ordered: every
+    backing-writing iteration closes with its own VST_VLD bar (the
+    unit-level bar fires only after the whole unit)."""
+    lanes = 128
+    K = 5
+
+    @T.prim_func
+    def main(W: T.Tensor((K,), "float32"), B: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            w_ub = T.alloc_shared((K,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(W, w_ub)
+            with T.SimdVF(lanes=lanes):
+                acc = T.alloc_fragment((lanes,), "float32")
+                for i in T.Parallel(lanes):
+                    acc[i] = T.float32(0.0)
+                for i in T.Parallel(lanes):
+                    for k in T.serial(K):
+                        acc[i] = acc[i] + w_ub[k]
+                for i in T.Parallel(lanes):
+                    b_ub[i] = acc[i]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    assert "acc_carry" not in str(_body_of(mod)), "a fragment must never become a carry vreg"
+    handle = "acc_fragment_mem"
+    # init: 1 store; in-shell RMW: 1 load + 1 store; read-out: 1 load.
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 2
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 2
+    assert not _collect_stores(mod, "local.fragment")
+    assert not _collect_loads(mod, "local.fragment")
+    # Two unit-level bars (init unit, shell unit) plus one bar inside the
+    # shell body — the per-iteration ordering point.
+    bars = _mem_bars(mod)
+    assert len(bars) == 3, [str(b) for b in bars]
+    bars_inside_for = []
+
+    def check_for(node):
+        if isinstance(node, tvm.tirx.For):
+            tvm.tirx.stmt_functor.post_order_visit(
+                node.body,
+                lambda n: bars_inside_for.append(n)
+                if isinstance(n, tvm.tirx.Call)
+                and getattr(getattr(n, "op", None), "name", "")
+                == "tl.simd.mem_bar"
+                else None,
+            )
+
+    _visit(mod, check_for)
+    assert bars_inside_for, (
+        "a backing-writing shell must close each iteration with a mem_bar"
+    )
+
+
+@pytest.mark.pto
+def test_outer_serial_fragment_entry_ok():
+    """The entry interval proof binds outer serial loop ranges: f[k, j]
+    with k a region-level serial var and the fragment holding K entries
+    lowers through both Verify and Vectorize (no 'can reach or exceed the
+    entry count' rejection)."""
+    lanes = 128
+    K = 4
+
+    @T.prim_func
+    def main(A: T.Tensor((K,), "float32"), B: T.Tensor((K * lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((K,), "float32")
+            b_ub = T.alloc_shared((K * lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((K, lanes), "float32")
+                for k in T.serial(K):
+                    for j in T.Parallel(lanes):
+                        keep[k, j] = a_ub[k]
+                for k in T.serial(K):
+                    for j in T.Parallel(lanes):
+                        b_ub[k * lanes + j] = keep[k, j]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    handle = "keep_fragment_mem"
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 1
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 1
+    assert not _collect_stores(mod, "local.fragment")
+    assert not _collect_loads(mod, "local.fragment")
+
+
+@pytest.mark.pto
+def test_outer_serial_fragment_entry_out_of_range_rejected():
+    """The interval bound stays real with outer ranges bound: f[k, j] with
+    k covering more rows than the fragment has entries is rejected."""
+    lanes = 128
+    K = 4
+
+    @T.prim_func
+    def main(A: T.Tensor((K,), "float32"), B: T.Tensor((K * lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((K,), "float32")
+            b_ub = T.alloc_shared((K * lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((2, lanes), "float32")
+                for k in T.serial(K):
+                    for j in T.Parallel(lanes):
+                        keep[k, j] = a_ub[k]
+                for k in T.serial(K):
+                    for j in T.Parallel(lanes):
+                        b_ub[k * lanes + j] = keep[k, j]
+            T.copy(b_ub, B)
+
+    _, error = _lower_capture(main, "VectorizeParallelToPTO", expect_error=True)
+    assert error is not None
+    text = str(error)
+    assert "slot entry index" in text and "reach or exceed" in text, text
+
+
+@pytest.mark.pto
+def test_split_region_fragment_entry_ok():
+    """The vecscope split hoists a UB-carrying serial loop out of the
+    region; the parts converted inside it still see the hoisted loop's
+    range, so a fragment entry depending on it (keep[t, i]) proves its
+    interval in both Verify (original tree) and Vectorize (split tree)."""
+    lanes = 128
+    TK = 4
+
+    @T.prim_func
+    def main(A: T.Tensor((TK * lanes,), "float32"), B: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((TK * lanes,), "float32")
+            y_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((TK, lanes), "float32")
+                for t in T.serial(TK):
+                    for i in T.Parallel(lanes):
+                        keep[t, i] = a_ub[t * lanes + i]
+                for i in T.Parallel(lanes):
+                    y_ub[i] = T.float32(0.0)
+                for t in T.serial(TK):
+                    for i in T.Parallel(lanes):
+                        y_ub[i] = y_ub[i] + keep[t, i]
+                for i in T.Parallel(lanes):
+                    b_ub[i] = y_ub[i]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    handle = "keep_fragment_mem"
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 1
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 1
+    assert not _collect_stores(mod, "local.fragment")
+    assert not _collect_loads(mod, "local.fragment")
+    # The split produced more than one vecscope: each part declares its own
+    # handle over the shared backing.
+    assert len(_declares(mod)) >= 2, [str(d) for d in _declares(mod)]
 
 
 if __name__ == "__main__":
