@@ -188,6 +188,20 @@ def VerifyPTOCodegenLegality():
     return _ffi_api.VerifyPTOCodegenLegality()  # type: ignore
 
 
+def PlanPtoSlotStorage():
+    """Declare the UB backing of PTO slot storage before scheduling.
+
+    Runs on the PTO target only: every local.fragment buffer accessed by a
+    converting SimdVF region gets a hidden shared.dyn backing buffer plus a
+    ``tl.pto_slot_plan`` record on the region's SBlock (entry count, vector
+    type, reserved bytes). The reservation feeds the AutoSchedule UB budget;
+    the backing itself gains reads/writes only when
+    ``VectorizeParallelToPTO`` emits accesses on it.
+    """
+    return _ffi_api.PlanPtoSlotStorage()  # type: ignore
+
+
+
 def VectorizeParallelToPTO():
     """Rewrite verified T.Parallel loops inside PTO SIMD_VF blocks into
     logical VMI code.

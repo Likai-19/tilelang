@@ -10,10 +10,11 @@ Scope: this file proves routing only.
 * PTO ``SimtVF`` and hand-written PTO VMI modules without a ``T.Parallel``
   unit enter the same three PTO pass entry points, but are bypassed inside
   those passes and accepted without conversion;
-* ``PlanPtoSlotStorage`` is neither registered nor called.
+* ``PlanPtoSlotStorage`` is registered and runs on the PTO route (the
+  slot-storage planning stage before scheduling).
 
-This file deliberately asserts routing only: no PTO Parallel semantics, no
-lowering output, and no Fragment/slot, control-flow, or Reduce support. Use
+This file deliberately asserts routing only: no PTO Parallel semantics and
+no lowering output beyond the routed pass set. Use
 ``TL_PTO_ROUTING_TRACE_DIR=<dir>`` to dump the per-case ordered pass trace and
 the lowered kernel source as review artifacts.
 
@@ -224,10 +225,8 @@ def test_pto_handwritten_vmi_without_parallel_is_accepted():
 
 
 @pytest.mark.pto
-def test_plan_pto_slot_storage_is_not_registered_or_called():
-    assert not hasattr(ascend_transform, _SLOT_STORAGE_PASS), (
-        "PlanPtoSlotStorage belongs to a later pipeline stage and must not be registered yet"
-    )
+def test_plan_pto_slot_storage_is_registered_and_runs_on_the_pto_route():
+    assert hasattr(ascend_transform, _SLOT_STORAGE_PASS), "PlanPtoSlotStorage is the slot-storage planning stage and must be registered"
     artifact, names = _lower_with_trace(_simdvf_parallel_kernel(), "pto")
-    assert not any(_SLOT_STORAGE_PASS in name for name in names), "no PlanPtoSlotStorage step may run"
-    _maybe_dump_artifacts("pto-slot-storage-absence", names, artifact)
+    assert any(_SLOT_STORAGE_PASS in name for name in names), f"the PTO route must run PlanPtoSlotStorage; trace tail: {names[-12:]}"
+    _maybe_dump_artifacts("pto-slot-storage-presence", names, artifact)

@@ -105,6 +105,13 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # asc_fill_l1. Must run before AutoSchedule.
     mod = ascend_transform.AscendInsertOOBPadding()(mod)
 
+    # Declare the UB backing of every PTO slot (local.fragment buffer used by
+    # a converting SimdVF region) before scheduling, so AutoSchedule budgets
+    # the reservation and the address pass chain can rewrite it. The pass is
+    # bookkeeping-only; the backing gains accesses only at Vectorize time.
+    # It runs on both the auto-scheduled and manual scheduling paths.
+    mod = ascend_transform.PlanPtoSlotStorage()(mod)
+
     if auto_schedule_enabled:
         mod = ascend_transform.NormalizeControlFlowForSchedule()(mod)
         mod = ascend_transform.NormalizeConflictHints()(mod)

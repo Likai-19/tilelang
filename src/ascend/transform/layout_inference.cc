@@ -1836,11 +1836,16 @@ private:
       if (!ContainsPtoSimdRoot(op->body)) {
         return ffi::GetRef<Stmt>(op);
       }
-      // Descend for the lane annotations; only the kLayoutMap writeback is
-      // skipped for the block itself.
+      // Descend for the lane annotations. A converting PTO region with
+      // fragment buffer layouts (the slot storage path) also receives the
+      // block-level kLayoutMap writeback exactly like the generic block
+      // branch below; regions without PTO parallel roots never reach this
+      // point, and a converting region without fragment layouts keeps its
+      // annotation set unchanged (no empty layout_map is written).
       SBlock block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
-      if (block.same_as(GetRef<SBlock>(op))) {
-        return ffi::GetRef<Stmt>(op);
+      if (!result_.layout_map.empty()) {
+        auto block_ptr = block.CopyOnWrite();
+        block_ptr->annotations.Set(attr::kLayoutMap, result_.layout_map);
       }
       return block;
     }
