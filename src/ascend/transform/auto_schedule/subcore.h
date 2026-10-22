@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <tvm/runtime/logging.h>
 #include <tvm/tirx/analysis.h>
 
 #include "layout/layout.h"
@@ -30,6 +31,8 @@
 #include "support/check.h"
 #include "task_analysis.h"
 #include "task_annotations.h"
+
+#include "../pto_slot_plan.h"
 
 namespace tvm {
 namespace tl {
@@ -51,6 +54,31 @@ public:
     projector.FindVaryingValues(scheduled.tree);
     if (!projector.NeedsProjection(scheduled.tree))
       return root;
+    // PTO slot plans identify their fragment/backing buffers by object;
+    // projection re-binds varying buffers to per-subcore copies, which
+    // would leave every plan pointing at buffers no access uses. Reject
+    // until the projection learns to rewrite PtoSlotPlan entries (Q4).
+    {
+      bool has_slot_plan = false;
+      PostOrderVisit(root->body, [&](const ObjectRef &node) {
+        if (const auto *block = node.as<SBlockNode>()) {
+          if (block->annotations.count(kPtoSlotPlan)) {
+            has_slot_plan = true;
+          }
+        }
+      });
+      if (has_slot_plan) {
+        std::ostringstream oss;
+        oss << "[SubcoreProjector] this kernel needs per-subcore "
+               "projection (subblock-dependent control flow or "
+               "core-local values) but reserves PTO slot storage; the "
+               "projection would detach the slot plans from their "
+               "fragment buffers. Keep fragment accesses on the "
+               "subblock-independent path until projection rewrites "
+               "slot plans";
+        LOG(FATAL) << oss.str();
+      }
+    }
     Stmt body = projector.RewriteList(scheduled.tree, -1);
     projector.VerifyProjectedFixpipeTasks(body);
     VarSet used;

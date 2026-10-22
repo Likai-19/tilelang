@@ -164,11 +164,58 @@ void CheckSelfCopyRegionsDisjoint(const CopyNode *copy) {
   }
 }
 
+// Predicated whole-entry expansion for an unaligned 1D fragment region
+// [min, min + extent): the loop base aligns down to the lane width, the
+// original range becomes a lane-varying predicate that Legalize lowers
+// into the store mask, and read/write indices shift by one shared
+// constant so every iteration addresses whole entries.
+For BuildPredicatedFill(const Buffer &dst, int64_t region_min,
+                        int64_t region_extent, const PrimExpr &value,
+                        int64_t lanes) {
+  const DataType ity = DataType::Int(32);
+  const int64_t delta = region_min % lanes;
+  const int64_t base = region_min - delta;
+  const int64_t padded =
+      ((delta + region_extent + lanes - 1) / lanes) * lanes;
+  Var i("i", ity);
+  PrimExpr idx = IntImm(ity, static_cast<int>(base)) + i;
+  PrimExpr cond =
+      (idx >= IntImm(ity, static_cast<int>(region_min))) &&
+      (idx < IntImm(ity, static_cast<int>(region_min + region_extent)));
+  Stmt body =
+      IfThenElse(cond, BufferStore(dst, value, {idx}));
+  return For(i, IntImm(ity, 0), IntImm(ity, static_cast<int>(padded)),
+             ForKind::kParallel, body);
+}
+
+For BuildPredicatedCopy(const Buffer &src, int64_t src_min, const Buffer &dst,
+                        int64_t dst_min, int64_t extent, int64_t lanes) {
+  const DataType ity = DataType::Int(32);
+  const int64_t delta = dst_min % lanes;
+  const int64_t base = dst_min - delta;
+  const int64_t padded = ((delta + extent + lanes - 1) / lanes) * lanes;
+  Var i("i", ity);
+  PrimExpr dst_idx = IntImm(ity, static_cast<int>(base)) + i;
+  PrimExpr src_idx =
+      IntImm(ity, static_cast<int>(src_min - delta)) + i;
+  PrimExpr cond =
+      (dst_idx >= IntImm(ity, static_cast<int>(dst_min))) &&
+      (dst_idx < IntImm(ity, static_cast<int>(dst_min + extent)));
+  Stmt body = IfThenElse(cond, BufferStore(
+                                   dst, BufferLoad(src, {src_idx}),
+                                   {dst_idx}));
+  return For(i, IntImm(ity, 0), IntImm(ity, static_cast<int>(padded)),
+             ForKind::kParallel, body);
+}
+
 class RegionExpander : public StmtExprMutator {
 public:
   // Rewrites the fill/copy calls of one converting region in source
   // order. Nested blocks inside the region keep their structure; the
   // base mutator rebuilds the standard wrappers around any replacement.
+  // \p lanes is the region's vector width (tl.simdvf_lanes); it decides
+  // whether a fragment region min is entry-aligned.
+  RegionExpander(int64_t lanes) : lanes_(lanes) {}
   Stmt Expand(const Stmt &stmt) { return VisitStmt(stmt); }
 
 private:
@@ -182,28 +229,154 @@ private:
     if (!TouchesFragmentBuffer(fill_copy)) {
       return GetRef<Stmt>(op);
     }
+    // The expansion expresses the fill/copy as plain element-wise
+    // T.Parallel loops; call-level annotations (cluster/subblock routing
+    // on ascend_copy, cache hints) describe semantics those loops do not
+    // carry, so silently dropping them would change behavior. Reject.
+    if (!fill_copy->annotations.empty()) {
+      std::ostringstream keys;
+      bool first = true;
+      for (const auto &kv : fill_copy->annotations) {
+        if (!first) {
+          keys << ", ";
+        }
+        first = false;
+        keys << kv.first;
+      }
+      std::ostringstream oss;
+      oss << "[ExpandPtoFragmentFillCopy] " << name << " on a fragment "
+             "buffer carries annotations ("
+          << keys.str()
+          << ") that the parallel-loop expansion cannot preserve; "
+             "initialize through a T.Parallel loop instead";
+      LOG(FATAL) << oss.str();
+    }
     TileOperator tile_op = ParseOperator(fill_copy);
     ICHECK(tile_op.defined())
         << "[ExpandPtoFragmentFillCopy] internal error: " << name
         << " call has no registered TileOperator builder";
-    arith::Analyzer analyzer;
-    Stmt expanded;
-    // MakeSIMTLoop lives on the node classes (FillNode/CopyNode); the
-    // TileOperator handle's arrow yields the base node.
+    // Unaligned fragment regions (min not a multiple of the lane width)
+    // expand to the predicated whole-entry form; aligned ones keep the
+    // plain MakeSIMTLoop shape. Both keep every access on whole entries
+    // so the storage lane equals the execution lane.
     if (auto fill = tile_op.as<Fill>()) {
-      expanded = fill.value().get()->MakeSIMTLoop(&analyzer);
-    } else if (auto copy = tile_op.as<Copy>()) {
-      CheckSelfCopyRegionsDisjoint(copy.value().get());
-      expanded = copy.value().get()->MakeSIMTLoop(&analyzer);
-    } else {
-      ICHECK(false) << "[ExpandPtoFragmentFillCopy] internal error: " << name
-                    << " parsed as an unexpected operator type";
+      const FillNode *node = fill.value().get();
+      if (Stmt unaligned = TryUnalignedFill(node, name);
+          unaligned.defined()) {
+        return StripLoopAnnotations(unaligned);
+      }
+      arith::Analyzer analyzer;
+      Stmt expanded = node->MakeSIMTLoop(&analyzer);
+      return StripLoopAnnotations(expanded);
     }
-    ICHECK(expanded.defined())
-        << "[ExpandPtoFragmentFillCopy] internal error: " << name
-        << " produced no loop form";
-    return StripLoopAnnotations(expanded);
+    if (auto copy = tile_op.as<Copy>()) {
+      const CopyNode *node = copy.value().get();
+      CheckSelfCopyRegionsDisjoint(node);
+      if (Stmt unaligned = TryUnalignedCopy(node, name);
+          unaligned.defined()) {
+        return StripLoopAnnotations(unaligned);
+      }
+      arith::Analyzer analyzer;
+      Stmt expanded = node->MakeSIMTLoop(&analyzer);
+      return StripLoopAnnotations(expanded);
+    }
+    ICHECK(false) << "[ExpandPtoFragmentFillCopy] internal error: " << name
+                  << " parsed as an unexpected operator type";
+    return Stmt();
   }
+
+  // Predicated expansion of an unaligned 1D fill into a fragment. Any
+  // other shape (aligned, multi-dimensional, non-constant bounds)
+  // returns an undefined Stmt so the caller falls back to MakeSIMTLoop
+  // (whose aligned form Verify proves) — multi-dimensional unaligned
+  // regions are rejected here, closest to the access.
+  Stmt TryUnalignedFill(const FillNode *node, const std::string &name) {
+    if (node->region.size() != 1u || node->dst->shape.size() != 1u) {
+      if (!AllMinsAligned(node->region)) {
+        RejectUnalignedShape(name, node->dst);
+      }
+      return Stmt();
+    }
+    const int64_t *min_p = as_const_int(node->region[0]->min);
+    const int64_t *extent_p = as_const_int(node->region[0]->extent);
+    if (min_p == nullptr || extent_p == nullptr) {
+      return Stmt();
+    }
+    if (*min_p % lanes_ == 0) {
+      return Stmt();  // aligned: plain loop, lane proof admits it
+    }
+    return BuildPredicatedFill(node->dst, *min_p, *extent_p, node->value,
+                               lanes_);
+  }
+
+  // Predicated expansion of an unaligned 1D copy touching a fragment.
+  // Rules (design §4.3): a fragment destination whose min is unaligned
+  // is only expandable when the source is the same allocation with a
+  // congruent min (fragment->fragment) — the shared shift keeps both
+  // sides in range. UB↔fragment copies with an unaligned fragment side
+  // would read past the source range and are rejected.
+  Stmt TryUnalignedCopy(const CopyNode *node, const std::string &name) {
+    const bool dst_frag = node->dst.scope() == "local.fragment";
+    const bool src_frag = node->src.scope() == "local.fragment";
+    if (node->dst_range.size() != 1u || node->src_range.size() != 1u) {
+      if (!AllMinsAligned(node->dst_range) ||
+          (src_frag && !AllMinsAligned(node->src_range))) {
+        RejectUnalignedShape(name, dst_frag ? node->dst : node->src);
+      }
+      return Stmt();
+    }
+    const int64_t *dmin_p = as_const_int(node->dst_range[0]->min);
+    const int64_t *dext_p = as_const_int(node->dst_range[0]->extent);
+    const int64_t *smin_p = as_const_int(node->src_range[0]->min);
+    if (dmin_p == nullptr || dext_p == nullptr || smin_p == nullptr) {
+      return Stmt();
+    }
+    const bool dst_aligned = *dmin_p % lanes_ == 0;
+    const bool src_aligned = !src_frag || *smin_p % lanes_ == 0;
+    if (dst_aligned && src_aligned) {
+      return Stmt();
+    }
+    if (!dst_frag && !src_frag) {
+      return Stmt();  // plain UB copy: not this pass's concern
+    }
+    if (dst_frag && src_frag && *dmin_p % lanes_ == *smin_p % lanes_) {
+      return BuildPredicatedCopy(node->src, *smin_p, node->dst, *dmin_p,
+                                 *dext_p, lanes_);
+    }
+    std::ostringstream oss;
+    oss << "[ExpandPtoFragmentFillCopy] " << name
+        << " has an unaligned fragment region (min not a multiple of "
+           "the lane width "
+        << lanes_
+        << ") that cannot be expanded to whole-entry addressing; align "
+           "the region start to the lane width or copy through an "
+           "intermediate buffer";
+    LOG(FATAL) << oss.str();
+    return Stmt();
+  }
+
+  bool AllMinsAligned(const Array<Range> &region) const {
+    for (const Range &range : region) {
+      const int64_t *min_p = as_const_int(range->min);
+      if (min_p != nullptr && *min_p % lanes_ != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  [[noreturn]] void RejectUnalignedShape(const std::string &name,
+                                         const Buffer &buffer) {
+    std::ostringstream oss;
+    oss << "[ExpandPtoFragmentFillCopy] " << name
+        << " on fragment buffer `" << buffer->name
+        << "` uses a multi-dimensional region with an unaligned min; "
+           "only 1D unaligned fragment regions are supported (align the "
+           "start to the lane width)";
+    LOG(FATAL) << oss.str();
+  }
+
+  int64_t lanes_;
 };
 
 class ExpandPtoFragmentFillCopyImpl : public StmtExprMutator {
@@ -222,7 +395,14 @@ private:
   Stmt VisitStmt_(const SBlockNode *op) final {
     if (op->name_hint == "SIMD_VF" &&
         pto::ScanPtoRegion(op->body).has_any_parallel) {
-      Stmt expanded = RegionExpander().Expand(op->body);
+      int64_t lanes = 0;
+      if (auto anno = op->annotations.Get("tl.simdvf_lanes");
+          anno.has_value()) {
+        if (const auto *imm = anno.value().as<IntImmNode>()) {
+          lanes = imm->value;
+        }
+      }
+      Stmt expanded = RegionExpander(lanes).Expand(op->body);
       if (expanded.same_as(op->body)) {
         return GetRef<Stmt>(op);
       }
