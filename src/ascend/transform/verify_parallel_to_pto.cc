@@ -182,7 +182,8 @@ private:
         if (name == "tl.tileop.reduce") {
           parent_->Fail("expression", "cross-lane reduce is not supported");
         }
-        if (name == "tl.tileop.fill" || name == "tl.tileop.copy") {
+        if (name == "tl.tileop.fill" || name == "tl.tileop.copy" ||
+            name == "tl.tileop.ascend_copy") {
           // Fragment-touching fill/copy is expanded into T.Parallel loops
           // before layout inference, so a survivor here means the
           // expansion missed a position; initialize the fragment through a

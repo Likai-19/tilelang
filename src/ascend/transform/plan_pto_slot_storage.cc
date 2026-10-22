@@ -375,10 +375,24 @@ private:
 
   static int64_t EntryCountFromLayout(const Buffer &fragment,
                                       const Fragment &layout) {
+    // Canonical form validation: the layout must be a PTO-legal Fragment
+    // (exactly one forward_index dimension, replicate == 1, constant
+    // positive thread extent). Non-canonical layouts (floating fragments
+    // seeded as FullyReplicated, or SIMT-oriented annotated layouts)
+    // would produce wrong reservation sizes.
     ICHECK_EQ(layout->GetForwardIndex().size(), 1u)
         << "[PlanPtoSlotStorage] fragment layout for buffer `" << fragment->name
         << "` must have exactly one entry dimension, got "
         << layout->GetForwardIndex().size();
+    const int64_t *replicate = as_const_int(layout->ReplicateExtent());
+    ICHECK(replicate != nullptr && *replicate == 1)
+        << "[PlanPtoSlotStorage] fragment layout for buffer `"
+        << fragment->name << "` must have replicate_size == 1 (non-canonical "
+        << "layout: floating or SIMT-annotated)";
+    const int64_t *thread_extent = as_const_int(layout->ThreadExtent());
+    ICHECK(thread_extent != nullptr && *thread_extent > 0)
+        << "[PlanPtoSlotStorage] fragment layout for buffer `"
+        << fragment->name << "` must have a constant positive thread extent";
     const Array<PrimExpr> output_shape = layout->OutputShape();
     const int64_t *count = as_const_int(output_shape[0]);
     ICHECK(count != nullptr && *count > 0)
