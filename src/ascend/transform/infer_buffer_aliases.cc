@@ -23,6 +23,7 @@
  */
 #include "buffer_alias.h"
 #include "merge_ub_common.h"
+#include "pto_slot_plan.h"
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
@@ -40,6 +41,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <tuple>
 #include <unordered_map>
@@ -1966,8 +1968,21 @@ InferBufferAliasesForScope(const Stmt &stmt, const AllocationMap &allocations,
   BufferAliasMap aliases;
   for (const VarNode *var : reuse_analysis.buffer_vars)
     AddBufferAliasStorage(&aliases, GetRef<Var>(var));
+  // PTO slot backings never share addresses with anything: their
+  // reads/writes may not exist until after Vectorize, so the happens-before
+  // reuse analysis has no basis to prove a lifetime split — drop them from
+  // every alias edge instead of relying on that vacuity. This pass runs
+  // after Vectorize, where the plans are already consumed; the
+  // declarations' backing operands are the surviving identification, with
+  // the plan annotation kept as a pre-conversion fallback.
+  const std::set<const VarNode *> slot_backings =
+      CollectAllSlotBackingVars(stmt);
   for (int lhs = 0; lhs < reuse_analysis.num_buffers; ++lhs) {
     for (int rhs = lhs + 1; rhs < reuse_analysis.num_buffers; ++rhs) {
+      if (slot_backings.count(reuse_analysis.buffer_vars[lhs]) != 0 ||
+          slot_backings.count(reuse_analysis.buffer_vars[rhs]) != 0) {
+        continue;
+      }
       if (reuse_analysis.CanReuse(lhs, rhs)) {
         AddBufferAlias(&aliases, GetRef<Var>(reuse_analysis.buffer_vars[lhs]),
                        GetRef<Var>(reuse_analysis.buffer_vars[rhs]));

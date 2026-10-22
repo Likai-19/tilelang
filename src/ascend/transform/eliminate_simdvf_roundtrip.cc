@@ -63,6 +63,7 @@
 #include <vector>
 
 #include "parallel_to_pto_utils.h"
+#include "pto_slot_plan.h"
 
 namespace tvm {
 namespace tl {
@@ -631,8 +632,29 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
     return false;
   }
 
+  /*! The reserved PTO fragment backings must survive this pass: they carry
+   * no accesses until VectorizeParallelToPTO emits them (their whole point
+   * is to be reserved ahead of scheduling), so an access-based pruning
+   * would drop the allocation that those accesses will reference. */
+  std::unordered_set<const VarNode *> PlannedBackingVars(
+      const SBlockNode *block) const {
+    std::unordered_set<const VarNode *> vars;
+    auto value = block->annotations.Get(kPtoSlotPlan);
+    if (!value.has_value()) {
+      return vars;
+    }
+    auto plans = value.value().try_cast<Array<PtoSlotPlan>>();
+    if (!plans.has_value()) {
+      return vars;
+    }
+    for (const PtoSlotPlan &plan : plans.value()) {
+      vars.insert(plan->backing->data.get());
+    }
+    return vars;
+  }
+
   /*! Drop block allocations that no longer take part in any access of the
-   * rewritten region. */
+   * rewritten region, except the planned slot backings above. */
   Array<Buffer> PruneAllocBuffers(const SBlockNode *block,
                                   const Stmt &region) const {
     std::unordered_set<const VarNode *> used;
@@ -645,6 +667,9 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
         used.insert(var);
       }
     });
+    for (const VarNode *var : PlannedBackingVars(block)) {
+      used.insert(var);
+    }
     Array<Buffer> kept;
     for (const Buffer &buffer : block->alloc_buffers) {
       if (used.count(buffer->data.get()) != 0) {

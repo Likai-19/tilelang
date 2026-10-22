@@ -38,6 +38,8 @@
 #include <utility>
 #include <vector>
 
+#include <set>
+
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/function.h>
@@ -66,6 +68,7 @@
 #include "ascend/transform/buffer_version.h"
 #include "backend/common/target_utils.h"
 #include "op/utils.h"
+#include "pto_slot_plan.h"
 #include "runtime/thread_storage_scope.h"
 #include "support/check.h"
 #include "tir/transforms/ir_utils.h"
@@ -1393,6 +1396,42 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
       metadata.manual_buffer_versions, groups, "manual version counts");
   unit_builder.SetStorageGroups(groups);
   int64_t shared_mem_limit = GetSharedMemoryLimit(kernel_body);
+  // PTO slot storage: the reserved backings carry no reads or writes at
+  // this point (slot_alloc appears only after Vectorize), so the
+  // access-region buffer enumeration cannot see them. Deduct their full
+  // capacity up front — the scheduler must budget as if every backing were
+  // live and must not assume PTOAS will later promote the slots to
+  // registers. An "unlimited" shared scope skips the
+  // reservation like every other capacity rule.
+  bool shared_unlimited = false;
+  for (const String &scope : metadata.unlimit_memory_scopes) {
+    if (scope == "shared") {
+      shared_unlimited = true;
+      break;
+    }
+  }
+  if (!shared_unlimited) {
+    int64_t slot_bytes = 0;
+    std::set<const VarNode *> seen_backings;
+    // Scan from the kernel root itself, not just its body: a fragment
+    // buffer allocated at kernel scope records its plan on the root block,
+    // and a body-only walk would silently skip that reservation.
+    for (const auto &plan : CollectPtoSlotPlans(metadata.kernel_root)) {
+      if (!seen_backings.insert(plan->backing->data.get()).second) {
+        continue;
+      }
+      slot_bytes += plan->bytes;
+    }
+    if (slot_bytes > 0) {
+      ICHECK(shared_mem_limit > slot_bytes)
+          << "[AutoSchedule] PTO slot storage reserves " << slot_bytes
+          << " bytes of UB for fragment buffers kept across loops, but only "
+          << shared_mem_limit
+          << " bytes are available on this target; reduce the reserved "
+             "fragments or use T.annotate_unlimit_memory(\"shared\")";
+      shared_mem_limit -= slot_bytes;
+    }
+  }
   unit_builder.SetMemoryLimit("shared", shared_mem_limit);
   if (auto value = metadata.kernel_root->annotations.Get(kAivStorageMap)) {
     unit_builder.SetAivStorages(value.value().cast<AivStorageMap>());
