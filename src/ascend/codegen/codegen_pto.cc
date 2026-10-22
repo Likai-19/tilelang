@@ -5682,21 +5682,25 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
   // Composed dist_mode forms (PTODSL removed the dist_mode kwarg,
   // PTOAS!293): emit before the generic call prefix opens, each branch
   // prints its own complete expression and returns.
-  auto pto_ptr_with_offset = [&](const PrimExpr &ptr,
-                                 const PrimExpr &offset) -> std::string {
+  // The PTODSL memory ABI is (source, offset, ...): keep TileLang's
+  // (ptr, elem_offset) pair split instead of folding to addptr.
+  auto pto_source = [&](const PrimExpr &ptr) -> std::string {
+    return PrintExpr_(ptr);
+  };
+  auto pto_offset = [&](const PrimExpr &offset) -> std::string {
     if (is_zero(offset)) {
-      return PrintExpr_(ptr);
+      return "0";
     }
-    return "pto.addptr(" + PrintExpr_(ptr) + ", " +
-           RemoveOutermostParentheses(PrintExpr_(offset)) + ")";
+    return RemoveOutermostParentheses(PrintExpr_(offset));
   };
   if (op_name == "tl.vmi.vload" || op_name == "tl.vmi.vstore") {
     const std::string dist_mode = VmiDistModeOf_(op);
     if (op_name == "tl.vmi.vload" && dist_mode == "brc") {
       // A broadcast load is a one-element load followed by vbrc.
       ICHECK_EQ(op->args.size(), 2U) << "tl.vmi.vload expects (ptr, offset)";
-      os << "pto.vmi.vbrc(pto.vmi.vload(" << pto_ptr_with_offset(op->args[0], op->args[1])
-         << ", size=1), size=" << VmiSizeOf_(op) << ")";
+      os << "pto.vmi.vbrc(pto.vmi.vload(" << pto_source(op->args[0]) << ", "
+         << pto_offset(op->args[1]) << ", size=1), size=" << VmiSizeOf_(op)
+         << ")";
       return;
     }
     if (op_name == "tl.vmi.vload" && dist_mode == "dintlv") {
@@ -5704,34 +5708,31 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
       // the full mask (loads stay unmasked in the VMI contract).
       ICHECK_EQ(op->args.size(), 2U) << "tl.vmi.vload expects (ptr, offset)";
       const int64_t size = VmiSizeOf_(op);
-      const std::string off =
-          RemoveOutermostParentheses(PrintExpr_(op->args[1]));
+      const std::string off = pto_offset(op->args[1]);
       os << "pto.vmi.vdintlv(";
-      os << "pto.vmi.vload(" << pto_ptr_with_offset(op->args[0], op->args[1])
+      os << "pto.vmi.vload(" << pto_source(op->args[0]) << ", " << off
          << ", size=" << size << "), ";
-      os << "pto.vmi.vload(pto.addptr(" << PrintExpr_(op->args[0]) << ", ("
-         << off << ") + " << size << "), size=" << size << "), ";
+      os << "pto.vmi.vload(" << pto_source(op->args[0]) << ", (" << off
+         << ") + " << size << ", size=" << size << "), ";
       os << "pto.vmi.create_mask(" << size << ", size=" << size << "))";
       return;
     }
     if (op_name == "tl.vmi.vstore" && dist_mode == "dintlv") {
       // An interleaved store is vintlv followed by two contiguous
-      // stores, emitted as one statement sequence (vintlv's result is an
-      // indexable pair).
+      // stores, emitted as one statement sequence (vintlv's result is
+      // an indexable pair).
       ICHECK_GE(op->args.size(), 5U)
           << "tl.vmi.vstore with dist_mode=dintlv expects (even, odd, ptr, "
              "offset, mask)";
       const int64_t size = op->args[0].dtype().lanes();
-      const std::string off =
-          RemoveOutermostParentheses(PrintExpr_(op->args[2]));
+      const std::string off = pto_offset(op->args[3]);
       const std::string mask = PrintExpr_(op->args[4]);
       os << "_di = pto.vmi.vintlv(" << PrintExpr_(op->args[0]) << ", "
          << PrintExpr_(op->args[1]) << ", " << mask << "); ";
-      os << "pto.vmi.vstore(_di[0], "
-         << pto_ptr_with_offset(op->args[2], op->args[3]) << ", " << mask
-         << "); ";
-      os << "pto.vmi.vstore(_di[1], pto.addptr(" << PrintExpr_(op->args[2])
-         << ", (" << off << ") + " << size << "), " << mask << ")";
+      os << "pto.vmi.vstore(_di[0], " << pto_source(op->args[2]) << ", "
+         << off << ", " << mask << "); ";
+      os << "pto.vmi.vstore(_di[1], " << pto_source(op->args[2]) << ", ("
+         << off << ") + " << size << ", " << mask << ")";
       return;
     }
   }
@@ -5758,8 +5759,6 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     PrintExpr_(arg, os);
   };
 
-  // PTODSL vgather/vgatherb/vscatter take a single pointer operand. TileLang
-  // lowers buffer addresses to (ptr, elem_offset); fold them with addptr here.
   auto print_ptr_with_offset = [&](const PrimExpr &ptr,
                                    const PrimExpr &offset) {
     if (is_zero(offset)) {
