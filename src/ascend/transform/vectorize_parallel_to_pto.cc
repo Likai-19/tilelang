@@ -310,6 +310,23 @@ public:
   }
 
 private:
+  // Kernel/outer serial loops in scope at the current position (outside
+  // any region): bound here so a fragment entry depending on them
+  // (f[b, j]) proves its interval — the region-side walk cannot see
+  // them, and Verify bound the same ranges when it accepted the program.
+  Stmt VisitStmt_(const ForNode *op) final {
+    if (op->kind == ForKind::kSerial && op->min.as<IntImmNode>() != nullptr &&
+        op->extent.as<IntImmNode>() != nullptr) {
+      Map<Var, Range> saved = outer_serial_ranges_;
+      outer_serial_ranges_.Set(
+          op->loop_var, Range::FromMinExtent(op->min, op->extent));
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      outer_serial_ranges_ = std::move(saved);
+      return result;
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
   // ------------------------------------------------------------------
   // Unified unit discovery (shared rules with Verify).
   // A SIMD_VF region contains zero or more *sequential* parallel units.
@@ -326,6 +343,12 @@ private:
       block_stack_.push_back(op);
       Stmt result = StmtExprMutator::VisitStmt_(op);
       block_stack_.pop_back();
+      // Fragments allocated at kernel scope were consumed by a child
+      // region's conversion: drop the dead allocation and its layout-map
+      // entry here so no stale reference survives into codegen (the
+      // region blocks clean their own entries; this covers the outer
+      // owners).
+      result = DropConsumedFragmentsFromBlock(op, result);
       // A child region split hoisted its UB allocations up to this block (see
       // TrySplitCarriedLoop); extend the rebuilt block so the split parts
       // share one allocation.
@@ -493,7 +516,10 @@ private:
   Stmt ConvertRegionBody(const Stmt &region) {
     // Reset the region-level slot state: every local.fragment buffer of
     // this converting region maps to one reserved backing (shared by all
-    // sequential units — e.g. an accumulator kept across units).
+    // sequential units — e.g. an accumulator kept across units). The WAR
+    // tracker is per region: an earlier vecscope's trailing reads are
+    // ordered by the vecscope boundary, not by a bar inside this one.
+    backing_reads_since_bar_ = false;
     BuildSlotState();
     pto_analysis::PtoRegionScan scan = pto_analysis::ScanPtoRegion(region);
     ICHECK(!scan.units.empty())
@@ -586,10 +612,24 @@ private:
       // through UB, and TileLang does not rely on a backend
       // auto-inserting the barrier. The mem-to-value promotion deletes
       // the bar again whenever it forwards the round trip.
+      //
+      // Cross-unit WAR is ordered symmetrically: a writing unit whose
+      // predecessors read the backing since the last bar gets a VLD_VST
+      // bar *before* it, so its vstore cannot overtake an earlier unit's
+      // vload of the same entry.
+      if (unit_wrote_backing_ && backing_reads_since_bar_) {
+        converted = SeqStmt::Flatten(
+            Evaluate(Call(DataType::Void(), tl::simd_mem_bar(),
+                          {StringImm("VLD_VST")})),
+            converted);
+      }
       if (unit_wrote_backing_) {
         converted = SeqStmt::Flatten(
             converted, Evaluate(Call(DataType::Void(), tl::simd_mem_bar(),
                                      {StringImm("VST_VLD")})));
+        backing_reads_since_bar_ = false;
+      } else if (unit_read_backing_) {
+        backing_reads_since_bar_ = true;
       }
       new_region = ReplaceStmt(new_region, scan.units[i], converted);
     }
@@ -966,6 +1006,13 @@ private:
       }
       void VisitStmt_(const BufferStoreNode *op) final {
         Record(op->buffer);
+        // The base visitor may not descend into BufferStore predicates;
+        // record fragment reads appearing only there explicitly (a
+        // split part whose only use is a store predicate would otherwise
+        // lose its declaration).
+        if (op->predicate.defined()) {
+          VisitExpr(op->predicate.value());
+        }
         StmtExprVisitor::VisitStmt_(op);
       }
       const std::unordered_map<Buffer, SlotState, ObjectPtrHash,
@@ -978,6 +1025,54 @@ private:
   // Bind one declare_fragment_buffer per accessed plan at the top of the
   // region, inside the tl.simdvf_scope attr when the region is wrapped by
   // one (VPTO treats vecscope data as region-local).
+  // Strip alloc_buffers / layout_map entries of fragments consumed by
+  // conversion from a rebuilt outer block. No-op unless a converting
+  // region below this block consumed a kernel-scope fragment.
+  Stmt DropConsumedFragmentsFromBlock(const SBlockNode *original,
+                                      const Stmt &rebuilt) {
+    if (converted_fragments_.empty()) {
+      return rebuilt;
+    }
+    Array<Buffer> allocs;
+    bool changed = false;
+    for (const Buffer &buffer : original->alloc_buffers) {
+      if (converted_fragments_.count(buffer->data.get()) != 0) {
+        changed = true;
+        continue;
+      }
+      allocs.push_back(buffer);
+    }
+    Map<Var, Layout> layouts;
+    bool layout_changed = false;
+    if (auto anno = original->annotations.Get(attr::kLayoutMap);
+        anno.has_value()) {
+      if (auto map = anno.value().try_cast<Map<Var, Layout>>();
+          map.has_value()) {
+        for (const auto &[var, layout] : map.value()) {
+          if (converted_fragments_.count(var.get()) != 0) {
+            layout_changed = true;
+            continue;
+          }
+          layouts.Set(var, layout);
+        }
+      }
+    }
+    if (!changed && !layout_changed) {
+      return rebuilt;
+    }
+    const auto *block = rebuilt.as<SBlockNode>();
+    ICHECK(block != nullptr)
+        << "[VectorizeParallelToPTO] internal error: a non-SBlock "
+           "statement carries fragment allocations";
+    Map<String, Any> annotations = block->annotations;
+    if (layout_changed) {
+      annotations.Set(attr::kLayoutMap, layouts);
+    }
+    return SBlock(block->iter_vars, block->reads, block->writes,
+                  block->name_hint, block->body, block->init, allocs,
+                  block->match_buffers, annotations);
+  }
+
   Stmt EmitSlotDeclarations(const Stmt &region, int64_t lanes) {
     declared_handles_.clear();
     handle_plans_.clear();
@@ -1036,6 +1131,9 @@ private:
           found = true;
           name = op->buffer->name;
         }
+        if (op->predicate.defined()) {
+          VisitExpr(op->predicate.value());
+        }
         StmtExprVisitor::VisitStmt_(op);
       }
     };
@@ -1084,6 +1182,19 @@ private:
               << (lanes ? std::to_string(lanes->value) : "?") << " vs plan "
               << plan->second->count << "x" << plan->second->vector_lanes
               << ")";
+          // The declared base must address the plan's own backing: the
+          // address is access_ptr(BufferLoad(backing, 0), total, 3).
+          const auto *base_call = call->args[0].as<CallNode>();
+          const BufferLoadNode *base_load = nullptr;
+          if (base_call != nullptr) {
+            base_load = base_call->args[0].as<BufferLoadNode>();
+          }
+          ICHECK(base_load != nullptr &&
+                 base_load->buffer->data.get() ==
+                     plan->second->backing->data.get())
+              << "[VectorizeParallelToPTO] internal error: declaration of `"
+              << op->var->name_hint << "` does not address its plan's "
+                 "backing";
           declared_.emplace(op->var.get(), plan->second);
         }
         StmtExprVisitor::VisitStmt_(op);
@@ -2040,12 +2151,17 @@ private:
     lane_scalar_vregs_.clear();
     lane_scalar_allocs_.clear();
     unit_wrote_backing_ = false;
+    unit_read_backing_ = false;
     outer_loop_ranges_ = EnclosingSerialRanges(region_body, loop.get());
-    // Ranges of serial loops the vecscope split hoisted outside the part
-    // being converted: the part body no longer contains them, but its
-    // fragment entries may still depend on their variables (f[t, i]), and
-    // Verify proved the interval against the original tree — with these
-    // ranges bound. Seed them so Vectorize reproduces the same proof.
+    // Serial loops in scope outside the region (kernel level) and the
+    // loops the vecscope split hoisted outside the part being converted:
+    // the region/part body no longer contains them, but fragment entries
+    // may still depend on their variables (f[b, j], f[t, i]), and Verify
+    // proved the interval against the original tree — with these ranges
+    // bound. Seed them so Vectorize reproduces the same proof.
+    for (const auto &kv : outer_serial_ranges_) {
+      outer_loop_ranges_.Set(kv.first, kv.second);
+    }
     for (const auto &kv : split_loop_ranges_) {
       outer_loop_ranges_.Set(kv.first, kv.second);
     }
@@ -2623,6 +2739,7 @@ private:
     // No CSE and no cross-access reuse: every textual fragment read is its
     // own vload on the handle (memory semantics; merging and the
     // store->load forwarding are PTOAS's decisions).
+    unit_read_backing_ = true;
     return EmitBind(
         "vload",
         Call(VectorDType(load->dtype, lanes_), VmiOp("vload"),
@@ -3130,6 +3247,10 @@ private:
   // True when the unit being converted wrote to a fragment backing (drives
   // the ordering mem_bar appended after the unit).
   bool unit_wrote_backing_ = false;
+  bool unit_read_backing_ = false;
+  /*! True when a converted unit read the backing without an intervening
+   * bar: the next backing-writing unit needs a WAR (VLD_VST) bar. */
+  bool backing_reads_since_bar_ = false;
 
   // Per-unit state.
   Var loop_var_;
@@ -3166,6 +3287,9 @@ private:
   // Serial loops hoisted out of the region by the vecscope split, in scope
   // while the parts inside them are converted (see TransformCarryLoop).
   Map<Var, Range> split_loop_ranges_;
+  // Serial loops in scope at the current mutation position outside any
+  // region (kernel level), maintained by the mutator's For visitor.
+  Map<Var, Range> outer_serial_ranges_;
   // Region-level carry promotion state (AnalyzeRegionCarry). When a unit is
   // the seed or an in-loop unit of the promoted region, its B accesses are
   // redirected to this vreg and the allocation happens once at region level
