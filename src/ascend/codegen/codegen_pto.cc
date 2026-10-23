@@ -290,6 +290,25 @@ std::string PtoIntegerVectorInterpretTarget(DataType element) {
   return "pto.ui" + std::to_string(element.bits());
 }
 
+// The TileLang-side name of a VMI call maps to the PTODSL surface name. The
+// boolean mask-combine ops have no PTODSL counterpart under their own
+// names; the current PTOAS surface exposes the same operation as the bitwise
+// vector ops on mask registers. ABI surface:
+//   pto.vmi.vand %a, %b : mask<128xpred>, mask<128xpred> -> mask<128xpred>
+//   pto.vmi.vor  (same shape) / pto.vmi.vnot : mask -> mask
+std::string PtoVmiEmitName(const std::string &op_name) {
+  if (op_name == "tl.vmi.mask_and") {
+    return "vmi.vand";
+  }
+  if (op_name == "tl.vmi.mask_or") {
+    return "vmi.vor";
+  }
+  if (op_name == "tl.vmi.mask_not") {
+    return "vmi.vnot";
+  }
+  return op_name.substr(3);
+}
+
 std::string StripPipePrefix(const std::string &name) {
   if (name.rfind("PIPE_", 0) == 0) {
     return name.substr(5);
@@ -5330,7 +5349,8 @@ CodeGenTileLangPTO::PtoValueKind CodeGenTileLangPTO::ClassifyVmiCallResult_(
   ICHECK(opt_call_op.has_value()) << "tl.vmi call has a non-Op callee";
   const std::string name = opt_call_op.value()->name;
   if (name == "tl.vmi.create_mask" || name == "tl.vmi.vcmp" ||
-      name == "tl.vmi.vcmps") {
+      name == "tl.vmi.vcmps" || name == "tl.vmi.mask_and" ||
+      name == "tl.vmi.mask_or" || name == "tl.vmi.mask_not") {
     return PtoValueKind::kVmiMask;
   }
   if (name == "tl.vmi.vintlv" || name == "tl.vmi.vdintlv" ||
@@ -5574,7 +5594,7 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
   if (bridge_integer_source) {
     os << "pto.vmi.vinterpret_cast(";
   }
-  os << "pto." << op_name.substr(3) << "(";
+  os << "pto." << PtoVmiEmitName(op_name) << "(";
   bool needs_comma = false;
 
   auto print_scalar_literal_value = [&](const PrimExpr &arg) {
