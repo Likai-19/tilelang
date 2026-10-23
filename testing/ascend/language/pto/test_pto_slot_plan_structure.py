@@ -1548,5 +1548,155 @@ def test_solver_1d_unit_pins_dim0():
     )
 
 
+# ---------------------------------------------------------------------------
+# Kernel-level layout annotations (R4 §3.3): pinned participation,
+# canonical-form validation, SimdVF-scope rejection, degenerate dims
+# ---------------------------------------------------------------------------
+
+
+def _transposed_donor(lanes):
+    """A [128, 128] fragment written from a transposed UB view (a[j, i]):
+    the access forces the outer direction, so f solves to lane dim 0
+    (count 128). Its layout is the pinned specimen."""
+
+    @T.prim_func
+    def main(A: T.Tensor((128, 128), "float32"), B: T.Tensor((128, 128), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((128, 128), "float32")
+            b_ub = T.alloc_shared((128, 128), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                f = T.alloc_fragment((128, 128), "float32")
+                for i, j in T.Parallel(128, 128):
+                    f[i, j] = a_ub[j, i]
+                for i, j in T.Parallel(128, 128):
+                    b_ub[j, i] = f[i, j]
+            T.copy(b_ub, B)
+
+    return main
+
+
+def _pinned_pair(lanes, donor_layout):
+    """The equal-byte square pair (unpinned tie pick: f lane dim 1, g lane
+    dim 0) with f pinned to the donor's lane-dim-0 layout — the pin must
+    flip the root (f lane dim 0, g lane dim 1); both roots are practical
+    here, so the pin is the only difference."""
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                f = T.alloc_fragment((128, 128), "float32")
+                g = T.alloc_fragment((128, 128), "float32")
+                T.annotate_layout({f: donor_layout})
+                for i in T.Parallel(lanes):
+                    b_ub[i] = a_ub[i]
+                for i, j in T.Parallel(128, 128):
+                    g[j, i] = f[i, j] + T.float32(1.0)
+            T.copy(b_ub, B)
+
+    return main
+
+
+@pytest.mark.pto
+def test_solver_kernel_annotation_pinned_flips_root():
+    """A canonical kernel-level annotation participates as a pinned
+    constraint: pinning f to lane dim 0 flips the equal-byte pair onto the
+    root the tie rule would NOT pick (f=_i/g=_j instead of f=_j/g=_i)."""
+    lanes = 128
+    donor_mod, _ = _lower_capture(_transposed_donor(lanes), "PlanPtoSlotStorage")
+    donor_layout = _region_layouts(donor_mod)["f"]
+    assert str(donor_layout.forward_thread) == "_i"
+
+    mod, _ = _lower_capture(_pinned_pair(lanes, donor_layout),
+                            "PlanPtoSlotStorage")
+    layouts = _region_layouts(mod)
+    assert str(layouts["f"].forward_thread) == "_i"
+    assert str(layouts["g"].forward_thread) == "_j"
+
+
+@pytest.mark.pto
+def test_solver_kernel_annotation_shape_mismatch_rejected():
+    """An annotation whose canonical form disagrees with the buffer (here:
+    a [128,128] layout pinned on a [128,4]-shaped pair buffer) is
+    rejected with the canonical-form message."""
+    lanes = 128
+    donor_mod, _ = _lower_capture(_transposed_donor(lanes), "PlanPtoSlotStorage")
+    donor_layout = _region_layouts(donor_mod)["f"]
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                f = T.alloc_fragment((128, 4), "float32")
+                g = T.alloc_fragment((4, 128), "float32")
+                T.annotate_layout({f: donor_layout})
+                for i in T.Parallel(lanes):
+                    b_ub[i] = a_ub[i]
+                for i, j in T.Parallel(128, 4):
+                    g[j, i] = f[i, j] + T.float32(1.0)
+            T.copy(b_ub, B)
+
+    _, error = _lower_capture(main, "PlanPtoSlotStorage", expect_error=True)
+    assert error is not None
+    text = str(error)
+    # Fail-closed either way: the solver's classified canonical-form
+    # diagnostic when it sees the annotation first, or the engine's own
+    # shape-consistency check during annotation loading (an internal-form
+    # message — registered diagnostic-form gap) when the engine applies
+    # it first. Both name the mismatched shapes.
+    assert "canonical" in text or ("InputShape" in text and "shape" in text), text
+
+
+@pytest.mark.pto
+def test_degenerate_dims_byte_minimal_consistent():
+    """Design §4-10: M==1 / N==1 degenerate units stay byte-minimal — a
+    [1, 1024] tall and a [1024, 1] wide fragment at VL=128 both reserve
+    8 entries (the non-degenerate orientation would waste 8x)."""
+    lanes = 128
+
+    @T.prim_func
+    def tall(A: T.Tensor((1, 8 * lanes), "float32"), C: T.Tensor((1, 8 * lanes), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((1, 8 * lanes), "float32")
+            c_ub = T.alloc_shared((1, 8 * lanes), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((1, 8 * lanes), "float32")
+                for i, j in T.Parallel(1, 8 * lanes):
+                    keep[i, j] = a_ub[i, j]
+                for i, j in T.Parallel(1, 8 * lanes):
+                    c_ub[i, j] = keep[i, j] * T.float32(2.0)
+            T.copy(c_ub, C)
+
+    @T.prim_func
+    def wide(A: T.Tensor((8 * lanes, 1), "float32"), C: T.Tensor((8 * lanes, 1), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((8 * lanes, 1), "float32")
+            c_ub = T.alloc_shared((8 * lanes, 1), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((8 * lanes, 1), "float32")
+                for i, j in T.Parallel(8 * lanes, 1):
+                    keep[i, j] = a_ub[i, j]
+                for i, j in T.Parallel(8 * lanes, 1):
+                    c_ub[i, j] = keep[i, j] * T.float32(2.0)
+            T.copy(c_ub, C)
+
+    for kernel in (tall, wide):
+        mod, _ = _lower_capture(kernel, "PlanPtoSlotStorage")
+        plans = _slot_plans(mod)
+        assert len(plans) == 1
+        assert plans[0][1].count == 8, (
+            f"degenerate dims must stay byte-minimal, got {plans[0][1].count}"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
