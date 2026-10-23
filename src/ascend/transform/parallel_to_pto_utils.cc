@@ -13,7 +13,9 @@
 #include "../../layout/utils.h"
 
 #include <functional>
+#include <set>
 #include <sstream>
+#include <utility>
 
 namespace tvm {
 namespace tl {
@@ -38,6 +40,52 @@ std::string AccessPatternToString(AccessPattern pattern) {
 // SubstituteVar, ResolveIndexAliases and IsSupportedAddressExpr moved to
 // src/op/pto_index_analysis.cc: the layout-planning code in
 // src/op and the consumers here share that single implementation.
+
+// ---------------------------------------------------------------------------
+// Shared frontend-op-name -> VMI-op-name tables: one table per concept so
+// the expression whitelist, the lane-use classification and the pass-side
+// dispatch (Verify admission / Vectorize rewriting) cannot drift apart.
+// ---------------------------------------------------------------------------
+
+const char *MaskLogicVmiOpName(const std::string &tir_op_name) {
+  // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
+  // tirx.bitwise_* calls (plus the tir.bitwise_* and tir.And/Or/Not
+  // spellings); Vectorize rewrites them to the mapped mask op.
+  static const std::pair<const char *, const char *> kMaskLogicTable[] = {
+      {"tirx.bitwise_and", "mask_and"},
+      {"tir.bitwise_and", "mask_and"},
+      {"tir.And", "mask_and"},
+      {"tirx.bitwise_or", "mask_or"},
+      {"tir.bitwise_or", "mask_or"},
+      {"tir.Or", "mask_or"},
+      {"tirx.bitwise_not", "mask_not"},
+      {"tir.bitwise_not", "mask_not"},
+      {"tir.Not", "mask_not"},
+  };
+  for (const auto &entry : kMaskLogicTable) {
+    if (tir_op_name == entry.first) {
+      return entry.second;
+    }
+  }
+  return nullptr;
+}
+
+const char *VectorUnaryVmiOpName(const std::string &tirx_op_name) {
+  // Hardware-backed unary math: fabs/exp/log/sqrt map to the VMI
+  // vabs/vexp/vln/vsqrt instructions.
+  static const std::pair<const char *, const char *> kUnaryMathTable[] = {
+      {"tirx.fabs", "vabs"},
+      {"tirx.exp", "vexp"},
+      {"tirx.log", "vln"},
+      {"tirx.sqrt", "vsqrt"},
+  };
+  for (const auto &entry : kUnaryMathTable) {
+    if (tirx_op_name == entry.first) {
+      return entry.second;
+    }
+  }
+  return nullptr;
+}
 
 PtoInverseMapping InvertPtoLaneLayout(const For &loop) {
   auto anno = loop->annotations.Get(attr::kPtoParallelLoopLayout);
@@ -596,32 +644,32 @@ public:
   void MarkUnsupported(const char *kind) {
     if (!unsupported.has_value()) {
       unsupported = std::string("unsupported expression node `") + kind +
-                    "` (only buffer loads, constants, "
-                    "scalars, loop indices, Add, Sub, Mul, Div, "
-                    "fabs/exp/log/sqrt and Cast)";
+                    "` (admits buffer loads, constants, scalars, loop "
+                    "indices, Add, Sub, Mul, Div, fabs/exp/log/sqrt, Cast, "
+                    "Select, comparisons, Min/Max, And/Or/Not and the "
+                    "bitwise mask-combine calls)";
     }
   }
   void VisitExpr_(const ModNode *) final { MarkUnsupported("Mod"); }
   void VisitExpr_(const FloorDivNode *) final { MarkUnsupported("FloorDiv"); }
   void VisitExpr_(const FloorModNode *) final { MarkUnsupported("FloorMod"); }
-  void VisitExpr_(const MinNode *) final { MarkUnsupported("Min"); }
-  void VisitExpr_(const MaxNode *) final { MarkUnsupported("Max"); }
-  void VisitExpr_(const EQNode *) final { MarkUnsupported("EQ"); }
-  void VisitExpr_(const NENode *) final { MarkUnsupported("NE"); }
-  void VisitExpr_(const LTNode *) final { MarkUnsupported("LT"); }
-  void VisitExpr_(const LENode *) final { MarkUnsupported("LE"); }
-  void VisitExpr_(const GTNode *) final { MarkUnsupported("GT"); }
-  void VisitExpr_(const GENode *) final { MarkUnsupported("GE"); }
-  void VisitExpr_(const AndNode *) final { MarkUnsupported("And"); }
-  void VisitExpr_(const OrNode *) final { MarkUnsupported("Or"); }
-  void VisitExpr_(const NotNode *) final { MarkUnsupported("Not"); }
-  void VisitExpr_(const SelectNode *) final {
-    if (!unsupported.has_value()) {
-      unsupported =
-          "Select is not vectorizable yet (integer T.abs lowers to Select; "
-          "it arrives with the PR-2 Select/cmp support)";
-    }
-  }
+  // Min/Max are admitted here — Verify runs before
+  // LegalizeParallelToPTO, which rewrites them into the Select form before
+  // VectorizeParallelToPTO consumes the unit.
+  void VisitExpr_(const MinNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const MaxNode *op) final { ExprVisitor::VisitExpr_(op); }
+  // Select + relational ops (the shape Legalize produces and Vectorize
+  // lowers to vcmp/vcmps + vsel).
+  void VisitExpr_(const EQNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const NENode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const LTNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const LENode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const GTNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const GENode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const AndNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const OrNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const NotNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const SelectNode *op) final { ExprVisitor::VisitExpr_(op); }
   void VisitExpr_(const RampNode *) final { MarkUnsupported("Ramp"); }
   void VisitExpr_(const BroadcastNode *) final { MarkUnsupported("Broadcast"); }
   void VisitExpr_(const ShuffleNode *) final { MarkUnsupported("Shuffle"); }
@@ -629,11 +677,27 @@ public:
   void VisitExpr_(const CallNode *op) final {
     if (auto call_op = op->op.as<Op>()) {
       const std::string &name = call_op.value()->name;
+      // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
+      // tirx.bitwise_* (not And/Or/Not nodes). Verify admits them; Vectorize
+      // rewrites them to mask_and/mask_or/mask_not (the shared
+      // MaskLogicVmiOpName table).
+      if (MaskLogicVmiOpName(name) != nullptr) {
+        for (const auto &arg : op->args) {
+          VisitExpr(arg);
+        }
+        return;
+      }
+      // The frontend -T.infinity(...) sentinel lowers to
+      // Mul(Call(tl.infinity, dtype), -1); infinity is a compile-time float
+      // constant and lane-uniform.
+      if (name == "tl.infinity" || name == "tir.infinity") {
+        return;
+      }
       // Hardware-backed unary math. fabs/exp/log/sqrt map to the VMI
-      // vabs/vexp/vln/vsqrt instructions; the dtype matrix mirrors the
-      // ISA documentation (see IsSupportedVectorUnaryOp).
-      if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
-          name == "tirx.sqrt") {
+      // vabs/vexp/vln/vsqrt instructions (the shared VectorUnaryVmiOpName
+      // table); the dtype matrix mirrors the ISA documentation (see
+      // IsSupportedVectorUnaryOp).
+      if (VectorUnaryVmiOpName(name) != nullptr) {
         if (op->args.size() != 1U) {
           if (!unsupported.has_value()) {
             unsupported = name + " expects exactly one operand";
@@ -838,6 +902,42 @@ PtoRegionScan ScanPtoRegion(const Stmt &region) {
   return scan;
 }
 
+bool IsNoOpStmt(const Stmt &stmt) {
+  // A no-op statement carries no work: an Evaluate of an IntImm constant
+  // (e.g. a simplified identity else store; treating it as "no else"
+  // yields the correct masked-update form), an empty SeqStmt, or a SeqStmt
+  // whose every element is itself a no-op. One shared implementation so
+  // the branch shapes Verify admits are exactly the ones Legalize
+  // rewrites.
+  if (const auto *eval = stmt.as<EvaluateNode>()) {
+    return eval->value.as<IntImmNode>() != nullptr;
+  }
+  if (const auto *seq = stmt.as<SeqStmtNode>()) {
+    for (const Stmt &s : seq->seq) {
+      if (!IsNoOpStmt(s)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+bool RegionContainsParallel(const Stmt &body) {
+  bool found = false;
+  PostOrderVisit(body, [&](const ObjectRef &node) {
+    if (found) {
+      return;
+    }
+    if (const auto *for_node = node.as<ForNode>()) {
+      if (for_node->kind == ForKind::kParallel) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
 std::string LaneUseToString(LaneUse use) {
   switch (use) {
   case LaneUse::kUniform:
@@ -964,12 +1064,12 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     }
   }
   // Hardware-backed unary math shares the whitelist's contract (float32
-  // tirx.fabs/exp/log/sqrt): recurse into the single operand.
+  // tirx.fabs/exp/log/sqrt; the shared VectorUnaryVmiOpName table):
+  // recurse into the single operand.
   if (const auto *call = expr.as<CallNode>()) {
     if (auto call_op = call->op.as<Op>()) {
       const std::string &name = call_op.value()->name;
-      if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
-          name == "tirx.sqrt") {
+      if (VectorUnaryVmiOpName(name) != nullptr) {
         return AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
       }
     }
@@ -1009,45 +1109,47 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     b = &fmod->b;
     known_op = metadata_mode;
   } else if (const auto *minn = expr.as<MinNode>()) {
+    // Min/Max classify like the comparisons in value mode too;
+    // LegalizeParallelToPTO rewrites them into Select before Vectorize.
     a = &minn->a;
     b = &minn->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *maxx = expr.as<MaxNode>()) {
     a = &maxx->a;
     b = &maxx->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *lt = expr.as<LTNode>()) {
     a = &lt->a;
     b = &lt->b;
-    known_op = metadata_mode;
+    known_op = true; // cmp -> vcmp/vcmps
   } else if (const auto *len = expr.as<LENode>()) {
     a = &len->a;
     b = &len->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *gt = expr.as<GTNode>()) {
     a = &gt->a;
     b = &gt->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *ge = expr.as<GENode>()) {
     a = &ge->a;
     b = &ge->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *eq = expr.as<EQNode>()) {
     a = &eq->a;
     b = &eq->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *ne = expr.as<NENode>()) {
     a = &ne->a;
     b = &ne->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *andn = expr.as<AndNode>()) {
     a = &andn->a;
     b = &andn->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *orn = expr.as<OrNode>()) {
     a = &orn->a;
     b = &orn->b;
-    known_op = metadata_mode;
+    known_op = true;
   }
   if (known_op) {
     lhs = AnalyzeLaneUseImpl(*a, ctx, reason, metadata_mode);
@@ -1062,14 +1164,59 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
                ? LaneUse::kUniform
                : LaneUse::kVarying;
   }
-  if (!metadata_mode) {
-    if (const auto *notn = expr.as<NotNode>()) {
-      // Not is a value-mode whitelist reject too; keep symmetric.
+  if (const auto *notn = expr.as<NotNode>()) {
+    return AnalyzeLaneUseImpl(notn->a, ctx, reason, metadata_mode);
+  }
+  if (const auto *call = expr.as<CallNode>()) {
+    std::string name;
+    if (const auto *op_node = call->op.as<OpNode>()) {
+      name = op_node->name;
     }
-  } else {
-    if (const auto *notn = expr.as<NotNode>()) {
-      return AnalyzeLaneUseImpl(notn->a, ctx, reason, metadata_mode);
+    auto is_mask_logic = [&](const std::string &n) {
+      return MaskLogicVmiOpName(n) != nullptr;
+    };
+    if (is_mask_logic(name)) {
+      if (call->args.empty()) {
+        if (reason)
+          *reason = "empty mask-logic call";
+        return LaneUse::kUnknown;
+      }
+      LaneUse acc =
+          AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
+      if (acc == LaneUse::kUnknown)
+        return LaneUse::kUnknown;
+      for (size_t i = 1; i < call->args.size(); ++i) {
+        LaneUse u =
+            AnalyzeLaneUseImpl(call->args[i], ctx, reason, metadata_mode);
+        if (u == LaneUse::kUnknown)
+          return LaneUse::kUnknown;
+        if (u == LaneUse::kVarying)
+          acc = LaneUse::kVarying;
+      }
+      return acc;
     }
+    if (name == "tl.infinity" || name == "tir.infinity") {
+      return LaneUse::kUniform;
+    }
+  }
+  if (const auto *sel = expr.as<SelectNode>()) {
+    // Select(cond, t, f) -> vsel; lane use is varying if any arm is.
+    LaneUse c = AnalyzeLaneUseImpl(sel->condition, ctx, reason, metadata_mode);
+    LaneUse tv =
+        AnalyzeLaneUseImpl(sel->true_value, ctx, reason, metadata_mode);
+    LaneUse fv =
+        AnalyzeLaneUseImpl(sel->false_value, ctx, reason, metadata_mode);
+    if (c == LaneUse::kUnknown || tv == LaneUse::kUnknown ||
+        fv == LaneUse::kUnknown) {
+      if (reason != nullptr && reason->empty()) {
+        *reason = "unknown operand in Select";
+      }
+      return LaneUse::kUnknown;
+    }
+    return (c == LaneUse::kUniform && tv == LaneUse::kUniform &&
+            fv == LaneUse::kUniform)
+               ? LaneUse::kUniform
+               : LaneUse::kVarying;
   }
   if (const auto *cast = expr.as<CastNode>()) {
     return AnalyzeLaneUseImpl(cast->value, ctx, reason, metadata_mode);
@@ -1098,19 +1245,19 @@ LaneUse AnalyzeLaneUseMeta(const PrimExpr &expr, LaneUseContext *ctx,
 bool IsSupportedVectorUnaryOp(const std::string &tirx_op, DataType dtype) {
   // Per the VMI ISA documentation: vabs admits f16/bf16/f32 (the vabs
   // instruction also takes si8/si16/si32, but the frontend abs() lowers
-  // integers to Select — PR-2 territory — and returns unsigned inputs
-  // unchanged, so integer dtypes never reach this gate); vexp/vln/vsqrt
-  // admit f16/f32 only.
+  // integers to Select and returns unsigned inputs unchanged, so integer
+  // dtypes never reach this gate); vexp/vln/vsqrt admit f16/f32 only.
+  // The op-name admission is the shared VectorUnaryVmiOpName table.
+  if (VectorUnaryVmiOpName(tirx_op) == nullptr) {
+    return false;
+  }
   const int bits = dtype.bits();
   if (tirx_op == "tirx.fabs") {
     return (dtype.is_float() || dtype.is_bfloat16()) &&
            (bits == 16 || bits == 32);
   }
-  if (tirx_op == "tirx.exp" || tirx_op == "tirx.log" ||
-      tirx_op == "tirx.sqrt") {
-    return dtype.is_float() && (bits == 16 || bits == 32);
-  }
-  return false;
+  // The remaining mapped names (exp/log/sqrt).
+  return dtype.is_float() && (bits == 16 || bits == 32);
 }
 
 bool ExprUsesVar(const PrimExpr &expr, const VarNode *var) {

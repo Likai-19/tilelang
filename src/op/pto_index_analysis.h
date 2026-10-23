@@ -15,6 +15,7 @@
 #ifndef TVM_TL_OP_PTO_INDEX_ANALYSIS_H_
 #define TVM_TL_OP_PTO_INDEX_ANALYSIS_H_
 
+#include <tvm/tirx/buffer.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/stmt.h>
 
@@ -27,6 +28,7 @@ namespace pto {
 
 using ffi::Map;
 using ffi::Optional;
+using tirx::Buffer;
 using tirx::Var;
 using tirx::VarNode;
 
@@ -63,6 +65,15 @@ bool IsSupportedAddressExpr(const PrimExpr &expr);
  * classified reason on rejection. The callers translate the error into
  * their own diagnostics. */
 std::pair<int64_t, int64_t> CheckedPtoPadding(int64_t extent, int64_t lanes);
+
+/*! `T.alloc_var` materialises a single-element `local.var` buffer. Inside a
+ * converting Parallel unit that buffer is a per-lane register: every lane
+ * owns its own copy, so its element address is (always) the same constant and
+ * carries no lane-address class. The continuous/lane-uniform classification
+ * does not apply to such accesses, so the layout classifier must skip them;
+ * VectorizeParallelToPTO promotes the whole-buffer read/write pair to a
+ * per-lane vreg (`local.var` vector). */
+bool IsLaneScalarBuffer(const Buffer &buffer);
 
 } // namespace pto
 } // namespace tl

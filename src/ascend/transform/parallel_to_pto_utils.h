@@ -258,6 +258,15 @@ struct VectorCastPlan {
 
 using CastPlan = std::variant<ScalarCastPlan, VectorCastPlan>;
 
+// Maps a frontend boolean-combine op name (tirx./tir.bitwise_{and,or,not}
+// or tir.{And,Or,Not}) to its VMI mask op name ("mask_and"/"mask_or"/
+// "mask_not"); returns nullptr for any other name.
+const char *MaskLogicVmiOpName(const std::string &tir_op_name);
+
+// The tirx.* unary math ops with a VMI mapping (fabs/exp/log/sqrt):
+// returns the VMI op name, or nullptr for any other name.
+const char *VectorUnaryVmiOpName(const std::string &tirx_op_name);
+
 /*! Operation-level type support for the vector arithmetic emitted
  * here. VMI vmul only supports i16/i32/f16/bf16/f32
  * elements; vadd/vsub additionally allow i8; vdiv admits f16/f32 only.
@@ -378,6 +387,22 @@ struct PtoRegionScan {
  * AttrStmt wrapper) for parallel units. One implementation shared by
  * Verify and Vectorize. */
 PtoRegionScan ScanPtoRegion(const Stmt &region);
+
+/*! A statement that carries no work: an Evaluate of an IntImm constant
+ * (e.g. a store simplified away into a constant), an empty SeqStmt, or a
+ * SeqStmt whose every element is itself a no-op. The shared contract for
+ * the "no operation" arm of a conditional branch under T.Parallel — the
+ * shape Legalize rewrites as "no else" (the masked-update Select form) and
+ * Verify admits as Select-rewritable. */
+bool IsNoOpStmt(const Stmt &stmt);
+
+/*! Whether \p body contains any T.Parallel unit anywhere inside it: the
+ * test for whether a region is a converting region (a SIMD_VF block
+ * without T.Parallel is a hand-written VMI region and stays untouched). */
+bool RegionContainsParallel(const Stmt &body);
+
+// The SBlock name_hint marking a SimdVF vecscope region.
+inline constexpr const char *kSimdVfBlockName = "SIMD_VF";
 
 } // namespace pto
 } // namespace tl

@@ -179,6 +179,13 @@ TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vmin).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vand).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vor).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vxor).set_num_inputs(-1);
+// Boolean mask-combine ops. They keep their own TileLang names (the
+// control-flow / vectorize passes emit them) while the PTO codegen maps them
+// onto the current PTODSL bitwise surface
+// (vand/vor/vnot on !pto.vmi.mask<Lxpred>).
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(mask_and).set_num_inputs(-1);
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(mask_or).set_num_inputs(-1);
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(mask_not).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vshl).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vshr).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vabs).set_num_inputs(-1);
