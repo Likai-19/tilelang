@@ -267,7 +267,15 @@ private:
   // ------------------------------------------------------------------
   Stmt VisitStmt_(const SBlockNode *op) final {
     if (op->name_hint != "SIMD_VF") {
-      return StmtExprMutator::VisitStmt_(op);
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      // A child region split hoisted its UB allocations up to this block (see
+      // TrySplitCarriedLoop); extend the rebuilt block so the split parts
+      // share one allocation.
+      if (!pending_parent_allocs_.empty()) {
+        result = AppendBlockAllocs(result, pending_parent_allocs_);
+        pending_parent_allocs_ = Array<Buffer>();
+      }
+      return result;
     }
     // Shared region scan: the same implementation Verify uses, so
     // skip/reject/convert decisions cannot drift apart.
@@ -286,71 +294,446 @@ private:
         << "[VectorizeParallelToPTO] internal error: parallel units lost "
            "after scan";
 
-    Stmt new_body;
-    {
-      // One inverse per unit: the same mapping feeds the lanes read, the
-      // shared-mask decision and the unit conversion below, so a region
-      // with n units inverts n times instead of 2n+1. The inversion is
-      // the expensive part (layout reshape + analyzer proofs); the
-      // mappings are small value structs.
-      std::vector<pto_analysis::PtoInverseMapping> mappings;
-      mappings.reserve(scan.units.size());
-      for (const For &unit : scan.units) {
-        mappings.push_back(pto_analysis::InvertPtoLaneLayout(unit));
+    // Plan A: a serial loop that carries a shared buffer through UB (a unit
+    // that both loads and stores the same buffer) has no ordering point
+    // inside one vecscope — every synchronisation operation delimits a
+    // vecscope, so none may appear between two iterations. When the carry
+    // promotion below does not apply (carried value is not a single full
+    // lane vector), hoist the loop nest out of the region and give every
+    // iteration its own region, so consecutive iterations are separated by
+    // a vecscope transition, which *is* the legal synchronisation point.
+    if (!RegionIsCarryPromotable(region, scan)) {
+      Stmt split = TrySplitCarriedLoop(op, region);
+      if (split.defined()) {
+        return split;
       }
-      // Lanes come from the first unit's layout; all units in one VF
-      // share the same L (Verify enforces the annotation consistency).
-      int64_t lanes = mappings[0].lanes;
-      // A full mask binding per VF, shared by the divisible units. A
-      // region whose units all have non-divisible extents never uses it
-      // (every unit builds its own per-chunk dynamic mask), so the
-      // binding is only emitted when at least one divisible unit needs
-      // it.
-      bool any_divisible = false;
-      for (const pto_analysis::PtoInverseMapping &mapping : mappings) {
-        if (mapping.tail_lanes == 0) {
-          any_divisible = true;
+    }
+    return RebuildSBlock(op, ConvertRegionBody(region));
+  }
+
+  Stmt RebuildSBlock(const SBlockNode *op, Stmt body) {
+    if (hoisted_allocs_.empty()) {
+      return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
+                    std::move(body), op->init, op->alloc_buffers,
+                    op->match_buffers, op->annotations);
+    }
+    // P1: a split hoisted these allocations to the enclosing block; the parts
+    // must not re-declare them, otherwise each part gets its own merged UB
+    // slot and the split silently breaks the data chain.
+    Array<Buffer> alloc_buffers;
+    for (const Buffer &buffer : op->alloc_buffers) {
+      if (hoisted_allocs_.count(buffer.get()) != 0) {
+        continue;
+      }
+      alloc_buffers.push_back(buffer);
+    }
+    return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
+                  std::move(body), op->init, alloc_buffers,
+                  op->match_buffers, op->annotations);
+  }
+
+  // P1 (region-local split carry): extend an enclosing block with the
+  // allocations hoisted out of a split region. Appending to the block's
+  // alloc_buffers is the same shape a Kernel-scope T.alloc_shared produces
+  // (the verified sv7 carrier), so the allocation passes see exactly one
+  // owner for the whole split.
+  Stmt AppendBlockAllocs(const Stmt &stmt, const Array<Buffer> &extra) {
+    if (extra.empty()) {
+      return stmt;
+    }
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+      const SBlock &block = realize->block;
+      Array<Buffer> allocs = block->alloc_buffers;
+      for (const Buffer &buffer : extra) {
+        allocs.push_back(buffer);
+      }
+      SBlock new_block =
+          SBlock(block->iter_vars, block->reads, block->writes,
+                 block->name_hint, block->body, block->init, allocs,
+                 block->match_buffers, block->annotations);
+      return SBlockRealize(realize->iter_values, realize->predicate,
+                           new_block);
+    }
+    const auto *block = stmt.as<SBlockNode>();
+    if (block == nullptr) {
+      // No enclosing block to extend: emit explicit AllocBuffer statements,
+      // which still give one allocation per buffer.
+      Stmt out = stmt;
+      for (auto it = extra.rbegin(); it != extra.rend(); ++it) {
+        out = SeqStmt::Flatten(AllocBuffer(*it), out);
+      }
+      return out;
+    }
+    Array<Buffer> allocs = block->alloc_buffers;
+    for (const Buffer &buffer : extra) {
+      allocs.push_back(buffer);
+    }
+    return SBlock(block->iter_vars, block->reads, block->writes,
+                  block->name_hint, block->body, block->init, allocs,
+                  block->match_buffers, block->annotations);
+  }
+
+  // True when AnalyzeRegionCarry would promote this region (the carry path
+  // keeps the loop in place, so no split is needed).
+  bool RegionIsCarryPromotable(const Stmt &region,
+                               const pto_analysis::PtoRegionScan &scan) {
+    if (scan.units.empty()) {
+      return false;
+    }
+    const int64_t lanes =
+        pto_analysis::InvertPtoLaneLayout(scan.units[0]).lanes;
+    std::vector<Stmt> stmts;
+    FlattenTopStmts(region, &stmts);
+    // Exactly-one-match rule, identical to AnalyzeRegionCarry: several serial
+    // loops may wrap units (sv7v has a fill loop and an accumulate loop), and
+    // only a single matching carrier may be promoted. If two loops match, the
+    // promotion would be ambiguous — AnalyzeRegionCarry then promotes nothing,
+    // so reporting `true` here would keep the whole region in one vecscope and
+    // leave both carriers on the unreliable plain path. Returning false hands
+    // the region to Plan A, which splits every carrier.
+    int matches = 0;
+    for (const Stmt &s : stmts) {
+      const auto *f = s.as<ForNode>();
+      if (f == nullptr || f->kind != ForKind::kSerial) {
+        continue;
+      }
+      // Same candidate set as AnalyzeRegionCarry: a serial loop that wraps at
+      // least one parallel unit.
+      bool wraps_unit = false;
+      for (const For &u : scan.units) {
+        if (StmtHasFor(f->body, u.get())) {
+          wraps_unit = true;
           break;
         }
       }
-      Stmt new_region = region;
-      if (any_divisible) {
-        shared_mask_ = Var("mask", DataType::Bool(static_cast<int>(lanes)));
-        PrimExpr mask_value = Call(
-            DataType::Bool(static_cast<int>(lanes)), VmiOp("create_mask"),
-            {IntImm(DataType::Int(32), static_cast<int>(lanes))},
-            {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes))}});
-        // Define the shared mask inside the simdvf scope attr when the
-        // region is wrapped by one: VPTO treats vecscope-region data as
-        // region-local and rejects pset values crossing the boundary.
-        const auto *scope_attr = new_region.as<AttrStmtNode>();
-        if (scope_attr != nullptr &&
-            scope_attr->attr_key == "tl.simdvf_scope") {
-          new_region = AttrStmt(scope_attr->node, scope_attr->attr_key,
-                                scope_attr->value,
-                                SeqStmt::Flatten(Bind(shared_mask_, mask_value),
-                                                 scope_attr->body));
-        } else {
-          new_region =
-              SeqStmt::Flatten(Bind(shared_mask_, mask_value), new_region);
-        }
+      if (!wraps_unit) {
+        continue;
       }
+      RegionCarry scratch;
+      if (TryRegionCarry(f, stmts, scan, lanes, &scratch) && ++matches > 1) {
+        return false;
+      }
+    }
+    return matches == 1;
+  }
 
-      // Convert each sequential unit in order; unit state (bind
-      // maps, counters) is reset per unit; the shared full mask, when
-      // emitted, is visible to every unit.
-      for (size_t i = 0; i < scan.units.size(); ++i) {
-        Stmt converted = ConvertUnit(scan.units[i], mappings[i], region);
-        new_region = ReplaceStmt(new_region, scan.units[i], converted);
+  // Convert one SIMD_VF region body: mask plan, carry promotion, units.
+  Stmt ConvertRegionBody(const Stmt &region) {
+    pto_analysis::PtoRegionScan scan = pto_analysis::ScanPtoRegion(region);
+    ICHECK(!scan.units.empty())
+        << "[VectorizeParallelToPTO] internal error: parallel units lost "
+           "after scan";
+    // One inverse per unit: the same mapping feeds the lanes read, the
+    // shared-mask decision and the unit conversion below, so a region
+    // with n units inverts n times instead of 2n+1. The inversion is
+    // the expensive part (layout reshape + analyzer proofs); the
+    // mappings are small value structs.
+    std::vector<pto_analysis::PtoInverseMapping> mappings;
+    mappings.reserve(scan.units.size());
+    for (const For &unit : scan.units) {
+      mappings.push_back(pto_analysis::InvertPtoLaneLayout(unit));
+    }
+    // Lanes come from the first unit's layout; all units in one VF
+    // share the same L (Verify enforces the annotation consistency).
+    int64_t lanes = mappings[0].lanes;
+    // A full mask binding per VF, shared by the divisible units. A
+    // region whose units all have non-divisible extents never uses it
+    // (every unit builds its own per-chunk dynamic mask), so the
+    // binding is only emitted when at least one divisible unit needs
+    // it.
+    bool any_divisible = false;
+    for (const pto_analysis::PtoInverseMapping &mapping : mappings) {
+      if (mapping.tail_lanes == 0) {
+        any_divisible = true;
+        break;
       }
-      new_body = new_region;
+    }
+    Stmt new_region = region;
+    if (any_divisible) {
+      shared_mask_ = Var("mask", DataType::Bool(static_cast<int>(lanes)));
+      PrimExpr mask_value = Call(
+          DataType::Bool(static_cast<int>(lanes)), VmiOp("create_mask"),
+          {IntImm(DataType::Int(32), static_cast<int>(lanes))},
+          {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes))}});
+      // Define the shared mask inside the simdvf scope attr when the
+      // region is wrapped by one: VPTO treats vecscope-region data as
+      // region-local and rejects pset values crossing the boundary.
+      const auto *scope_attr = new_region.as<AttrStmtNode>();
+      if (scope_attr != nullptr &&
+          scope_attr->attr_key == "tl.simdvf_scope") {
+        new_region = AttrStmt(scope_attr->node, scope_attr->attr_key,
+                              scope_attr->value,
+                              SeqStmt::Flatten(Bind(shared_mask_, mask_value),
+                                               scope_attr->body));
+      } else {
+        new_region =
+            SeqStmt::Flatten(Bind(shared_mask_, mask_value), new_region);
+      }
     }
 
-    // new_body is (mask bind + region with all units converted); the
-    // scope AttrStmt wrapper, if any, is inside it already.
-    return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint, new_body,
-                  op->init, op->alloc_buffers, op->match_buffers,
-                  op->annotations);
+    // Convert each sequential unit in order; unit state (bind
+    // maps, counters) is reset per unit; the shared full mask, when
+    // emitted, is visible to every unit.
+    AnalyzeRegionCarry(region, scan, lanes);
+    if (region_carry_.active) {
+      // Hoist the seed: broadcast it into the vreg before the loop so the
+      // carrier is a plain SSA value at region scope (a store nested in the
+      // seed unit's chunk loop would not be visible outside it).
+      PrimExpr bcast = Call(
+          VectorDType(region_carry_.seed_value.dtype(), lanes),
+          VmiOp("vbrc"), {region_carry_.seed_value},
+          {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes))}});
+      Stmt seed_stmt = BufferStore(
+          region_carry_.vreg, bcast,
+          {make_zero(DataType::Int(32))});
+      new_region = ReplaceStmt(new_region, GetRef<For>(region_carry_.seed),
+                               seed_stmt);
+      // Insert the single writeback right after the promoted loop; the
+      // loop object stays the same, so the per-unit replacement below
+      // still finds the units inside it.
+      For loop_ref = GetRef<For>(region_carry_.loop);
+      Stmt loop_stmt = loop_ref;
+      new_region = ReplaceStmt(
+          new_region, loop_ref,
+          SeqStmt::Flatten(loop_stmt, EmitRegionCarryWriteback(lanes)));
+    }
+    for (size_t i = 0; i < scan.units.size(); ++i) {
+      Stmt converted = ConvertUnit(scan.units[i], mappings[i], region);
+      new_region = ReplaceStmt(new_region, scan.units[i], converted);
+    }
+    if (region_carry_.active) {
+      new_region = SeqStmt::Flatten(AllocBuffer(region_carry_.vreg),
+                                    new_region);
+      region_carry_ = RegionCarry();
+    }
+    return new_region;
+  }
+
+  // ------------------------------------------------------------------
+  // Plan A: vecscope splitting
+  //
+  // A SIMD_VF region may contain a serial loop whose body carries a shared
+  // buffer through UB (load+store the same buffer inside one unit). Inside
+  // one vecscope such a chain has no ordering point, so the split rewrites
+  //
+  //   SIMD_VF { pre;  for t { body }  post }
+  //
+  // into
+  //
+  //   SIMD_VF { pre }
+  //   for t { SIMD_VF { body } }
+  //   SIMD_VF { post }
+  //
+  // The loop nest that actually carries the buffer is hoisted out (nested
+  // loops are hoisted level by level), so the innermost iteration — the one
+  // whose unit does the read-modify-write — is its own region.
+  // ------------------------------------------------------------------
+  static const BufferNode *UnitUbCarry(const ForNode *unit) {
+    ShellAccessCollector acc;
+    acc(static_cast<const Stmt &>(unit->body));
+    for (const auto &a : acc.accesses) {
+      if (!a.is_store) {
+        continue;
+      }
+      for (const auto &b : acc.accesses) {
+        if (!b.is_store && b.buf == a.buf) {
+          return a.buf;
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  static bool SubtreeCarriesThroughUb(const Stmt &s) {
+    bool found = false;
+    PostOrderVisit(s, [&](const ObjectRef &n) {
+      const auto *f = n.as<ForNode>();
+      if (f != nullptr && f->kind == ForKind::kParallel &&
+          UnitUbCarry(f) != nullptr) {
+        found = true;
+      }
+    });
+    return found;
+  }
+
+  static void CollectBindVars(const Stmt &s, std::set<const VarNode *> *out) {
+    PostOrderVisit(s, [&](const ObjectRef &n) {
+      if (const auto *b = n.as<BindNode>()) {
+        out->insert(b->var.get());
+      }
+    });
+  }
+
+  static bool UsesAnyVar(const Stmt &s,
+                         const std::set<const VarNode *> &vars) {
+    bool used = false;
+    PostOrderVisit(s, [&](const ObjectRef &n) {
+      const auto *v = n.as<VarNode>();
+      if (v != nullptr && vars.count(v) != 0) {
+        used = true;
+      }
+    });
+    return used;
+  }
+
+  // Wrap a statement list in a new SIMD_VF region (same metadata as the
+  // prototype) and convert it. Returns an undefined Stmt for an empty list.
+  Stmt MakeRegion(const SBlockNode *proto, std::vector<Stmt> stmts,
+                  const AttrStmtNode *scope_attr) {
+    if (stmts.empty()) {
+      return Stmt();
+    }
+    Stmt body = SeqStmt::Flatten(stmts);
+    if (scope_attr != nullptr) {
+      body = AttrStmt(scope_attr->node, scope_attr->attr_key,
+                      scope_attr->value, body);
+    }
+    return RebuildSBlock(proto, ConvertRegionBody(body));
+  }
+
+  // Rebuild a loop whose body is split into per-iteration regions. Nested
+  // carriers are hoisted level by level.
+  Stmt TransformCarryLoop(const For &loop, const SBlockNode *proto,
+                          const AttrStmtNode *scope_attr) {
+    const auto *fn = loop.as<ForNode>();
+    std::vector<Stmt> stmts;
+    FlattenTopStmts(fn->body, &stmts);
+    // Every sibling serial loop that carries a buffer through UB must get its
+    // own region: leaving two of them in one vecscope has no ordering point
+    // between their iterations (the plain path this split exists to avoid).
+    std::vector<size_t> nested;
+    for (size_t i = 0; i < stmts.size(); ++i) {
+      const auto *f = stmts[i].as<ForNode>();
+      if (f != nullptr && f->kind == ForKind::kSerial &&
+          SubtreeCarriesThroughUb(f->body)) {
+        nested.push_back(i);
+      }
+    }
+    Array<Stmt> body;
+    if (nested.empty()) {
+      body.push_back(MakeRegion(proto, stmts, scope_attr));
+    } else {
+      size_t cursor = 0;
+      for (size_t idx : nested) {
+        std::vector<Stmt> pre(stmts.begin() + cursor, stmts.begin() + idx);
+        Stmt pre_region = MakeRegion(proto, pre, scope_attr);
+        if (pre_region.defined()) {
+          body.push_back(pre_region);
+        }
+        body.push_back(TransformCarryLoop(
+            GetRef<For>(stmts[idx].as<ForNode>()), proto, scope_attr));
+        cursor = idx + 1;
+      }
+      std::vector<Stmt> post(stmts.begin() + cursor, stmts.end());
+      Stmt post_region = MakeRegion(proto, post, scope_attr);
+      if (post_region.defined()) {
+        body.push_back(post_region);
+      }
+    }
+    return For(fn->loop_var, fn->min, fn->extent, ForKind::kSerial,
+               SeqStmt::Flatten(body));
+  }
+
+  // Split the region at every top-level serial loop whose subtree carries a
+  // shared buffer through UB. Returns an undefined Stmt when the region must
+  // be converted as a whole.
+  Stmt TrySplitCarriedLoop(const SBlockNode *op, const Stmt &region) {
+    std::vector<Stmt> stmts;
+    FlattenTopStmts(region, &stmts);
+    std::vector<size_t> carriers;
+    for (size_t i = 0; i < stmts.size(); ++i) {
+      const auto *f = stmts[i].as<ForNode>();
+      if (f != nullptr && f->kind == ForKind::kSerial &&
+          SubtreeCarriesThroughUb(f->body)) {
+        carriers.push_back(i);
+      }
+    }
+    if (carriers.empty()) {
+      return Stmt();
+    }
+    const AttrStmtNode *scope_attr = region.as<AttrStmtNode>();
+    if (scope_attr != nullptr &&
+        scope_attr->attr_key != "tl.simdvf_scope") {
+      scope_attr = nullptr;
+    }
+    // P1 (region-local split carry): every part below is a separate block, so
+    // each would re-declare the region's allocations and MergeUBAllocations
+    // would give one logical buffer several merged slots — the parts then talk
+    // to different addresses and the data chain breaks silently. Hoist every
+    // region-local UB allocation to the enclosing block first, so all parts
+    // share one allocation (the shape sv7 already uses: carrier allocated at
+    // Kernel scope, verified 0/64).
+    //
+    // Deliberately conservative: hoisting a buffer used by a single part is
+    // semantically neutral (only the lifetime widens; MergeUB plans by alias
+    // clique, so no extra UB is consumed). Restricting the set to the "carrier"
+    // would miss the neighbouring region-local buffers that also live across
+    // the split (sv5v/sv6v `xf`): written before the loop, read inside it.
+    Array<Buffer> hoist;
+    for (const Buffer &buffer : op->alloc_buffers) {
+      const std::string &scope = buffer.scope();
+      if (scope == "shared" || scope == "shared.dyn") {
+        hoist.push_back(buffer);
+      }
+    }
+    for (const Buffer &buffer : hoist) {
+      hoisted_allocs_.insert(buffer.get());
+    }
+    // Values bound outside a loop cannot cross the new region boundary
+    // (VPTO treats vecscope-region data as region-local): leave such regions
+    // alone instead of splitting them.
+    std::set<const VarNode *> outer_binds;
+    for (size_t i = 0; i < stmts.size(); ++i) {
+      if (std::find(carriers.begin(), carriers.end(), i) == carriers.end()) {
+        CollectBindVars(stmts[i], &outer_binds);
+      }
+    }
+    if (!outer_binds.empty()) {
+      for (size_t idx : carriers) {
+        if (UsesAnyVar(stmts[idx], outer_binds)) {
+          // Fail-closed (B.7): the loop must be split — its iterations carry
+          // a buffer through UB, and one vecscope has no ordering point — but
+          // a bind from a sibling statement blocks moving the loop across the
+          // new region boundary. Converting the region as a whole is the
+          // unreliable shape (the same one Plan A exists to avoid), so reject
+          // instead of silently emitting it.
+          LOG(FATAL)
+              << "[VectorizeParallelToPTO] the serial loop at region offset "
+              << idx
+              << " carries a UB buffer across iterations but reads a value "
+                 "bound outside the loop; the vecscope split cannot move such "
+                 "a bind across the new region boundary. Compute that value "
+                 "inside the loop (or drop the bind) so the loop can be "
+                 "hoisted out of the region.";
+        }
+      }
+    }
+    Array<Stmt> out;
+    size_t cursor = 0;
+    for (size_t idx : carriers) {
+      std::vector<Stmt> gap(stmts.begin() + cursor, stmts.begin() + idx);
+      Stmt gap_region = MakeRegion(op, gap, scope_attr);
+      if (gap_region.defined()) {
+        out.push_back(gap_region);
+      }
+      out.push_back(TransformCarryLoop(
+          GetRef<For>(stmts[idx].as<ForNode>()), op, scope_attr));
+      cursor = idx + 1;
+    }
+    std::vector<Stmt> tail(stmts.begin() + cursor, stmts.end());
+    Stmt tail_region = MakeRegion(op, tail, scope_attr);
+    if (tail_region.defined()) {
+      out.push_back(tail_region);
+    }
+    VLOG(1) << "[split] vecscope split: carriers=" << carriers.size()
+              << " parts=" << out.size() << " hoisted=" << hoist.size();
+    hoisted_allocs_.clear();
+    // Hand the hoisted allocations to the enclosing block (consumed by its
+    // VisitStmt_); the parts no longer declare them.
+    for (const Buffer &buffer : hoist) {
+      pending_parent_allocs_.push_back(buffer);
+    }
+    return SeqStmt::Flatten(out);
   }
 
   // Replace one statement (the unit's For) with its conversion, recursing
@@ -484,6 +867,11 @@ private:
   bool IsCarryAccess(const Buffer &buf, const Array<PrimExpr> &indices) const {
     if (!carry_src_.defined() || !buf->data.same_as(carry_src_->data)) {
       return false;
+    }
+    if (carry_lane_var_match_) {
+      // Region-level promotion: every unit has its own Parallel loop var, so
+      // the carried access is "this buffer, indexed by a single lane Var".
+      return indices.size() == 1 && indices[0].as<VarNode>() != nullptr;
     }
     if (indices.size() != carry_indices_.size()) {
       return false;
@@ -662,6 +1050,18 @@ private:
     return s;
   }
 
+  // Region-level promotion owns the vreg allocation (one per region, before
+  // the loop); a unit must never allocate it again inside the loop, otherwise
+  // the PTODSL emission splits the carried value into two Python names and
+  // the loop-carried ssa value is lost.
+  Stmt WrapCarryAllocIfLocal(Stmt s) {
+    if (unit_carry_from_region_) {
+      carry_active_ = false;
+      return s;
+    }
+    return WrapCarryAlloc(std::move(s));
+  }
+
   // The shell's own stores were eliminated by promotion; publish the
   // final carry value back to the source buffer once, after the shell.
   Stmt EmitCarryWriteback() {
@@ -685,6 +1085,289 @@ private:
         DataType::Void(), VmiOp("vstore"),
         {BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))}), ptr,
          IntImm(DataType::Int(32), 0), mask_var_}));
+  }
+
+  // ------------------------------------------------------------------
+  // Region-level carry promotion (serial loop WRAPPING Parallel units).
+  //
+  // Inside one vecscope a UB read-modify-write chain has no ordering
+  // point: every sync operation delimits a vecscope, so none can appear
+  // between two iterations. Verified on .39: an accumulator updated that
+  // way keeps reading its seed (sv7: m_ub stays 0, output 1e6) or a
+  // partially updated value, and the outcome depends on the trip count
+  // and on backend scheduling. Promoting the accumulator to a local.var
+  // vreg makes the loop carry an SSA value (scf.for iter_args), so no
+  // memory ordering is needed at all.
+  //
+  // Recognised shape (deliberately narrow, mirroring AnalyzeLoopShell):
+  //   <unit S>: B[lane] = seed            (right before the loop, no B read)
+  //   for t in serial(G):
+  //     <unit U>: ... = B[lane] ... B[lane] = f(...)   (one store, same index)
+  // with B a 1-D shared buffer of exactly one lane vector (lanes elements),
+  // and no other unit in the region touching B.
+  // ------------------------------------------------------------------
+  static bool StmtHasFor(const Stmt &s, const ForNode *target) {
+    bool found = false;
+    PostOrderVisit(s, [&](const ObjectRef &n) {
+      if (n.get() == target) {
+        found = true;
+      }
+    });
+    return found;
+  }
+
+  // Flatten the *top level* of a region body, looking through the AttrStmt
+  // (simdvf scope) and SBlock wrappers that the region may carry.
+  static void FlattenTopStmts(const Stmt &stmt, std::vector<Stmt> *out) {
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const auto &s : seq->seq) {
+        FlattenTopStmts(s, out);
+      }
+      return;
+    }
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      FlattenTopStmts(attr->body, out);
+      return;
+    }
+    if (const auto *blk = stmt.as<SBlockNode>()) {
+      FlattenTopStmts(blk->body, out);
+      return;
+    }
+    out->push_back(stmt);
+  }
+
+  struct RegionCarry {
+    bool active = false;
+    const ForNode *loop = nullptr;
+    const ForNode *seed = nullptr;
+    tirx::Buffer src{};
+    Array<PrimExpr> indices{};
+    tirx::Buffer vreg{};
+    PrimExpr seed_value{};
+  };
+
+  // Try to promote one candidate loop; returns true when the canonical
+  // carried-buffer pattern matches.
+  bool TryRegionCarry(const ForNode *loop, const std::vector<Stmt> &stmts,
+                      const pto_analysis::PtoRegionScan &scan, int64_t lanes,
+                      RegionCarry *out) {
+    const ForNode *first = nullptr;
+    for (const For &u : scan.units) {
+      if (StmtHasFor(loop->body, u.get())) {
+        first = u.as<ForNode>();
+        break;
+      }
+    }
+    if (first == nullptr) {
+      return false;
+    }
+
+    // Carried buffer: the single shared buffer that the first in-loop unit
+    // both reads and writes, with exactly one store.
+    ShellAccessCollector acc;
+    acc(static_cast<const Stmt &>(first->body));
+    const BufferNode *carried = nullptr;
+    Array<PrimExpr> indices;
+    for (const auto &a : acc.accesses) {
+      if (!a.is_store) {
+        continue;
+      }
+      bool also_read = false;
+      for (const auto &b : acc.accesses) {
+        if (!b.is_store && b.buf == a.buf &&
+            ffi::StructuralEqual()(b.indices, a.indices)) {
+          also_read = true;
+          break;
+        }
+      }
+      if (!also_read) {
+        continue;
+      }
+      if (carried != nullptr && carried != a.buf) {
+        return false;  // more than one candidate
+      }
+      carried = a.buf;
+      indices = a.indices;
+    }
+    if (carried == nullptr || indices.size() != 1 ||
+        indices[0].as<VarNode>() == nullptr) {
+      return false;
+    }
+    // Full lane width, single chunk.
+    if (carried->shape.size() != 1) {
+      return false;
+    }
+    const auto *extent = carried->shape[0].as<IntImmNode>();
+    if (extent == nullptr || extent->value != lanes) {
+      return false;
+    }
+
+    // Every in-loop unit updates the same buffer at a single lane index.
+    for (const For &u : scan.units) {
+      if (!StmtHasFor(loop->body, u.get())) {
+        continue;
+      }
+      ShellAccessCollector ua;
+      ua(static_cast<const Stmt &>(u.as<ForNode>()->body));
+      // The carried index must be this unit's own lane variable. A bare Var is
+      // not enough: `m_ub[t]` (t an enclosing serial variable) is also a
+      // single-Var index and passes Verify as a lane-uniform load, but
+      // redirecting it to the vreg would turn one lane's value into a
+      // whole-vector read — a silent semantic error.
+      std::set<const VarNode *> unit_vars;
+      unit_vars.insert(u->loop_var.get());
+      if (const auto *inner_par = u->body.as<ForNode>()) {
+        if (inner_par->kind == ForKind::kParallel) {
+          unit_vars.insert(inner_par->loop_var.get());
+        }
+      }
+      int stores = 0;
+      int loads = 0;
+      for (const auto &a : ua.accesses) {
+        if (a.buf != carried) {
+          continue;
+        }
+        const auto *iv = a.indices.size() == 1 ? a.indices[0].as<VarNode>()
+                                               : nullptr;
+        if (iv == nullptr || unit_vars.count(iv) == 0) {
+          return false;
+        }
+        a.is_store ? ++stores : ++loads;
+      }
+      if (stores != 1 || loads < 1) {
+        return false;
+      }
+    }
+
+    // Seed: the statement right before the loop writes B once, never reads it.
+    size_t loop_pos = 0;
+    bool found_loop = false;
+    for (size_t i = 0; i < stmts.size(); ++i) {
+      if (stmts[i].get() == loop) {
+        loop_pos = i;
+        found_loop = true;
+        break;
+      }
+    }
+    if (!found_loop || loop_pos == 0) {
+      return false;
+    }
+    const auto *seed = stmts[loop_pos - 1].as<ForNode>();
+    if (seed == nullptr) {
+      return false;
+    }
+    ShellAccessCollector sa;
+    sa(static_cast<const Stmt &>(seed->body));
+    int seed_stores = 0;
+    int seed_loads = 0;
+    PrimExpr seed_value;
+    for (const auto &a : sa.accesses) {
+      if (a.buf != carried) {
+        continue;
+      }
+      if (a.indices.size() != 1 ||
+          a.indices[0].as<VarNode>() == nullptr) {
+        return false;
+      }
+      if (a.is_store) {
+        ++seed_stores;
+        if (const auto *st = seed->body.as<BufferStoreNode>()) {
+          seed_value = st->value;
+        }
+      } else {
+        ++seed_loads;
+      }
+    }
+    if (seed_stores != 1 || seed_loads != 0 || !seed_value.defined()) {
+      return false;
+    }
+    // The seed is broadcast at region level, so it must be lane-invariant.
+    bool seed_has_var = false;
+    PostOrderVisit(seed_value, [&](const ObjectRef &n) {
+      if (n.as<VarNode>() != nullptr) {
+        seed_has_var = true;
+      }
+    });
+    if (seed_has_var) {
+      return false;
+    }
+
+    // Isolation: no other unit in the region may touch the carried buffer.
+    for (const For &u : scan.units) {
+      if (StmtHasFor(loop->body, u.get()) || u.get() == seed) {
+        continue;
+      }
+      BufferAccessCounter counter(carried);
+      counter(static_cast<const Stmt &>(u.as<ForNode>()->body));
+      if (counter.count_ != 0) {
+        return false;
+      }
+    }
+
+    out->active = true;
+    out->loop = loop;
+    out->seed = seed;
+    out->src = GetRef<Buffer>(carried);
+    out->indices = indices;
+    out->seed_value = seed_value;
+    out->vreg = tirx::decl_buffer(
+        {IntImm(DataType::Int(32), 1)},
+        VectorDType(GetRef<Buffer>(carried)->dtype, lanes),
+        std::string(carried->name) + "_rcarry", "local.var");
+    return true;
+  }
+
+  void AnalyzeRegionCarry(const Stmt &region,
+                          const pto_analysis::PtoRegionScan &scan,
+                          int64_t lanes) {
+    region_carry_ = RegionCarry();
+    if (lanes <= 0) {
+      return;
+    }
+    std::vector<Stmt> stmts;
+    FlattenTopStmts(region, &stmts);
+    // Several serial loops may wrap parallel units (sv7v has a fill loop and
+    // an accumulate loop): exactly one of them must match the carried-buffer
+    // pattern, otherwise the region is left unpromoted.
+    std::vector<const ForNode *> candidates;
+    for (const Stmt &s : stmts) {
+      const auto *f = s.as<ForNode>();
+      if (f == nullptr || f->kind != ForKind::kSerial) {
+        continue;
+      }
+      for (const For &u : scan.units) {
+        if (StmtHasFor(f->body, u.get())) {
+          candidates.push_back(f);
+          break;
+        }
+      }
+    }
+    for (const ForNode *cand : candidates) {
+      RegionCarry rc;
+      if (!TryRegionCarry(cand, stmts, scan, lanes, &rc)) {
+        continue;
+      }
+      if (region_carry_.active) {
+        region_carry_ = RegionCarry();  // ambiguous: promote nothing
+        return;
+      }
+      region_carry_ = rc;
+    }
+    if (region_carry_.active) {
+      VLOG(1) << "[rc] ACCEPT carry buffer " << region_carry_.src->name;
+    }
+  }
+
+  Stmt EmitRegionCarryWriteback(int64_t lanes) {
+    PrimExpr ptr = Call(
+        DataType::Handle(), tl::access_ptr(),
+        {BufferLoad(region_carry_.src, {make_zero(DataType::Int(32))}),
+         IntImm(DataType::Int(32), static_cast<int>(lanes)),
+         IntImm(DataType::Int(32), 2)});
+    return Evaluate(Call(
+        DataType::Void(), VmiOp("vstore"),
+        {BufferLoad(region_carry_.vreg, {make_zero(DataType::Int(32))}), ptr,
+         IntImm(DataType::Int(32), 0), shared_mask_}));
   }
 
   // ------------------------------------------------------------------
@@ -757,13 +1440,34 @@ private:
       mask_var_ = Var("mask", DataType::Bool(static_cast<int>(lanes_)));
     }
 
-    // Loop shells: analyze the unit body for preserved serial loops
-    // before conversion — set up carry promotion where the canonical
-    // pattern matches, and reject order-unsafe shapes.
-    AnalyzeLoopShell(
-        inner != nullptr ? static_cast<const Stmt &>(inner->body)
-                         : static_cast<const Stmt &>(loop->body),
-        region_body);
+    // Region-level carry: the seed unit and the in-loop units of a promoted
+    // loop route their carried-buffer accesses through the region vreg, so
+    // neither the unit-level loop-shell analysis nor a per-unit allocation
+    // applies to them.
+    unit_carry_from_region_ = false;
+    carry_lane_var_match_ = false;
+    if (region_carry_.active &&
+        (loop.get() == region_carry_.seed ||
+         StmtHasFor(region_carry_.loop->body, loop.get()))) {
+      unit_carry_from_region_ = true;
+      carry_seed_ = nullptr;
+      carry_loop_ = nullptr;
+      carry_src_ = region_carry_.src;
+      carry_indices_ = region_carry_.indices;
+      carry_vreg_ = region_carry_.vreg;
+      carry_lane_var_match_ = true;
+      carry_active_ = true;
+      VLOG(1) << "[rc] unit matched region carry, seed="
+                << (loop.get() == region_carry_.seed);
+    } else {
+      // Loop shells: analyze the unit body for preserved serial loops
+      // before conversion — set up carry promotion where the canonical
+      // pattern matches, and reject order-unsafe shapes.
+      AnalyzeLoopShell(
+          inner != nullptr ? static_cast<const Stmt &>(inner->body)
+                           : static_cast<const Stmt &>(loop->body),
+          region_body);
+    }
 
     // Convert the unit body statements in order. For a 2D unit this is
     // the innermost compute body; the outer (kept) coordinate is
@@ -802,9 +1506,9 @@ private:
         For(chunk_var_, make_zero(chunk_var_->dtype),
             IntImm(chunk_var_->dtype, static_cast<int64_t>(nchunks_)),
             ForKind::kSerial, chunk_body);
-    if (inner == nullptr) {
+    if (inner == nullptr) { 
       if (!has_tail) {
-        return WrapCarryAlloc(chunk_loop);
+        return WrapCarryAllocIfLocal(chunk_loop);
       }
       // remaining lives across the whole chunk loop: declare it, set it
       // to E once before the loop.
@@ -813,7 +1517,7 @@ private:
                       IntImm(DataType::Int(32),
                              static_cast<int64_t>(mapping.logical_extent)),
                       {make_zero(DataType::Int(32))});
-      return WrapCarryAlloc(SeqStmt::Flatten(
+      return WrapCarryAllocIfLocal(SeqStmt::Flatten(
           AllocBuffer(remaining_buffer_), SeqStmt::Flatten(init, chunk_loop)));
     }
     // 2D: keep the non-vectorized coordinate as the outer
@@ -838,11 +1542,10 @@ private:
         For(kept_var, make_zero(kept_var->dtype),
             IntImm(kept_var->dtype, static_cast<int64_t>(kept_extent)),
             ForKind::kSerial, kept_body);
-    if (!has_tail) {
-      return WrapCarryAlloc(kept_loop);
-    }
-    return WrapCarryAlloc(
-        SeqStmt::Flatten(AllocBuffer(remaining_buffer_), kept_loop));
+    Stmt result =
+        has_tail ? SeqStmt::Flatten(AllocBuffer(remaining_buffer_), kept_loop)
+                 : kept_loop;
+    return WrapCarryAllocIfLocal(std::move(result));
   }
 
   // Substitute the analysis chunk var with the real loop var q (and keep
@@ -981,6 +1684,16 @@ private:
               }
             }
           }
+        }
+        if (value.dtype().lanes() == 1) {
+          // Region-level promotion: the seed unit stores a scalar constant
+          // into the vector carrier, so broadcast it first.
+          value = EmitBind(
+              "vbrc_val",
+              Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"), {value},
+                   {{"size",
+                     IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+              &pre);
         }
         for (const auto &s : pre) {
           out->push_back(s);
@@ -1552,6 +2265,21 @@ private:
   tirx::Buffer carry_vreg_{};
   Array<PrimExpr> carry_indices_{};
   bool carry_active_ = false;
+  // Region-level carry promotion state (AnalyzeRegionCarry). When a unit is
+  // the seed or an in-loop unit of the promoted region, its B accesses are
+  // redirected to this vreg and the allocation happens once at region level
+  // (unit_carry_from_region_ suppresses WrapCarryAlloc).
+  RegionCarry region_carry_{};
+  bool unit_carry_from_region_ = false;
+  // Region-level carry matches any single lane Var index (each unit has its
+  // own Parallel loop var), not one fixed expression.
+  bool carry_lane_var_match_ = false;
+  // P1 (region-local split carry): UB allocations hoisted out of a split
+  // region while its parts are being built (they must not be re-declared by
+  // any part), and the hand-off list consumed by the enclosing block's
+  // VisitStmt_ once the split completes.
+  std::set<const BufferNode *> hoisted_allocs_;
+  Array<Buffer> pending_parent_allocs_;
   int tmp_counter_ = 0;
   Map<Var, PrimExpr> bind_env_; // analysis env: original var -> def expr
   Map<Var, Var> value_map_;     // value env: original var -> converted var
@@ -1584,3 +2312,4 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
 } // namespace tl
 } // namespace tvm
+
