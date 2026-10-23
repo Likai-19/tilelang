@@ -270,27 +270,17 @@ def test_shell_without_carry_is_preserved():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.pto
-def test_two_carried_buffers_are_rejected():
-    _, error = _lower_capture(_k_two_carried(), expect_error=True)
+@pytest.mark.parametrize(
+    "builder,needle",
+    [
+        (_k_two_carried, "more than one buffer"),
+        (_k_seed_not_adjacent, "seed"),
+        (_k_region_leak, "only be accessed"),
+    ],
+)
+def test_unsafe_shells_are_rejected(builder, needle):
+    _, error = _lower_capture(builder(), expect_error=True)
     assert error is not None
     message = str(error)
     assert "[VectorizeParallelToPTO] loop shell" in message
-    assert "more than one buffer" in message
-
-
-@pytest.mark.pto
-def test_seed_not_adjacent_is_rejected():
-    _, error = _lower_capture(_k_seed_not_adjacent(), expect_error=True)
-    assert error is not None
-    message = str(error)
-    assert "[VectorizeParallelToPTO] loop shell" in message
-    assert "seed" in message
-
-
-@pytest.mark.pto
-def test_carried_buffer_read_elsewhere_is_rejected():
-    _, error = _lower_capture(_k_region_leak(), expect_error=True)
-    assert error is not None
-    message = str(error)
-    assert "[VectorizeParallelToPTO] loop shell" in message
-    assert "only be accessed" in message
+    assert needle in message, f"expected {needle!r} in: {message}"

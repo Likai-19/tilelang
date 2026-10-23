@@ -47,6 +47,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -157,7 +158,7 @@ private:
         "tl.vmi.vsqrt",
         "tl.vmi.vcvt",
         "tl.vmi.vinterpret_cast",
-        // M2 control-flow ops (vcmp/vcmps produce masks, vsel/mask_* combine
+        // Control-flow ops (vcmp/vcmps produce masks, vsel/mask_* combine
         // them); an unused result is discardable like the arithmetic ops.
         "tl.vmi.vcmp",
         "tl.vmi.vcmps",
@@ -244,6 +245,55 @@ private:
   }
 };
 
+// Scalar fold of a binary operation over the converted lane-uniform
+// operands: rebuild the TIR semantics of the source node.
+using ScalarFoldFn = PrimExpr (*)(const PrimExpr &, const PrimExpr &);
+
+// (node kind, PTODSL compare name) for the six relational kinds. The
+// operands are always taken in the node's own (a, b) order; this one
+// table feeds ConvertExpr, RelationalCmpName and ConvertRelationalToMask
+// so the node kind and the compare name cannot drift apart.
+struct RelationalKind {
+  // Fill a/b (when non-null) with the node's operands and report whether
+  // e is of this entry's kind.
+  bool (*take)(const PrimExpr &e, PrimExpr *a, PrimExpr *b);
+  const char *cmp;
+};
+
+template <typename Node>
+bool TakeRelational(const PrimExpr &e, PrimExpr *a, PrimExpr *b) {
+  const Node *n = e.as<Node>();
+  if (n == nullptr) {
+    return false;
+  }
+  if (a != nullptr) {
+    *a = n->a;
+  }
+  if (b != nullptr) {
+    *b = n->b;
+  }
+  return true;
+}
+
+const RelationalKind kRelationalTable[6] = {
+    {TakeRelational<EQNode>, "eq"}, {TakeRelational<NENode>, "ne"},
+    {TakeRelational<LTNode>, "lt"}, {TakeRelational<LENode>, "le"},
+    {TakeRelational<GTNode>, "gt"}, {TakeRelational<GENode>, "ge"},
+};
+
+// Match e against kRelationalTable: on a hit fill a/b (either may be
+// null) with the node's operands and return the table entry; return
+// nullptr when e is not a relational node.
+const RelationalKind *MatchRelational(const PrimExpr &e, PrimExpr *a,
+                                      PrimExpr *b) {
+  for (const RelationalKind &kind : kRelationalTable) {
+    if (kind.take(e, a, b)) {
+      return &kind;
+    }
+  }
+  return nullptr;
+}
+
 class VectorizeParallelToPTOImpl : public StmtExprMutator {
 public:
   static PrimFunc Substitute(PrimFunc f) {
@@ -266,7 +316,7 @@ private:
   // SIMD_VF block entry
   // ------------------------------------------------------------------
   Stmt VisitStmt_(const SBlockNode *op) final {
-    if (op->name_hint != "SIMD_VF") {
+    if (op->name_hint != pto_analysis::kSimdVfBlockName) {
       Stmt result = StmtExprMutator::VisitStmt_(op);
       // A child region split hoisted its UB allocations up to this block (see
       // TrySplitCarriedLoop); extend the rebuilt block so the split parts
@@ -294,14 +344,15 @@ private:
         << "[VectorizeParallelToPTO] internal error: parallel units lost "
            "after scan";
 
-    // Plan A: a serial loop that carries a shared buffer through UB (a unit
-    // that both loads and stores the same buffer) has no ordering point
-    // inside one vecscope — every synchronisation operation delimits a
-    // vecscope, so none may appear between two iterations. When the carry
-    // promotion below does not apply (carried value is not a single full
-    // lane vector), hoist the loop nest out of the region and give every
-    // iteration its own region, so consecutive iterations are separated by
-    // a vecscope transition, which *is* the legal synchronisation point.
+    // The vecscope split: a serial loop that carries a shared buffer
+    // through UB (a unit that both loads and stores the same buffer) has
+    // no ordering point inside one vecscope — every synchronisation
+    // operation delimits a vecscope, so none may appear between two
+    // iterations. When the carry promotion below does not apply (carried
+    // value is not a single full lane vector), hoist the loop nest out of
+    // the region and give every iteration its own region, so consecutive
+    // iterations are separated by a vecscope transition, which *is* the
+    // legal synchronisation point.
     if (!RegionIsCarryPromotable(region, scan)) {
       Stmt split = TrySplitCarriedLoop(op, region);
       if (split.defined()) {
@@ -317,7 +368,7 @@ private:
                     std::move(body), op->init, op->alloc_buffers,
                     op->match_buffers, op->annotations);
     }
-    // P1: a split hoisted these allocations to the enclosing block; the parts
+    // A split hoisted these allocations to the enclosing block; the parts
     // must not re-declare them, otherwise each part gets its own merged UB
     // slot and the split silently breaks the data chain.
     Array<Buffer> alloc_buffers;
@@ -332,11 +383,10 @@ private:
                   op->match_buffers, op->annotations);
   }
 
-  // P1 (region-local split carry): extend an enclosing block with the
+  // Region-local split carry: extend an enclosing block with the
   // allocations hoisted out of a split region. Appending to the block's
-  // alloc_buffers is the same shape a Kernel-scope T.alloc_shared produces
-  // (the verified sv7 carrier), so the allocation passes see exactly one
-  // owner for the whole split.
+  // alloc_buffers is the same shape a Kernel-scope T.alloc_shared produces,
+  // so the allocation passes see exactly one owner for the whole split.
   Stmt AppendBlockAllocs(const Stmt &stmt, const Array<Buffer> &extra) {
     if (extra.empty()) {
       return stmt;
@@ -385,12 +435,13 @@ private:
     std::vector<Stmt> stmts;
     FlattenTopStmts(region, &stmts);
     // Exactly-one-match rule, identical to AnalyzeRegionCarry: several serial
-    // loops may wrap units (sv7v has a fill loop and an accumulate loop), and
-    // only a single matching carrier may be promoted. If two loops match, the
-    // promotion would be ambiguous — AnalyzeRegionCarry then promotes nothing,
-    // so reporting `true` here would keep the whole region in one vecscope and
-    // leave both carriers on the unreliable plain path. Returning false hands
-    // the region to Plan A, which splits every carrier.
+    // loops may wrap units (e.g. a fill loop followed by an accumulate
+    // loop), and only a single matching carrier may be promoted. If two
+    // loops match, the promotion would be ambiguous — AnalyzeRegionCarry
+    // then promotes nothing, so reporting `true` here would keep the whole
+    // region in one vecscope and leave both carriers on the unreliable
+    // plain path. Returning false hands the region to the vecscope split,
+    // which splits every carrier.
     int matches = 0;
     for (const Stmt &s : stmts) {
       const auto *f = s.as<ForNode>();
@@ -510,7 +561,7 @@ private:
   }
 
   // ------------------------------------------------------------------
-  // Plan A: vecscope splitting
+  // Vecscope splitting
   //
   // A SIMD_VF region may contain a serial loop whose body carries a shared
   // buffer through UB (load+store the same buffer inside one unit). Inside
@@ -656,19 +707,18 @@ private:
         scope_attr->attr_key != "tl.simdvf_scope") {
       scope_attr = nullptr;
     }
-    // P1 (region-local split carry): every part below is a separate block, so
+    // Region-local split carry: every part below is a separate block, so
     // each would re-declare the region's allocations and MergeUBAllocations
     // would give one logical buffer several merged slots — the parts then talk
     // to different addresses and the data chain breaks silently. Hoist every
     // region-local UB allocation to the enclosing block first, so all parts
-    // share one allocation (the shape sv7 already uses: carrier allocated at
-    // Kernel scope, verified 0/64).
+    // share one allocation.
     //
     // Deliberately conservative: hoisting a buffer used by a single part is
     // semantically neutral (only the lifetime widens; MergeUB plans by alias
     // clique, so no extra UB is consumed). Restricting the set to the "carrier"
     // would miss the neighbouring region-local buffers that also live across
-    // the split (sv5v/sv6v `xf`): written before the loop, read inside it.
+    // the split (written before the loop, read inside it).
     Array<Buffer> hoist;
     for (const Buffer &buffer : op->alloc_buffers) {
       const std::string &scope = buffer.scope();
@@ -679,9 +729,9 @@ private:
     for (const Buffer &buffer : hoist) {
       hoisted_allocs_.insert(buffer.get());
     }
-    // Values bound outside a loop cannot cross the new region boundary
-    // (VPTO treats vecscope-region data as region-local): leave such regions
-    // alone instead of splitting them.
+    // Values bound in a sibling statement cannot cross the new region
+    // boundary (VPTO treats vecscope-region data as region-local); a
+    // carrier that reads one is rejected below.
     std::set<const VarNode *> outer_binds;
     for (size_t i = 0; i < stmts.size(); ++i) {
       if (std::find(carriers.begin(), carriers.end(), i) == carriers.end()) {
@@ -691,12 +741,12 @@ private:
     if (!outer_binds.empty()) {
       for (size_t idx : carriers) {
         if (UsesAnyVar(stmts[idx], outer_binds)) {
-          // Fail-closed (B.7): the loop must be split — its iterations carry
+          // Fail-closed: the loop must be split — its iterations carry
           // a buffer through UB, and one vecscope has no ordering point — but
           // a bind from a sibling statement blocks moving the loop across the
           // new region boundary. Converting the region as a whole is the
-          // unreliable shape (the same one Plan A exists to avoid), so reject
-          // instead of silently emitting it.
+          // unreliable shape (the same one the vecscope split exists to
+          // avoid), so reject instead of silently emitting it.
           LOG(FATAL)
               << "[VectorizeParallelToPTO] the serial loop at region offset "
               << idx
@@ -729,7 +779,7 @@ private:
               << " parts=" << out.size() << " hoisted=" << hoist.size();
     hoisted_allocs_.clear();
     // Hand the hoisted allocations to the enclosing block (consumed by its
-    // VisitStmt_); the parts no longer declare them.
+    // VisitStmt_); the parts do not declare them.
     for (const Buffer &buffer : hoist) {
       pending_parent_allocs_.push_back(buffer);
     }
@@ -918,6 +968,14 @@ private:
     // cross-iteration dependencies.
     std::unordered_map<const BufferNode *, std::pair<int, int>> counts;
     for (const auto &acc : collector.accesses) {
+      // A per-lane scalar is a register, not a memory carry: its in-shell
+      // update is promoted to the vreg by ConvertBody, so it never needs a
+      // UB round-trip promotion (and must not be counted as the carried
+      // buffer, whose post-shell isolation check would then reject the
+      // legitimate reads of the final value).
+      if (pto_analysis::IsLaneScalarBuffer(GetRef<Buffer>(acc.buf))) {
+        continue;
+      }
       auto &c = counts[acc.buf];
       if (acc.is_store) {
         ++c.second;
@@ -990,6 +1048,11 @@ private:
                 "immediately before the T.serial loop");
     }
     const auto *seed = stmts[shell_pos - 1].as<BufferStoreNode>();
+    if (seed != nullptr && seed->predicate.defined()) {
+      ShellFail("the seed store of the carried buffer must be "
+                "unconditional; a conditional seed cannot be promoted to a "
+                "register and has no ordered UB form inside a vecscope");
+    }
     if (seed == nullptr || seed->buffer.get() != carried ||
         seed->indices.size() != ref.size()) {
       ShellFail("the loop carry needs a seed store to the carried buffer "
@@ -1050,11 +1113,41 @@ private:
     return s;
   }
 
+  // ------------------------------------------------------------------
+  // Per-lane scalar promotion (`T.alloc_var` in a Parallel unit)
+  // ------------------------------------------------------------------
+  // `T.alloc_var(dtype)` is a single-element `local.var` buffer. Every lane
+  // owns its own copy, so the buffer is a per-lane register rather than a
+  // lane-addressed memory object; Vectorize reads and writes it as a
+  // `local.var` vector (vreg) so the value stays in RF and a carried update
+  // inside a preserved shell becomes an ordinary SSA loop carry.
+  // Create (once per unit) the vreg backing a per-lane scalar.
+  tirx::Buffer LaneScalarVreg(const Buffer &buffer) {
+    auto it = lane_scalar_vregs_.find(buffer.get());
+    if (it != lane_scalar_vregs_.end()) {
+      return it->second;
+    }
+    tirx::Buffer vreg = tirx::decl_buffer(
+        {IntImm(DataType::Int(32), 1)}, VectorDType(buffer->dtype, lanes_),
+        std::string(buffer->name) + "_lane", "local.var");
+    lane_scalar_vregs_[buffer.get()] = vreg;
+    lane_scalar_allocs_.push_back(vreg);
+    return vreg;
+  }
+
   // Region-level promotion owns the vreg allocation (one per region, before
   // the loop); a unit must never allocate it again inside the loop, otherwise
   // the PTODSL emission splits the carried value into two Python names and
   // the loop-carried ssa value is lost.
   Stmt WrapCarryAllocIfLocal(Stmt s) {
+    // Per-lane scalar vregs are declared at the same place as the carry vreg:
+    // inside the unit, outside the shell, so a carried update binds to one
+    // SSA name. Reversed so the first created vreg ends up outermost.
+    for (auto it = lane_scalar_allocs_.rbegin(); it != lane_scalar_allocs_.rend();
+         ++it) {
+      s = SeqStmt::Flatten(AllocBuffer(*it), std::move(s));
+    }
+    lane_scalar_allocs_.clear();
     if (unit_carry_from_region_) {
       carry_active_ = false;
       return s;
@@ -1092,12 +1185,11 @@ private:
   //
   // Inside one vecscope a UB read-modify-write chain has no ordering
   // point: every sync operation delimits a vecscope, so none can appear
-  // between two iterations. Verified on .39: an accumulator updated that
-  // way keeps reading its seed (sv7: m_ub stays 0, output 1e6) or a
-  // partially updated value, and the outcome depends on the trip count
-  // and on backend scheduling. Promoting the accumulator to a local.var
-  // vreg makes the loop carry an SSA value (scf.for iter_args), so no
-  // memory ordering is needed at all.
+  // between two iterations. An accumulator updated that way keeps reading
+  // its seed or a partially updated value, and the outcome depends on the
+  // trip count and on backend scheduling. Promoting the accumulator to a
+  // local.var vreg makes the loop carry an SSA value (scf.for iter_args),
+  // so no memory ordering is needed at all.
   //
   // Recognised shape (deliberately narrow, mirroring AnalyzeLoopShell):
   //   <unit S>: B[lane] = seed            (right before the loop, no B read)
@@ -1326,9 +1418,9 @@ private:
     }
     std::vector<Stmt> stmts;
     FlattenTopStmts(region, &stmts);
-    // Several serial loops may wrap parallel units (sv7v has a fill loop and
-    // an accumulate loop): exactly one of them must match the carried-buffer
-    // pattern, otherwise the region is left unpromoted.
+    // Several serial loops may wrap parallel units (e.g. a fill loop
+    // followed by an accumulate loop): exactly one of them must match the
+    // carried-buffer pattern, otherwise the region is left unpromoted.
     std::vector<const ForNode *> candidates;
     for (const Stmt &s : stmts) {
       const auto *f = s.as<ForNode>();
@@ -1383,6 +1475,8 @@ private:
     bind_env_.clear();
     value_map_.clear();
     tmp_counter_ = 0;
+    lane_scalar_vregs_.clear();
+    lane_scalar_allocs_.clear();
     // Keep the complete mapping (2D fields included) for the
     // per-access analysis calls in ConvertBody.
     unit_mapping_ = mapping;
@@ -1506,7 +1600,7 @@ private:
         For(chunk_var_, make_zero(chunk_var_->dtype),
             IntImm(chunk_var_->dtype, static_cast<int64_t>(nchunks_)),
             ForKind::kSerial, chunk_body);
-    if (inner == nullptr) { 
+    if (inner == nullptr) {
       if (!has_tail) {
         return WrapCarryAllocIfLocal(chunk_loop);
       }
@@ -1642,6 +1736,45 @@ private:
       return;
     }
     if (const auto *store = body.as<BufferStoreNode>()) {
+      // A one-sided conditional write arrives as a predicated store: only
+      // the lanes the predicate selects may be written and the destination
+      // is never read back. Register targets turn the predicate into a
+      // select against the register's current value; memory targets turn it
+      // into a store mask.
+      const bool predicated = store->predicate.defined();
+      Array<Stmt> pred_pre;
+      PrimExpr pred_mask;
+      if (predicated) {
+        pred_mask = ConvertPredicateToMask(store->predicate.value(), &pred_pre);
+      }
+      // Per-lane scalar (T.alloc_var): the whole-buffer store becomes a write
+      // to the vreg. A scalar value is broadcast over the lanes; a vector
+      // value (a lane-varying load) is stored as-is.
+      if (pto_analysis::IsLaneScalarBuffer(store->buffer)) {
+        Array<Stmt> pre;
+        PrimExpr value = ConvertExpr(store->value, &pre);
+        if (value.dtype().lanes() == 1) {
+          value = BroadcastToLanes("vbrc_lane", value, &pre);
+        }
+        tirx::Buffer vreg = LaneScalarVreg(store->buffer);
+        for (const auto &s : pred_pre) {
+          pre.push_back(s);
+        }
+        if (predicated) {
+          value = EmitBind(
+              "vsel",
+              Call(value.dtype(), VmiOp("vsel"),
+                   {pred_mask, value,
+                    BufferLoad(vreg, {make_zero(DataType::Int(32))})}),
+              &pre);
+        }
+        for (const auto &s : pre) {
+          out->push_back(s);
+        }
+        out->push_back(BufferStore(vreg, value,
+                                   {make_zero(DataType::Int(32))}));
+        return;
+      }
       if (carry_seed_ != nullptr && store == carry_seed_) {
         // Seed of the promoted carry: forward the value into the vreg
         // buffer instead of storing to UB, so the shell's loads never
@@ -1649,12 +1782,7 @@ private:
         Array<Stmt> pre;
         PrimExpr value = ConvertExpr(store->value, &pre);
         if (value.dtype().lanes() == 1) {
-          value = EmitBind(
-              "vbrc_val",
-              Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"), {value},
-                   {{"size",
-                     IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
-              &pre);
+          value = BroadcastToLanes("vbrc_val", value, &pre);
         }
         for (const auto &s : pre) {
           out->push_back(s);
@@ -1688,11 +1816,19 @@ private:
         if (value.dtype().lanes() == 1) {
           // Region-level promotion: the seed unit stores a scalar constant
           // into the vector carrier, so broadcast it first.
+          value = BroadcastToLanes("vbrc_val", value, &pre);
+        }
+        for (const auto &s : pred_pre) {
+          pre.push_back(s);
+        }
+        if (predicated) {
+          // A conditional carry update keeps the register value on the
+          // lanes the predicate does not select.
           value = EmitBind(
-              "vbrc_val",
-              Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"), {value},
-                   {{"size",
-                     IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+              "vsel",
+              Call(value.dtype(), VmiOp("vsel"),
+                   {pred_mask, value,
+                    BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))})}),
               &pre);
         }
         for (const auto &s : pre) {
@@ -1709,12 +1845,7 @@ private:
           CurrentMapping(), &analyzer_, bind_env_);
       if (access.pattern == pto_analysis::AccessPattern::kContinuous) {
         if (value.dtype().lanes() == 1) {
-          value = EmitBind(
-              "vbrc_val",
-              Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"), {value},
-                   {{"size",
-                     IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
-              &pre);
+          value = BroadcastToLanes("vbrc_val", value, &pre);
         }
         Array<PrimExpr> start_idx;
         for (const auto &idx : access.start_indices) {
@@ -1726,12 +1857,25 @@ private:
                  {BufferLoad(store->buffer, start_idx),
                   IntImm(DataType::Int(32), static_cast<int>(lanes_)),
                   IntImm(DataType::Int(32), 2)});
+        for (const auto &s : pred_pre) {
+          pre.push_back(s);
+        }
+        // One-sided write: AND the predicate into the chunk's valid mask so
+        // the lanes the source condition did not select stay untouched.
+        PrimExpr store_mask = mask_var_;
+        if (predicated) {
+          store_mask = EmitBind(
+              "mand",
+              Call(DataType::Bool(static_cast<int>(lanes_)),
+                   VmiOp("mask_and"), {mask_var_, pred_mask}),
+              &pre);
+        }
         for (const auto &s : pre) {
           out->push_back(s);
         }
         out->push_back(Evaluate(
             Call(DataType::Void(), VmiOp("vstore"),
-                 {value, ptr, IntImm(DataType::Int(32), 0), mask_var_})));
+                 {value, ptr, IntImm(DataType::Int(32), 0), store_mask})));
       } else {
         // Verify rejects lane-uniform stores (the current
         // support boundary), so this branch is unreachable. Treat any
@@ -1839,6 +1983,11 @@ private:
   // ------------------------------------------------------------------
   PrimExpr ConvertExpr(const PrimExpr &expr, Array<Stmt> *pre) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
+      // Per-lane scalar (T.alloc_var): read the vreg that carries its value.
+      if (pto_analysis::IsLaneScalarBuffer(load->buffer)) {
+        return BufferLoad(LaneScalarVreg(load->buffer),
+                          {make_zero(DataType::Int(32))});
+      }
       if (carry_active_ && IsCarryAccess(load->buffer, load->indices)) {
         // Promoted carry read: the value lives in the vreg buffer.
         return BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))});
@@ -1913,49 +2062,34 @@ private:
       return ConvertBinary(div->a, div->b, "vdiv", pre);
     }
     if (const auto *call = expr.as<CallNode>()) {
-      // M2: lane-mask boolean combinations and the topk_gate infinity constant
-      // come first. They are not unary math, so the strict kUnaryMap check
-      // below must not see them (that table only covers fabs/exp/log/sqrt).
+      // Lane-mask boolean combinations come first. They are not unary
+      // math, so the strict unary-math mapping below must not see them
+      // (it only covers fabs/exp/log/sqrt). The frontend infinity()
+      // constant never arrives here: Legalize rewrites it to FloatImm.
       std::string name;
       if (const auto *op_node = call->op.as<OpNode>()) {
         name = op_node->name;
       }
-      if (name == "tl.infinity" || name == "tir.infinity") {
-        // Lane-uniform +inf scalar (frontend -T.infinity is Mul(inf, -1)).
-        // Keep the Call; vbrc / Mul / Select consume it like a FloatImm.
-        return GetRef<PrimExpr>(call);
-      }
-      if (name == "tirx.bitwise_and" || name == "tir.bitwise_and" ||
-          name == "tir.And") {
-        ICHECK_EQ(call->args.size(), 2);
-        return ConvertMaskLogic(call->args[0], call->args[1], "mask_and", pre);
-      }
-      if (name == "tirx.bitwise_or" || name == "tir.bitwise_or" ||
-          name == "tir.Or") {
-        ICHECK_EQ(call->args.size(), 2);
-        return ConvertMaskLogic(call->args[0], call->args[1], "mask_or", pre);
-      }
-      if (name == "tirx.bitwise_not" || name == "tir.bitwise_not" ||
-          name == "tir.Not") {
-        ICHECK_EQ(call->args.size(), 1);
-        PrimExpr a = ConvertExpr(call->args[0], pre);
-        DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
-        return EmitBind("mnot", Call(mask_ty, VmiOp("mask_not"), {a}), pre);
+      if (const char *mask_op = pto_analysis::MaskLogicVmiOpName(name)) {
+        const bool is_not = std::string_view(mask_op) == "mask_not";
+        ICHECK_EQ(call->args.size(), is_not ? 1 : 2);
+        if (is_not) {
+          PrimExpr a = ConvertExpr(call->args[0], pre);
+          DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+          return EmitBind("mnot", Call(mask_ty, VmiOp("mask_not"), {a}), pre);
+        }
+        return ConvertMaskLogic(call->args[0], call->args[1], mask_op, pre);
       }
       // Hardware-backed unary math (fabs/exp/log/sqrt); the dtype matrix
       // mirrors the ISA documentation (see IsSupportedVectorUnaryOp).
-      static const std::unordered_map<std::string, std::string> kUnaryMap = {
-          {"tirx.fabs", "vabs"},
-          {"tirx.exp", "vexp"},
-          {"tirx.log", "vln"},
-          {"tirx.sqrt", "vsqrt"}};
       auto call_op = call->op.as<Op>();
       ICHECK(call_op.has_value())
           << "[VectorizeParallelToPTO] internal error: non-Op call passed "
              "Verify: "
           << expr;
-      auto it = kUnaryMap.find(call_op.value()->name);
-      ICHECK(it != kUnaryMap.end())
+      const char *unary = pto_analysis::VectorUnaryVmiOpName(
+          call_op.value()->name);
+      ICHECK(unary != nullptr)
           << "[VectorizeParallelToPTO] internal error: call passed Verify "
              "without a VMI mapping: "
           << call_op.value()->name;
@@ -1963,9 +2097,9 @@ private:
       if (a.dtype().lanes() == 1) {
         return Call(expr.dtype(), call->op, {a});
       }
-      return EmitBind(it->second,
+      return EmitBind(unary,
                       Call(VectorDType(expr.dtype().element_of(), lanes_),
-                           VmiOp(it->second), {a, mask_var_}),
+                           VmiOp(unary), {a, mask_var_}),
                       pre);
     }
     if (const auto *cast = expr.as<CastNode>()) {
@@ -2054,53 +2188,97 @@ private:
     }
     if (const auto *sel = expr.as<SelectNode>()) {
 
-      PrimExpr cond = ConvertExpr(sel->condition, pre);
+      // A Select inside a Parallel body may test a lane-uniform condition
+      // (it depends only on the non-vectorized coordinates, e.g. a row
+      // index). PTODSL has no scalar predicate, so the
+      // compare is redone in the vector domain and the result is a mask
+      // that is either all-true or all-false.
+      PrimExpr cond = RelationalCmpName(sel->condition) != nullptr
+                          ? ConvertRelationalToMask(sel->condition, pre)
+                          : ConvertExpr(sel->condition, pre);
       PrimExpr tval = ConvertExpr(sel->true_value, pre);
       PrimExpr fval = ConvertExpr(sel->false_value, pre);
       if (tval.dtype().lanes() == 1) {
-        tval = EmitBind(
-            "brc",
-            Call(VectorDType(tval.dtype(), lanes_), VmiOp("vbrc"), {tval},
-                 {{"size",
-                   IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
-            pre);
+        tval = BroadcastToLanes("brc", tval, pre);
       }
       if (fval.dtype().lanes() == 1) {
-        fval = EmitBind(
-            "brc",
-            Call(VectorDType(fval.dtype(), lanes_), VmiOp("vbrc"), {fval},
-                 {{"size",
-                   IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
-            pre);
+        fval = BroadcastToLanes("brc", fval, pre);
       }
       ICHECK(cond.dtype().lanes() > 1)
-          << "[VectorizeParallelToPTO] Select condition must be a lane mask "
-             "after conversion (got scalar); Phase 1 expects lane-varying "
-             "predicates from SimdVFLowerControlFlow";
+          << "[VectorizeParallelToPTO] unsupported Select condition: a "
+             "lane-uniform condition is only supported when it is a "
+             "relational expression over lane-uniform values (e.g. "
+             "`row_flag >= 0`); got a scalar `"
+          << sel->condition->GetTypeKey()
+          << "`. Rewrite the test as a comparison, or make it lane-varying.";
       return EmitBind(
           "vsel", Call(tval.dtype(), VmiOp("vsel"), {cond, tval, fval}), pre);
     }
-    if (const auto *eq = expr.as<EQNode>()) {
-      return ConvertCompare(eq->a, eq->b, "eq", pre);
-    }
-    if (const auto *ne = expr.as<NENode>()) {
-      return ConvertCompare(ne->a, ne->b, "ne", pre);
-    }
-    if (const auto *lt = expr.as<LTNode>()) {
-      return ConvertCompare(lt->a, lt->b, "lt", pre);
-    }
-    if (const auto *le = expr.as<LENode>()) {
-      return ConvertCompare(le->a, le->b, "le", pre);
-    }
-    if (const auto *gt = expr.as<GTNode>()) {
-      return ConvertCompare(gt->a, gt->b, "gt", pre);
-    }
-    if (const auto *ge = expr.as<GENode>()) {
-      return ConvertCompare(ge->a, ge->b, "ge", pre);
+    PrimExpr rel_a;
+    PrimExpr rel_b;
+    if (const RelationalKind *rel = MatchRelational(expr, &rel_a, &rel_b)) {
+      return ConvertCompare(rel_a, rel_b, rel->cmp, pre);
     }
     LOG(FATAL) << "[VectorizeParallelToPTO] internal error: unsupported "
                   "expression passed Verify: "
                << expr->GetTypeKey();
+  }
+
+  // Relational node -> PTODSL compare name, or nullptr for other nodes.
+  static const char *RelationalCmpName(const PrimExpr &e) {
+    const RelationalKind *rel = MatchRelational(e, nullptr, nullptr);
+    return rel != nullptr ? rel->cmp : nullptr;
+  }
+
+  // Materialise a store predicate as a lane mask. A relational predicate
+  // goes through the compare path (broadcast + vcmp) so a lane-uniform
+  // test still yields an all-true / all-false mask; anything else is
+  // converted as a value, and a scalar result is broadcast to a mask.
+  PrimExpr ConvertPredicateToMask(const PrimExpr &pred, Array<Stmt> *pre) {
+    PrimExpr mask;
+    if (RelationalCmpName(pred) != nullptr) {
+      mask = ConvertRelationalToMask(pred, pre);
+    } else {
+      mask = ConvertExpr(pred, pre);
+      if (mask.dtype().lanes() == 1) {
+        mask = BroadcastToLanes("brc_pred", mask, pre);
+      }
+    }
+    ICHECK(mask.dtype().lanes() > 1)
+        << "[VectorizeParallelToPTO] unsupported store predicate: expected a "
+           "lane mask, got a scalar `"
+        << pred->GetTypeKey()
+        << "`. Rewrite the condition as a comparison, or make it lane-varying.";
+    return mask;
+  }
+
+  // Materialise a relational condition as a lane mask even when both sides
+  // are lane-uniform: broadcast the scalars and compare vector-wise. The
+  // resulting mask is all-true or all-false, which is exactly the semantics
+  // of a scalar predicate applied to a whole vector.
+  PrimExpr ConvertRelationalToMask(const PrimExpr &cond, Array<Stmt> *pre) {
+    PrimExpr lhs;
+    PrimExpr rhs;
+    const RelationalKind *rel = MatchRelational(cond, &lhs, &rhs);
+    ICHECK(rel != nullptr) << "not a relational condition";
+    const char *cmp = rel->cmp;
+    Array<Stmt> local;
+    PrimExpr a = ConvertExpr(lhs, &local);
+    PrimExpr b = ConvertExpr(rhs, &local);
+    for (const auto &s : local) {
+      pre->push_back(s);
+    }
+    if (a.dtype().lanes() == 1) {
+      a = BroadcastToLanes("brc", a, pre);
+    }
+    if (b.dtype().lanes() == 1) {
+      b = BroadcastToLanes("brc", b, pre);
+    }
+    return EmitBind(
+        "vcmp",
+        Call(DataType::Bool(static_cast<int>(lanes_)), VmiOp("vcmp"),
+             {a, b, mask_var_, StringImm(cmp)}),
+        pre);
   }
 
   PrimExpr ConvertCompare(const PrimExpr &lhs, const PrimExpr &rhs,
@@ -2113,18 +2291,25 @@ private:
     if (!a_vec && !b_vec) {
       // Lane-uniform compare: keep scalar relational (Select of scalars is
       // rare inside Parallel; Verify still allows it).
-      if (std::string(cmp) == "eq")
-        return a == b;
-      if (std::string(cmp) == "ne")
-        return a != b;
-      if (std::string(cmp) == "lt")
-        return a < b;
-      if (std::string(cmp) == "le")
-        return a <= b;
-      if (std::string(cmp) == "gt")
-        return a > b;
-      if (std::string(cmp) == "ge")
-        return a >= b;
+      static const std::unordered_map<std::string, ScalarFoldFn>
+          kScalarCmpFold = {
+              {"eq",
+               [](const PrimExpr &a, const PrimExpr &b) { return a == b; }},
+              {"ne",
+               [](const PrimExpr &a, const PrimExpr &b) { return a != b; }},
+              {"lt",
+               [](const PrimExpr &a, const PrimExpr &b) { return a < b; }},
+              {"le",
+               [](const PrimExpr &a, const PrimExpr &b) { return a <= b; }},
+              {"gt",
+               [](const PrimExpr &a, const PrimExpr &b) { return a > b; }},
+              {"ge",
+               [](const PrimExpr &a, const PrimExpr &b) { return a >= b; }},
+          };
+      auto it = kScalarCmpFold.find(cmp);
+      if (it != kScalarCmpFold.end()) {
+        return it->second(a, b);
+      }
       LOG(FATAL) << "[VectorizeParallelToPTO] unknown cmp " << cmp;
     }
     if (a_vec && !b_vec) {
@@ -2134,11 +2319,7 @@ private:
           pre);
     }
     if (!a_vec && b_vec) {
-      a = EmitBind(
-          "brc",
-          Call(VectorDType(a.dtype(), lanes_), VmiOp("vbrc"), {a},
-               {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
-          pre);
+      a = BroadcastToLanes("brc", a, pre);
     }
     return EmitBind(
         "vcmp", Call(mask_ty, VmiOp("vcmp"), {a, b, mask_var_, StringImm(cmp)}),
@@ -2152,7 +2333,8 @@ private:
     DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
     ICHECK(a.dtype().lanes() > 1 && b.dtype().lanes() > 1)
         << "[VectorizeParallelToPTO] " << op_name
-        << " expects lane masks (Phase 2)";
+        << " expects lane masks (scalar boolean operands are not "
+           "supported here)";
     return EmitBind(op_name, Call(mask_ty, VmiOp(op_name), {a, b}), pre);
   }
 
@@ -2164,34 +2346,29 @@ private:
     bool b_vec = b.dtype().lanes() > 1;
     if (!a_vec && !b_vec) {
       // Lane-uniform folds stay scalar with the TIR semantics of the node.
-      if (vmi_name == "vadd") {
-        return a + b;
-      }
-      if (vmi_name == "vsub") {
-        return a - b;
-      }
-      if (vmi_name == "vmul") {
-        return a * b;
-      }
-      if (vmi_name == "vdiv") {
-        return div(a, b);
+      static const std::unordered_map<std::string, ScalarFoldFn>
+          kScalarBinaryFold = {
+              {"vadd",
+               [](const PrimExpr &a, const PrimExpr &b) { return a + b; }},
+              {"vsub",
+               [](const PrimExpr &a, const PrimExpr &b) { return a - b; }},
+              {"vmul",
+               [](const PrimExpr &a, const PrimExpr &b) { return a * b; }},
+              {"vdiv",
+               [](const PrimExpr &a, const PrimExpr &b) { return div(a, b); }},
+          };
+      auto it = kScalarBinaryFold.find(vmi_name);
+      if (it != kScalarBinaryFold.end()) {
+        return it->second(a, b);
       }
       ICHECK(false) << "[VectorizeParallelToPTO] internal error: unknown "
                        "binary op "
                     << vmi_name;
     }
     if (a_vec && !b_vec) {
-      b = EmitBind(
-          "brc",
-          Call(VectorDType(b.dtype(), lanes_), VmiOp("vbrc"), {b},
-               {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
-          pre);
+      b = BroadcastToLanes("brc", b, pre);
     } else if (!a_vec && b_vec) {
-      a = EmitBind(
-          "brc",
-          Call(VectorDType(a.dtype(), lanes_), VmiOp("vbrc"), {a},
-               {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
-          pre);
+      a = BroadcastToLanes("brc", a, pre);
     }
     return EmitBind(vmi_name,
                     Call(VectorDType(a.dtype().element_of(), lanes_),
@@ -2226,6 +2403,17 @@ private:
       os << dtype;
     }
     return os.str();
+  }
+
+  // Broadcast a lane-uniform scalar to the full vector width: bind a
+  // vbrc of the scalar at the current VL and return the bound Var.
+  PrimExpr BroadcastToLanes(const char *tag, const PrimExpr &scalar,
+                            Array<Stmt> *pre) {
+    return EmitBind(
+        tag,
+        Call(VectorDType(scalar.dtype(), lanes_), VmiOp("vbrc"), {scalar},
+             {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+        pre);
   }
 
   Var EmitBind(const std::string &name, const PrimExpr &value,
@@ -2274,7 +2462,15 @@ private:
   // Region-level carry matches any single lane Var index (each unit has its
   // own Parallel loop var), not one fixed expression.
   bool carry_lane_var_match_ = false;
-  // P1 (region-local split carry): UB allocations hoisted out of a split
+  // Per-lane scalar promotion (`T.alloc_var` inside a Parallel unit). The
+  // single-element `local.var` buffer is a private register per lane, so each
+  // whole-buffer access becomes a `local.var` vector (vreg) access: the seed
+  // store broadcasts, later loads/stores reference the same vreg. Keyed by the
+  // source buffer node; the vregs are declared at unit scope by
+  // WrapCarryAllocIfLocal.
+  std::unordered_map<const BufferNode *, tirx::Buffer> lane_scalar_vregs_;
+  std::vector<tirx::Buffer> lane_scalar_allocs_;
+  // Region-local split carry: UB allocations hoisted out of a split
   // region while its parts are being built (they must not be re-declared by
   // any part), and the hand-off list consumed by the enclosing block's
   // VisitStmt_ once the split completes.

@@ -1,4 +1,4 @@
-"""Region-local state inside a SimdVF region (split + hoisting).
+"""Region-local state inside a SimdVF region.
 
 Two facts that share the same region-level state handling:
 
@@ -62,6 +62,130 @@ def _lower_capture(func, *, expect_error=False):
 def _body_of(mod):
     assert len(mod.functions) == 1, f"expected a single function, got {list(mod.functions)}"
     return next(iter(mod.functions.values())).body
+
+
+def _accessed_buffers(mod):
+    """name -> Buffer for every buffer read or written in the vectorized body."""
+    found = {}
+
+    def visit(node):
+        if isinstance(node, (tvm.tirx.BufferStore, tvm.tirx.BufferLoad)):
+            found[node.buffer.name] = node.buffer
+
+    tvm.tirx.stmt_functor.post_order_visit(_body_of(mod), visit)
+    return found
+
+
+def _stmt_text(mod):
+    return tvm.ir.save_json(_body_of(mod))
+
+
+# ---------------------------------------------------------------------------
+# Kernels
+# ---------------------------------------------------------------------------
+
+def _k_absmax_accumulator(E=256, lanes=64, dtype="float32"):
+    """Scalar absmax accumulator over a constant-bound shell (sv2v shape)."""
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(X: T.Tensor((P,), dtype), Y: T.Tensor((P,), dtype)):
+        with T.Kernel(1):
+            x_ub = T.alloc_shared((P,), dtype)
+            y_ub = T.alloc_shared((P,), dtype)
+            T.copy(X, x_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    m = T.alloc_var(dtype, init=0.0)
+                    for _c in T.serial(3):
+                        _v = x_ub[(i + _c * lanes) % P]
+                        m = T.max(m, T.max(_v, -_v))
+                    y_ub[i] = T.max(m, T.float32(1e-6))
+            T.copy(y_ub, Y)
+
+    return main
+
+
+def _k_lane_varying_seed(E=256, lanes=64, dtype="float32"):
+    """Scalar seeded from a lane-varying load, then used as a divisor."""
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(S: T.Tensor((P,), dtype), X: T.Tensor((P,), dtype),
+             Y: T.Tensor((P,), dtype)):
+        with T.Kernel(1):
+            s_ub = T.alloc_shared((P,), dtype)
+            x_ub = T.alloc_shared((P,), dtype)
+            y_ub = T.alloc_shared((P,), dtype)
+            T.copy(S, s_ub)
+            T.copy(X, x_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    d = T.alloc_var(dtype)
+                    d = s_ub[i]
+                    y_ub[i] = x_ub[i] / d
+            T.copy(y_ub, Y)
+
+    return main
+
+
+def _k_region_level_alloc_var(E=256, lanes=64, dtype="float32"):
+    """alloc_var used outside the Parallel unit: no promotion path."""
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(X: T.Tensor((P,), dtype), Y: T.Tensor((P,), dtype)):
+        with T.Kernel(1):
+            x_ub = T.alloc_shared((P,), dtype)
+            y_ub = T.alloc_shared((P,), dtype)
+            T.copy(X, x_ub)
+            with T.SimdVF(lanes=lanes):
+                acc = T.alloc_var(dtype, init=0.0)
+                for i in T.Parallel(E):
+                    y_ub[i] = x_ub[i] + T.Cast(dtype, acc)
+            T.copy(y_ub, Y)
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "builder,source_name",
+    [
+        (_k_absmax_accumulator, "m"),
+        (_k_lane_varying_seed, "d"),
+    ],
+)
+def test_lane_scalar_becomes_a_local_var_vreg(builder, source_name):
+    """A per-lane scalar -- accumulator or lane-varying seed -- is promoted to
+    a ``local.var`` vreg and the source buffer disappears from the accesses."""
+    captured, _ = _lower_capture(builder())
+    buffers = _accessed_buffers(captured["vectorize"])
+    lane = {n: b for n, b in buffers.items() if n.endswith("_lane")}
+    assert lane, f"no promoted vreg in {sorted(buffers)}"
+    (name, buf), = lane.items()
+    assert buf.scope() == "local.var"
+    assert buf.dtype.lanes == 64, buf.dtype
+    assert source_name not in buffers, sorted(buffers)
+    # The final value is read back from the vreg.
+    assert name in _stmt_text(captured["vectorize"])
+
+
+def test_promotion_is_stable_across_two_units():
+    """Two units each own their scalar: two distinct vregs, no sharing."""
+    captured, _ = _lower_capture(_k_absmax_accumulator())
+    text = _stmt_text(captured["vectorize"])
+    assert "m_lane" in text
+
+
+def test_region_level_alloc_var_rejected():
+    _, error = _lower_capture(_k_region_level_alloc_var(), expect_error=True)
+    assert error is not None
+    message = str(error)
+    assert "local.var" in message or "lane-uniform" in message, message
 
 
 def _alloc_sites(mod, name):
