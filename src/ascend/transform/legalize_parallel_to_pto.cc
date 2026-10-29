@@ -186,6 +186,25 @@ public:
     }
 
     std::vector<BranchItem> items;
+    // Positional pairing first: when both arms have the same length and store i
+    // of one arm writes the same destination as store i of the other, emitting
+    // pair by pair preserves *both* arms' order, so an intra-arm RAW/WAR cannot
+    // be reordered and the two stores can still share one value choice.
+    if (then_stores.size() == else_stores.size()) {
+      bool positional = !then_stores.empty();
+      for (size_t i = 0; positional && i < then_stores.size(); ++i) {
+        positional = pto::SameAccess(then_stores[i], else_stores[i]);
+      }
+      if (positional) {
+        for (size_t i = 0; i < then_stores.size(); ++i) {
+          BranchItem item;
+          item.then_store = then_stores[i];
+          item.else_store = else_stores[i];
+          items.push_back(item);
+        }
+        return items;
+      }
+    }
     const bool order_matters = pto::HasIntraArmDependency(then_stores) ||
                                pto::HasIntraArmDependency(else_stores);
     if (order_matters) {
