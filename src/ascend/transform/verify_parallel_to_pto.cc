@@ -43,6 +43,13 @@ namespace pto_analysis = ::tvm::tl::pto;
 
 namespace {
 
+// Shared tail of the runtime lane-uniform float dtype diagnostic (used
+// by both the unary and the binary op checks).
+static const char *kLaneUniformRuntimeMsg =
+    " is a runtime lane-uniform float computation; it stays "
+    "scalar inside SIMD_VF (no scalar float ALU by design). "
+    "Compute it outside the SimdVF region.";
+
 class VerifyParallelToPTOImpl : public StmtExprVisitor {
 public:
   void Verify(const PrimFunc &f) {
@@ -159,6 +166,8 @@ private:
       }
       StmtExprVisitor::VisitExpr_(op);
     }
+    bool inside_parallel_unit() const { return parallel_depth_ > 0; }
+
     void VisitExpr_(const CallNode *op) final {
       if (const auto *op_node = op->op.as<OpNode>()) {
         std::string name = op_node->name;
@@ -236,7 +245,15 @@ private:
         oss << ")";
         parent_->Fail("region", oss.str());
       }
+      // Track unit scope: a nested Parallel (2D unit) stays inside the unit.
+      const bool parallel = op->kind == ForKind::kParallel;
+      if (parallel) {
+        ++parallel_depth_;
+      }
       StmtExprVisitor::VisitStmt_(op);
+      if (parallel) {
+        --parallel_depth_;
+      }
     }
 
   private:
@@ -260,8 +277,25 @@ private:
             << buffer->name << "` has scope global); stage through UB first";
         parent_->Fail("memory access", oss.str());
       }
-      // Only UB accesses are currently supported. local /
-      // local.fragment / shared.l1 (L1) and other scopes are rejected.
+      // Per-lane scalar register: `T.alloc_var` lowers to a single-element
+      // `local.var` buffer. Inside a converting unit it is a private register
+      // per lane, and VectorizeParallelToPTO promotes the whole-buffer form to
+      // a `local.var` vector (vreg), so no UB scope / address classification
+      // applies. Region-level accesses have no promotion path and stay
+      // rejected.
+      if (scope == "local.var") {
+        if (!pto_analysis::IsLaneScalarBuffer(buffer) ||
+            !inside_parallel_unit()) {
+          std::ostringstream oss;
+          oss << "buffer `" << buffer->name << "` has scope `local.var`; only "
+                 "a single-element local.var inside a converting T.Parallel "
+                 "unit (T.alloc_var) is supported";
+          parent_->Fail("memory access", oss.str());
+        }
+        return;
+      }
+      // The remaining scopes only support UB accesses. local /
+      // shared.l1 (L1) and other scopes are rejected.
       if (scope != "shared" && scope != "shared.dyn") {
         std::ostringstream oss;
         oss << "buffer `" << buffer->name << "` has scope `" << scope
@@ -278,6 +312,7 @@ private:
       }
     }
     VerifyParallelToPTOImpl *parent_;
+    int parallel_depth_ = 0;
   };
 
   // ------------------------------------------------------------------
@@ -361,51 +396,87 @@ private:
     // not a whitelist. Reject those kinds explicitly.
 
     void VisitStmt_(const ForNode *op) final {
-      // No loops of any kind inside T.Parallel.
-      parent_->Fail("loop structure",
-                    "loops (serial/pipelined/while) inside T.Parallel are "
-                    "not yet supported");
+      // Loop-shell admission: a T.serial loop inside T.Parallel is admitted
+      // as a preserved shell (Vectorize copies the loop through and converts
+      // only its body). The induction variable is lane-uniform by
+      // construction, so it is registered as a uniform definition while the
+      // body runs through the same unit-level checks. Neither the shell nor
+      // its body depends on the trip count being known at compile time: the
+      // bound is copied through verbatim, so a runtime extent is admitted as
+      // well. A constant extent must still be positive; a runtime extent is
+      // the program's contract (the same assumption any `for` carries).
+      // Non-serial kinds stay rejected at this stage.
+      if (op->kind != ForKind::kSerial) {
+        parent_->Fail("loop structure",
+                      "only T.serial loops inside T.Parallel are supported "
+                      "at this stage (pipelined and while loops are "
+                      "rejected)");
+      }
+      const auto *extent_imm = op->extent.as<IntImmNode>();
+      if (extent_imm != nullptr && extent_imm->value <= 0) {
+        parent_->Fail("loop structure",
+                      "T.serial inside T.Parallel must have a positive "
+                      "extent");
+      }
+      if (op->step.defined()) {
+        const auto *step_imm = op->step.value().as<IntImmNode>();
+        if (step_imm == nullptr || step_imm->value != 1) {
+          parent_->Fail("loop structure",
+                        "T.serial inside T.Parallel must have step 1 at "
+                        "this stage");
+        }
+      }
+      defined_loop_vars_.insert(op->loop_var.get());
+      Map<Var, Integer> saved_classified = classified_;
+      classified_.Set(op->loop_var, Integer(0));
+      StmtExprVisitor::VisitStmt_(op);
+      classified_ = std::move(saved_classified);
+      defined_loop_vars_.erase(op->loop_var.get());
     }
-    void VisitStmt_(const IfThenElseNode *) final {
-      parent_->Fail("loop structure",
-                    "conditional branches inside T.Parallel are not yet "
-                    "supported");
+    void VisitStmt_(const IfThenElseNode *op) final {
+      // The restricted lane-varying conditional forms are admitted.
+      // LegalizeParallelToPTO rewrites them into the Select form
+      // before VectorizeParallelToPTO runs, so the admitted shape is exactly
+      // what Legalize can rewrite: buffer stores, no-ops, a SeqStmt of those,
+      // or a nested conditional whose destinations are lane-varying
+      // (lane-uniform stores stay rejected by the store check).
+      CheckComputeValue(op->condition, "if condition");
+      CheckConditionalBranch(op->then_case, "then");
+      if (op->else_case.defined()) {
+        CheckConditionalBranch(op->else_case.value(), "else");
+      }
     }
     void VisitStmt_(const WhileNode *) final {
       parent_->Fail("loop structure",
                     "while loops inside T.Parallel are not yet supported");
     }
-    void VisitStmt_(const SBlockNode *) final {
+    // The unit-level statement rejections share one message shape:
+    // "<subject> inside T.Parallel <is/are> not yet supported". The verb
+    // stays per call site so the existing diagnostics are preserved
+    // verbatim.
+    void RejectInsideUnit(const std::string &subject, const char *verb) {
       parent_->Fail("loop structure",
-                    "nested blocks inside T.Parallel are not yet "
-                    "supported");
+                    subject + " inside T.Parallel " + verb +
+                        " not yet supported");
+    }
+    void VisitStmt_(const SBlockNode *) final {
+      RejectInsideUnit("nested blocks", "are");
     }
     void VisitStmt_(const SBlockRealizeNode *) final {
-      parent_->Fail("loop structure",
-                    "nested blocks inside T.Parallel are not yet "
-                    "supported");
+      RejectInsideUnit("nested blocks", "are");
     }
     void VisitStmt_(const AllocBufferNode *) final {
-      parent_->Fail("loop structure",
-                    "buffer allocation inside T.Parallel is not yet "
-                    "supported");
+      RejectInsideUnit("buffer allocation", "is");
     }
     void VisitStmt_(const DeclBufferNode *) final {
-      parent_->Fail("loop structure",
-                    "buffer declaration inside T.Parallel is not yet "
-                    "supported");
+      RejectInsideUnit("buffer declaration", "is");
     }
     void VisitStmtDefault_(const ffi::Object *op) final {
       // Backstop for kinds the base does not dispatch.
-      std::ostringstream oss;
-      oss << "statement `" << op->GetTypeKey()
-          << "` inside T.Parallel is not yet supported";
-      parent_->Fail("loop structure", oss.str());
+      RejectInsideUnit("statement `" + op->GetTypeKey() + "`", "is");
     }
     void VisitStmt_(const AssertStmtNode *) final {
-      parent_->Fail("loop structure",
-                    "assert statements inside T.Parallel are not yet "
-                    "supported");
+      RejectInsideUnit("assert statements", "are");
     }
     void VisitStmt_(const BindNode *op) final {
       // Self/forward reference is rejected before registering.
@@ -479,6 +550,36 @@ private:
       return ctx;
     }
 
+    // Statements allowed inside a conditional branch under T.Parallel: the
+    // branch must stay rewritable as Select arm(s) — buffer stores, no-ops,
+    // SeqStmt of those, or a nested conditional (which recurses through the
+    // same checks).
+    void CheckConditionalBranch(const Stmt &stmt, const char *which) {
+      if (const auto *seq = stmt.as<SeqStmtNode>()) {
+        for (const Stmt &sub : seq->seq) {
+          CheckConditionalBranch(sub, which);
+        }
+        return;
+      }
+      if (const auto *nested = stmt.as<IfThenElseNode>()) {
+        VisitStmt_(nested);
+        return;
+      }
+      if (const auto *store = stmt.as<BufferStoreNode>()) {
+        VisitStmt_(store);
+        return;
+      }
+      if (pto_analysis::IsNoOpStmt(stmt)) {
+        return;
+      }
+      std::ostringstream oss;
+      oss << "If " << which
+          << "-branch under T.Parallel must be buffer stores, nested "
+             "conditionals or no-ops (the Select-rewritable shape); other "
+             "statements are not supported at this stage";
+      parent_->Fail("loop structure", oss.str());
+    }
+
     // The unified reference check. One StmtExprVisitor
     // covers every expression position — values, load/store indices and
     // metadata node/value — relying on the base class's complete descent
@@ -523,6 +624,11 @@ private:
           return;
         }
         if (parent_->external_defs_.count(v) != 0) {
+          return;
+        }
+        if (parent_->defined_loop_vars_.count(v) != 0) {
+          // Induction variable of an admitted serial shell; it is
+          // lane-uniform and in lexical scope inside the shell body.
           return;
         }
         std::ostringstream oss;
@@ -574,6 +680,53 @@ private:
       return use;
     }
 
+    /*! The two-operand value nodes, one shared recursion shape: both
+     * operands run through the same check, and the arithmetic kinds
+     * additionally apply the VMI operation matrix. `vmi_op` carries the
+     * kind's VMI op for Add/Sub/Mul/Div (vadd/vsub/vmul/vdiv) and is
+     * nullptr for the relational / boolean kinds that Legalize and
+     * Vectorize express as vcmp+vsel / vand|vor|vnot (recursion only).
+     * The unary Not and the three-operand Select are handled separately
+     * by the caller. */
+    struct BinaryOperands {
+      const char *vmi_op = nullptr;
+      DataType dtype;
+      PrimExpr a;
+      PrimExpr b;
+    };
+
+    static std::optional<BinaryOperands> GetBinaryOperands(
+        const PrimExpr &e) {
+      if (const auto *n = e.as<AddNode>()) {
+        return BinaryOperands{"vadd", n->dtype, n->a, n->b};
+      }
+      if (const auto *n = e.as<SubNode>()) {
+        return BinaryOperands{"vsub", n->dtype, n->a, n->b};
+      }
+      if (const auto *n = e.as<MulNode>()) {
+        return BinaryOperands{"vmul", n->dtype, n->a, n->b};
+      }
+      if (const auto *n = e.as<DivNode>()) {
+        return BinaryOperands{"vdiv", n->dtype, n->a, n->b};
+      }
+      // The six relational kinds come from the shared table, so this
+      // whitelist cannot drift from the vectorizer's dispatch. A relational
+      // node has no VMI name of its own: the vectorizer picks vcmp/vcmps from
+      // the operands' lane shapes.
+      PrimExpr rel_a;
+      PrimExpr rel_b;
+      if (pto::MatchRelational(e, &rel_a, &rel_b) != nullptr) {
+        return BinaryOperands{nullptr, e.dtype(), rel_a, rel_b};
+      }
+      if (const auto *n = e.as<AndNode>()) {
+        return BinaryOperands{nullptr, n->dtype, n->a, n->b};
+      }
+      if (const auto *n = e.as<OrNode>()) {
+        return BinaryOperands{nullptr, n->dtype, n->a, n->b};
+      }
+      return std::nullopt;
+    }
+
     // Per-operation type rules driven by the operands'
     // lane classification. Uniform+Uniform stays scalar (only the base
     // dtype and PTO scalar-support are required); any Varying operand
@@ -583,39 +736,51 @@ private:
     // stays rejected.
     void CheckBinaryOpTypes(const PrimExpr &expr) {
       std::function<void(const PrimExpr &)> check = [&](const PrimExpr &e) {
-        if (const auto *add = e.as<AddNode>()) {
-          check(add->a);
-          check(add->b);
-          CheckOneOp("vadd", add->dtype, add->a, add->b);
-          return;
-        }
-        if (const auto *sub = e.as<SubNode>()) {
-          check(sub->a);
-          check(sub->b);
-          CheckOneOp("vsub", sub->dtype, sub->a, sub->b);
-          return;
-        }
-        if (const auto *mul = e.as<MulNode>()) {
-          check(mul->a);
-          check(mul->b);
-          CheckOneOp("vmul", mul->dtype, mul->a, mul->b);
-          return;
-        }
-        if (const auto *div = e.as<DivNode>()) {
-          check(div->a);
-          check(div->b);
-          CheckOneOp("vdiv", div->dtype, div->a, div->b);
+        if (auto bin = GetBinaryOperands(e)) {
+          check(bin->a);
+          check(bin->b);
+          if (bin->vmi_op != nullptr) {
+            CheckOneOp(bin->vmi_op, bin->dtype, bin->a, bin->b);
+          }
           return;
         }
         if (const auto *cast = e.as<CastNode>()) {
           check(cast->value);
           return;
         }
+        // Select, like the relational / boolean nodes of
+        // GetBinaryOperands, is expressed by Legalize and Vectorize as
+        // vcmp+vsel. Operands recurse through the same check, so lane
+        // classification and dtype rules still apply to whatever feeds
+        // them.
+        if (const auto *sel = e.as<SelectNode>()) {
+          check(sel->condition);
+          check(sel->true_value);
+          check(sel->false_value);
+          return;
+        }
+        if (const auto *notn = e.as<NotNode>()) {
+          check(notn->a);
+          return;
+        }
         if (const auto *call = e.as<CallNode>()) {
           if (auto call_op = call->op.as<Op>()) {
             const std::string &name = call_op.value()->name;
-            if (name == "tirx.fabs" || name == "tirx.exp" ||
-                name == "tirx.log" || name == "tirx.sqrt") {
+            // Boolean mask-combine calls (the shared
+            // tirx.bitwise_* / tir.And|Or|Not admission table) and the
+            // tl/tir.infinity() constant.
+            if (pto_analysis::MaskLogicVmiOpName(name) != nullptr) {
+              for (const auto &arg : call->args) {
+                check(arg);
+              }
+              return;
+            }
+            if (name == "tl.infinity" || name == "tir.infinity") {
+              return;
+            }
+            // The tirx.fabs/exp/log/sqrt unary math table; the original
+            // tirx op name stays the CheckOneUnaryOp key.
+            if (pto_analysis::VectorUnaryVmiOpName(name) != nullptr) {
               check(call->args[0]);
               CheckOneUnaryOp(name.c_str(), call->dtype, call->args[0]);
               return;
@@ -661,11 +826,7 @@ private:
       if (pto_analysis::IsFloatFamily(dtype) &&
           pto_analysis::ContainsRuntimeValue(arg)) {
         std::ostringstream oss;
-        oss << op_name << " on " << dtype
-            << " is a runtime lane-uniform float computation; it stays "
-               "scalar inside SIMD_VF (no scalar float ALU by design). "
-               "Compute it outside the SimdVF region, or wait for the "
-               "gather/scatter milestone for vector write-back";
+        oss << op_name << " on " << dtype << kLaneUniformRuntimeMsg;
         parent_->Fail("dtype", oss.str());
       }
     }
@@ -716,11 +877,7 @@ private:
           (pto_analysis::ContainsRuntimeValue(lhs) ||
            pto_analysis::ContainsRuntimeValue(rhs))) {
         std::ostringstream oss;
-        oss << op_name << " on " << dtype
-            << " is a runtime lane-uniform float computation; it stays "
-               "scalar inside SIMD_VF (no scalar float ALU by design). "
-               "Compute it outside the SimdVF region, or wait for the "
-               "gather/scatter milestone for vector write-back";
+        oss << op_name << " on " << dtype << kLaneUniformRuntimeMsg;
         parent_->Fail("dtype", oss.str());
       }
       // Pure scalar op: base dtype legality only (int8 scalar mul is
@@ -793,24 +950,32 @@ private:
 
     void VerifyAccess(const Buffer &buffer, const Array<PrimExpr> &indices,
                       bool is_write, const Optional<PrimExpr> &predicate) {
-      // Predicated accesses have no supported lowering; only
-      // absent or provably-true predicates are accepted.
+      // A predicated access has no lowering: the vectorizer writes whole
+      // chunks, so a predicate could only be honoured by a store mask or a
+      // destination read-back. Reject the field itself -- a provably-true
+      // predicate used to be accepted and then silently dropped, which turned
+      // a conditional write into an unconditional one.
       if (predicate.defined()) {
-        // The predicate is an expression position too — a
-        // provably-true predicate (e.g. `True || ghost > 0`) could hide
-        // undefined vars that Vectorize then silently drops with the
-        // predicate. Run the same reference check as every other
-        // position before the true-check.
         CheckDefinedVars(predicate.value());
-        arith::Analyzer probe;
-        PrimExpr simplified = probe.Simplify(predicate.value());
-        if (!is_one(simplified)) {
+        std::ostringstream oss;
+        oss << "buffer `" << buffer->name
+            << "` carries an access predicate; predicated load/store is not "
+               "supported, remove the predicate from the source";
+        parent_->Fail("memory access", oss.str());
+      }
+      // Per-lane scalar (T.alloc_var): a single-element local.var buffer that
+      // VectorizeParallelToPTO promotes to a local.var vector (vreg). It is a
+      // private register per lane, so no lane-address pattern applies and the
+      // lane-uniform-store rule (aimed at UB writes) must not reject it.
+      if (buffer.scope() == "local.var") {
+        if (!pto_analysis::IsLaneScalarBuffer(buffer)) {
           std::ostringstream oss;
           oss << "buffer `" << buffer->name
-              << "` has a non-trivial access predicate; predicated "
-                 "load/store is not yet supported";
+              << "` has scope `local.var` with a non-single-element shape; "
+                 "only T.alloc_var scalars are supported";
           parent_->Fail("memory access", oss.str());
         }
+        return;
       }
       try {
         auto access = pto_analysis::AnalyzeBufferAccess(
@@ -852,6 +1017,10 @@ private:
     // vars, thread_extent bindings, binds, allocations) that is in scope
     // where the unit appears.
     std::set<const VarNode *> external_defs_;
+    // Induction variables of admitted serial loop shells (constant-bound
+    // T.serial inside T.Parallel). In scope only while the shell's body
+    // is being visited; classified as lane-uniform.
+    std::set<const VarNode *> defined_loop_vars_;
   };
 
   // ------------------------------------------------------------------
@@ -938,7 +1107,7 @@ private:
   }
 
   void VisitStmt_(const SBlockNode *op) final {
-    if (op->name_hint != "SIMD_VF") {
+    if (op->name_hint != pto_analysis::kSimdVfBlockName) {
       std::set<const VarNode *> saved = defs_;
       for (const auto &iv : op->iter_vars) {
         defs_.insert(iv->var.get());
@@ -1010,6 +1179,38 @@ private:
   // ------------------------------------------------------------------
   // Per-unit checks (structure, ranges, layout)
   // ------------------------------------------------------------------
+  // The directly nested Parallel For of a 2D unit's body (the inner
+  // layer of the adjacent nest), or nullptr for a 1D unit.
+  static const ForNode *GetInnerParallel(const For &unit) {
+    const auto *body_for = unit->body.as<ForNode>();
+    if (body_for != nullptr && body_for->kind == ForKind::kParallel) {
+      return body_for;
+    }
+    return nullptr;
+  }
+
+  // The min/step half of the loop-header contract, shared by the unit
+  // loop and its inner probe; \p prefix ("" / "inner ") keeps the
+  // diagnostics byte-identical. The extent check is deliberately not
+  // shared — the unit folds both failure modes into one message while
+  // the inner probe reports them separately — and only the inner loop
+  // variable must be int32; both stay at their call sites.
+  void CheckLoopHeader(const ForNode *loop, const char *prefix) {
+    if (!is_zero(loop->min)) {
+      std::ostringstream oss;
+      oss << prefix << "loop min must be 0, got " << loop->min;
+      Fail("loop range", oss.str());
+    }
+    // The lane layout assumes unit stride; a non-unit step changes the
+    // set of iteration points and has no supported lowering.
+    if (loop->step.defined() &&
+        !is_one(analyzer_.Simplify(loop->step.value()))) {
+      std::ostringstream oss;
+      oss << prefix << "T.Parallel step must be 1, got " << loop->step;
+      Fail("loop range", oss.str());
+    }
+  }
+
   void VerifyUnit(const For &unit, int64_t lanes, size_t unit_index) {
     // Full per-unit context for diagnostics.
     {
@@ -1019,20 +1220,7 @@ private:
           << unit->extent << ", lanes " << lanes << ")";
       unit_context_ = oss.str();
     }
-    if (!is_zero(unit->min)) {
-      std::ostringstream oss;
-      oss << "loop min must be 0, got " << unit->min;
-      Fail("loop range", oss.str());
-    }
-    // The lane layout assumes unit stride; a non-unit step
-    // changes the set of iteration points and has no supported
-    // lowering.
-    if (unit->step.defined() &&
-        !is_one(analyzer_.Simplify(unit->step.value()))) {
-      std::ostringstream oss;
-      oss << "T.Parallel step must be 1, got " << unit->step;
-      Fail("loop range", oss.str());
-    }
+    CheckLoopHeader(unit.get(), "");
     const int64_t *extent = as_const_int(unit->extent);
     if (extent == nullptr || *extent <= 0) {
       std::ostringstream oss;
@@ -1049,41 +1237,26 @@ private:
     // *before* the inversion helper (which relies on constant extents) so
     // an illegal inner loop gets its loop-range diagnostic instead of a
     // raw assertion.
-    const ForNode *inner_probe = nullptr;
-    if (const auto *body_for = unit->body.as<ForNode>()) {
-      if (body_for->kind == ForKind::kParallel) {
-        inner_probe = body_for;
-      }
-    }
-    if (inner_probe != nullptr) {
-      if (!is_zero(inner_probe->min)) {
-        std::ostringstream oss;
-        oss << "inner loop min must be 0, got " << inner_probe->min;
-        Fail("loop range", oss.str());
-      }
-      if (inner_probe->step.defined() &&
-          !is_one(analyzer_.Simplify(inner_probe->step.value()))) {
-        std::ostringstream oss;
-        oss << "inner T.Parallel step must be 1, got " << inner_probe->step;
-        Fail("loop range", oss.str());
-      }
-      if (as_const_int(inner_probe->extent) == nullptr) {
+    const ForNode *inner = GetInnerParallel(unit);
+    if (inner != nullptr) {
+      CheckLoopHeader(inner, "inner ");
+      if (as_const_int(inner->extent) == nullptr) {
         std::ostringstream oss;
         oss << "inner loop extent must be a compile-time constant, got "
-            << inner_probe->extent;
+            << inner->extent;
         Fail("loop range", oss.str());
-      } else if (*as_const_int(inner_probe->extent) <= 0) {
+      } else if (*as_const_int(inner->extent) <= 0) {
         std::ostringstream oss;
         oss << "inner loop extent must be a positive compile-time constant, "
                "got "
-            << inner_probe->extent;
+            << inner->extent;
         Fail("loop range", oss.str());
       }
-      if (inner_probe->loop_var.dtype() != DataType::Int(32)) {
+      if (inner->loop_var.dtype() != DataType::Int(32)) {
         std::ostringstream oss;
         oss << "inner loop variable must be int32 (the dtype "
                "LayoutInference produces), got "
-            << inner_probe->loop_var.dtype();
+            << inner->loop_var.dtype();
         Fail("loop range", oss.str());
       }
     }
@@ -1109,12 +1282,6 @@ private:
     // inner loop's range contract was already enforced by the
     // pre-inversion block above (min/step/extent/dtype), so no per-loop
     // check is repeated here.
-    const ForNode *inner = nullptr;
-    if (const auto *body_for = unit->body.as<ForNode>()) {
-      if (body_for->kind == ForKind::kParallel) {
-        inner = body_for;
-      }
-    }
 
     // The vectorized coordinate is the selected dimension of a 2D mapping
     // and the single loop var in 1D (the other 2D coordinate stays a
@@ -1274,8 +1441,13 @@ private:
         CheckRegionExprDefined(idx, "region-level store index");
       }
       if (store->predicate.defined()) {
-        CheckRegionExprDefined(store->predicate.value(),
-                               "region-level store predicate");
+        // Same contract as inside a unit: a predicated access has no lowering.
+        SetRegionContext();
+        std::ostringstream oss;
+        oss << "region-level store into buffer `" << store->buffer->name
+            << "` carries an access predicate; predicated store is not "
+               "supported, remove the predicate from the source";
+        Fail("memory access", oss.str());
       }
       return;
     }

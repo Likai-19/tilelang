@@ -198,6 +198,17 @@ bool IsSupportedAddressExpr(const PrimExpr &expr) {
   return checker.supported;
 }
 
+bool IsLaneScalarBuffer(const Buffer &buffer) {
+  if (buffer.scope() != "local.var") {
+    return false;
+  }
+  if (buffer->shape.size() != 1) {
+    return false;
+  }
+  const auto *extent = buffer->shape[0].as<IntImmNode>();
+  return extent != nullptr && extent->value == 1;
+}
+
 } // namespace pto
 } // namespace tl
 } // namespace tvm

@@ -72,6 +72,7 @@ deeplearning_operators/deepseek_mla
 compiler_internals/letstmt_inline
 compiler_internals/inject_fence_proxy
 compiler_internals/tensor_checks
+compiler_internals/pto_vmi_dist_mode_migration
 compiler_internals/metal_tilelang_development
 :::
 

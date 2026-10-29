@@ -258,6 +258,16 @@ struct VectorCastPlan {
 
 using CastPlan = std::variant<ScalarCastPlan, VectorCastPlan>;
 
+// Maps a frontend boolean-combine op name (tirx./tir.bitwise_{and,or,not}
+// or tir.{And,Or,Not}) to the PTODSL bitwise vector op whose mask register
+// overload implements the boolean combine ("vand"/"vor"/"vnot"); returns
+// nullptr for any other name.
+const char *MaskLogicVmiOpName(const std::string &tir_op_name);
+
+// The tirx.* unary math ops with a VMI mapping (fabs/exp/log/sqrt):
+// returns the VMI op name, or nullptr for any other name.
+const char *VectorUnaryVmiOpName(const std::string &tirx_op_name);
+
 /*! Operation-level type support for the vector arithmetic emitted
  * here. VMI vmul only supports i16/i32/f16/bf16/f32
  * elements; vadd/vsub additionally allow i8; vdiv admits f16/f32 only.
@@ -378,6 +388,96 @@ struct PtoRegionScan {
  * AttrStmt wrapper) for parallel units. One implementation shared by
  * Verify and Vectorize. */
 PtoRegionScan ScanPtoRegion(const Stmt &region);
+
+/*! A statement that carries no work: an Evaluate of an IntImm constant
+ * (e.g. a store simplified away into a constant), an empty SeqStmt, or a
+ * SeqStmt whose every element is itself a no-op. The shared contract for
+ * the "no operation" arm of a conditional branch under T.Parallel — the
+ * shape Legalize rewrites as "no else" (the masked-update Select form) and
+ * Verify admits as Select-rewritable. */
+bool IsNoOpStmt(const Stmt &stmt);
+
+// The SBlock name_hint marking a SimdVF vecscope region.
+inline constexpr const char *kSimdVfBlockName = "SIMD_VF";
+
+/*!
+ * \brief True when any of \p indices contains \p var (used by the lane-varying
+ * store check).
+ */
+bool IndicesDependOnVar(const Array<PrimExpr> &indices, const Var &var);
+
+/*!
+ * \brief Error text for a lane-uniform store target, or an empty string when
+ * the indices depend on the T.Parallel loop variable (the supported case).
+ */
+std::string LaneVaryingStoreError(const Buffer &buffer,
+                                  const Array<PrimExpr> &indices,
+                                  const Var &var);
+
+/*!
+ * \brief True when an arm's stores depend on their own write order: a later
+ * store reads what an earlier store of the arm wrote (RAW), or overwrites what
+ * an earlier one read (WAR).
+ */
+bool HasIntraArmDependency(const std::vector<const BufferStoreNode *> &stores);
+
+/*!
+ * \brief One relational node kind: how to take its operands, its PTODSL compare
+ * name, and how to rebuild it when both operands stay scalar.
+ *
+ * The (node kind, compare name, scalar semantics) triple lives here once so a
+ * new relational kind cannot drift between the verifier's whitelist, the
+ * vectorizer's dispatch and its lane-uniform fold.
+ */
+struct RelationalKind {
+  /*! \brief Fill a/b (when non-null) with the node's operands, in the node's
+   *  own (a, b) order, and report whether \p e is of this kind. */
+  bool (*take)(const PrimExpr &e, PrimExpr *a, PrimExpr *b);
+  /*! \brief PTODSL compare name: "eq" / "ne" / "lt" / "le" / "gt" / "ge". */
+  const char *cmp;
+  /*! \brief Rebuild the comparison for two lane-uniform operands. */
+  PrimExpr (*fold)(const PrimExpr &a, const PrimExpr &b);
+};
+
+/*!
+ * \brief Match \p e against the relational table: on a hit fill a/b (either may
+ * be null) with the node's operands and return the entry, else return nullptr.
+ */
+const RelationalKind *MatchRelational(const PrimExpr &e, PrimExpr *a,
+                                      PrimExpr *b);
+
+/*!
+ * \brief Look the table up by PTODSL compare name; nullptr when unknown.
+ */
+const RelationalKind *RelationalByName(const char *cmp);
+
+/*!
+ * \brief Same-destination test: same buffer data Var, same number of indices
+ * and every index structurally equal.
+ */
+bool SameAccess(const BufferStoreNode *a, const BufferStoreNode *b);
+
+/*!
+ * \brief Collect a flat list of stores from \p stmt (a store, a no-op, or a
+ * Seq of those). Returns false when the statement is any other shape.
+ */
+bool CollectStores(const Stmt &stmt,
+                   std::vector<const BufferStoreNode *> *out);
+
+/*!
+ * \brief True when \p call is one of the boolean mask-combine ops that
+ * vectorize lowers to the VMI op \p vmi_name ("vand" / "vor" / "vnot").
+ */
+bool IsMaskLogicCall(const CallNode *call, const char *vmi_name);
+
+/*!
+ * \brief Expand And/Or/Not in a Select condition into nested Selects:
+ *   select(a&b, t, f) => select(a, select(b, t, f), f)
+ *   select(a|b, t, f) => select(a, t, select(b, t, f))
+ *   select(~a, t, f)  => select(a, f, t)
+ */
+PrimExpr ExpandPredSelect(const PrimExpr &cond, const PrimExpr &tval,
+                          const PrimExpr &fval);
 
 } // namespace pto
 } // namespace tl

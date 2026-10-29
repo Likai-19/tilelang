@@ -150,6 +150,11 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
     Var q("probe_q", dt);
     PrimExpr sel_expr = q * IntImm(dt, lanes) + lane;
     for (const auto &access : collector.accesses) {
+      // Per-lane register (T.alloc_var): no lane-address classification; the
+      // whole-buffer form is promoted to a vreg by VectorizeParallelToPTO.
+      if (pto::IsLaneScalarBuffer(access.buffer)) {
+        continue;
+      }
       // Resolve Bind aliases per index with the shared resolver (cycle /
       // depth / loaded-value failure, 4096-node budget, error conversion)
       // against this access's program-point environment, then apply the
@@ -312,10 +317,13 @@ Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds) {
         << " for loop " << iv->var->name_hint;
     extents.push_back(*ext);
   }
-  ICHECK(loop_vars.size() == 1u || loop_vars.size() == 2u)
-      << "[PTO layout inference] supports a 1D T.Parallel or a two-layer "
-         "Parallel nest; got "
-      << loop_vars.size() << " layers";
+  if (loop_vars.size() != 1u && loop_vars.size() != 2u) {
+    // User-facing: an unsupported input shape, not an internal invariant.
+    LOG(FATAL) << "[PTO layout inference] a T.Parallel nest with "
+               << loop_vars.size()
+               << " layers is not supported; flatten it to 1D or split it "
+                  "into at most two tightly nested T.Parallel units";
+  }
 
   // 1D mapping: t = i, lane = i % L,
   // forward_index = [i // L]. A non-divisible extent E is padded to
