@@ -740,6 +740,33 @@ private:
       out->push_back(Evaluate(value));
       return;
     }
+    if (const auto *loop = body.as<ForNode>()) {
+      ICHECK(loop->kind == ForKind::kSerial)
+          << "[VectorizeParallelToPTO] internal error: non-serial loop "
+             "passed Verify";
+      // Loop-shell preservation: a serial loop admitted by Verify is copied
+      // through as a scalar shell; the body is converted with the same
+      // statement machinery. Binds defined inside stay scoped to the shell
+      // (same discipline as the AttrStmt branch). The bounds are copied through
+      // verbatim: Verify already rejected a negative constant extent and a
+      // non-positive or non-constant step, while a runtime extent is the
+      // program's own contract, so the source min/extent/step are kept (a zero
+      // trip count is an empty shell).
+      Array<Stmt> inner;
+      Map<Var, PrimExpr> saved_env = bind_env_;
+      Map<Var, Var> saved_map = value_map_;
+      ConvertBody(loop->body, &inner);
+      bind_env_ = std::move(saved_env);
+      value_map_ = std::move(saved_map);
+      // Keep the shell's step (and annotations): the step only changes the
+      // sequence of values the induction variable takes, and the shell stays
+      // lane-uniform either way.
+      out->push_back(For(loop->loop_var, loop->min, loop->extent,
+                         ForKind::kSerial, SeqStmt::Flatten(inner),
+                         std::nullopt, loop->annotations, loop->step,
+                         loop->span));
+      return;
+    }
     LOG(FATAL) << "[VectorizeParallelToPTO] internal error: unsupported "
                   "statement passed Verify: "
                << body->GetTypeKey();

@@ -382,10 +382,95 @@ private:
     // not a whitelist. Reject those kinds explicitly.
 
     void VisitStmt_(const ForNode *op) final {
-      // No loops of any kind inside T.Parallel.
-      parent_->Fail("loop structure",
-                    "loops (serial/pipelined/while) inside T.Parallel are "
-                    "not yet supported");
+      // Loop-shell admission: a T.serial loop inside T.Parallel is admitted
+      // as a preserved shell (Vectorize copies the loop through and converts
+      // only its body). The induction variable is lane-uniform by
+      // construction, so it is registered as a uniform definition while the
+      // body runs through the same unit-level checks. Neither the shell nor
+      // its body depends on the trip count being known at compile time: the
+      // bound is copied through verbatim, so a runtime extent is admitted as
+      // well. A constant extent must still be positive; a runtime extent is
+      // the program's contract (the same assumption any `for` carries).
+      // Non-serial kinds stay rejected at this stage.
+      if (op->kind != ForKind::kSerial) {
+        parent_->Fail("loop structure",
+                      "only T.serial loops inside T.Parallel are supported "
+                      "at this stage (pipelined and while loops are "
+                      "rejected)");
+      }
+      // A zero trip count is a legal empty shell, the same semantics a plain
+      // `for` has; only a negative constant is rejected.
+      const auto *extent_imm = op->extent.as<IntImmNode>();
+      if (extent_imm != nullptr && extent_imm->value < 0) {
+        parent_->Fail("loop structure",
+                      "T.serial inside T.Parallel must not have a negative "
+                      "extent");
+      }
+      if (op->step.defined()) {
+        // A non-unit step only changes which values the induction variable
+        // takes; the shell stays lane-uniform, so Vectorize copies the step
+        // through. Only a constant positive step is admitted (a runtime step
+        // would need its own analysis).
+        const auto *step_imm = op->step.value().as<IntImmNode>();
+        if (step_imm == nullptr || step_imm->value <= 0) {
+          parent_->Fail("loop structure",
+                        "T.serial inside T.Parallel must have a positive "
+                        "constant step at this stage");
+        }
+      }
+      // The shell is copied through verbatim, so a bound that references a
+      // lane-varying or unit-local variable would dangle after conversion.
+      {
+        bool uses_local_var = false;
+        const auto probe = [&uses_local_var, this](const PrimExpr &expr) {
+          PostOrderVisit(expr, [&uses_local_var, this](const ObjectRef &n) {
+            if (const auto *v = n.as<VarNode>()) {
+              // The lane variable disappears with the conversion, and a var
+              // bound inside the unit is re-bound by Vectorize; either way a
+              // copied bound would dangle.
+              if (v == loop_var_.get() ||
+                  bind_env_.count(GetRef<Var>(v))) {
+                uses_local_var = true;
+              }
+            }
+            // A bound read from a buffer (such as `T.serial(n[0])`) is out of
+            // scope: the shell is copied through verbatim, so the read would be
+            // re-evaluated against a buffer the conversion may have rewritten.
+            if (n->IsInstance<BufferLoadNode>()) {
+              uses_local_var = true;
+            }
+          });
+        };
+        probe(op->min);
+        probe(op->extent);
+        if (op->step.defined()) {
+          probe(op->step.value());
+        }
+        if (uses_local_var) {
+          parent_->Fail("loop structure",
+                        "T.serial shell bounds must not reference the "
+                        "parallel lane variable or a variable bound inside "
+                        "the unit (the shell is copied through after those "
+                        "variables are gone or re-bound)");
+        }
+      }
+      // Every other expression position runs the reference check; the shell
+      // bounds must too. Without it a variable that is never defined anywhere is
+      // copied through verbatim into the output (the shell is rebuilt from these
+      // very expressions).
+      CheckDefinedVars(op->min);
+      CheckDefinedVars(op->extent);
+      if (op->step.defined()) {
+        CheckDefinedVars(op->step.value());
+      }
+      defined_loop_vars_.insert(op->loop_var.get());
+      Map<Var, PrimExpr> saved_env = bind_env_;
+      Map<Var, Integer> saved_classified = classified_;
+      classified_.Set(op->loop_var, Integer(0));
+      StmtExprVisitor::VisitStmt_(op);
+      bind_env_ = std::move(saved_env);
+      classified_ = std::move(saved_classified);
+      defined_loop_vars_.erase(op->loop_var.get());
     }
     void VisitStmt_(const IfThenElseNode *op) final {
       // The restricted lane-varying conditional forms are admitted.
@@ -504,6 +589,12 @@ private:
       ctx.analyzer = &analyzer_;
       ctx.bind_env = bind_env_;
       ctx.external_defs = external_defs_;
+    // An admitted serial induction variable is lane-uniform and lexically
+    // defined inside its shell, so the analysis must not treat it as an
+    // unknown variable.
+    for (const VarNode *v : defined_loop_vars_) {
+      ctx.external_defs.insert(v);
+    }
       ctx.classified = classified_;
       return ctx;
     }
@@ -605,6 +696,11 @@ private:
           return;
         }
         if (parent_->external_defs_.count(v) != 0) {
+          return;
+        }
+        if (parent_->defined_loop_vars_.count(v) != 0) {
+          // Induction variable of an admitted serial shell; it is
+          // lane-uniform and in lexical scope inside the shell body.
           return;
         }
         std::ostringstream oss;
@@ -1037,6 +1133,10 @@ private:
     // vars, thread_extent bindings, binds, allocations) that is in scope
     // where the unit appears.
     std::set<const VarNode *> external_defs_;
+    // Induction variables of admitted serial loop shells (constant-bound
+    // T.serial inside T.Parallel). In scope only while the shell's body
+    // is being visited; classified as lane-uniform.
+    std::set<const VarNode *> defined_loop_vars_;
   };
 
   // ------------------------------------------------------------------
