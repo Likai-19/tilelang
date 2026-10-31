@@ -19,6 +19,7 @@
 #include <tvm/tirx/stmt.h>
 
 #include <optional>
+#include <map>
 #include <set>
 #include <string>
 #include <variant>
@@ -176,6 +177,19 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
                                  arith::Analyzer *analyzer,
                                  const Map<Var, PrimExpr> &bind_env = {});
 
+/*! The destination form a conditional store must satisfy to be pairable
+ * into one value choice: leading indices compile-time constants, and the
+ * last index equal to the vectorized variable up to a constant offset.
+ * The offset may be negative -- the shifted window is the caller's
+ * allocation contract, exactly as for unconditional stores, and the
+ * 32-byte alignment of the shifted window is
+ * VerifyPTOCodegenLegality's contract, not this form's.
+ * Continuity itself is AnalyzeBufferAccess's proof (VerifyAccess runs it
+ * before the pairing rule); this form additionally keeps the pairing and
+ * the pad read-back well-defined. \p vector_var is the layout-selected
+ * vectorized variable of the unit. */
+bool IsPairableDestination(const Array<PrimExpr> &indices, const Var &vector_var);
+
 /*! Check whether a dtype is supported by the unified element
  * addressing convention: the buffer element dtype itself must not carry
  * vector lanes and must not be a packed sub-byte type (FP4 etc.).
@@ -257,6 +271,12 @@ struct VectorCastPlan {
 };
 
 using CastPlan = std::variant<ScalarCastPlan, VectorCastPlan>;
+
+// Maps a frontend boolean-combine op name (tirx./tir.bitwise_{and,or,not}
+// or tir.{And,Or,Not}) to the PTODSL bitwise vector op whose mask register
+// overload implements the boolean combine ("vand"/"vor"/"vnot"); returns
+// nullptr for any other name.
+const char *MaskLogicVmiOpName(const std::string &tir_op_name);
 
 // The tirx.* unary math ops with a VMI mapping (fabs/exp/log/sqrt):
 // returns the VMI op name, or nullptr for any other name.
@@ -383,6 +403,59 @@ struct PtoRegionScan {
  * Verify and Vectorize. */
 PtoRegionScan ScanPtoRegion(const Stmt &region);
 
+/*! A statement that carries no work: an Evaluate of an IntImm constant
+ * (e.g. a store simplified away into a constant), an empty SeqStmt, or a
+ * SeqStmt whose every element is itself a no-op. The shared contract for
+ * the "no operation" arm of a conditional branch under T.Parallel — the
+ * shape Legalize rewrites as "no else" (the masked-update Select form) and
+ * Verify admits as Select-rewritable. */
+bool IsNoOpStmt(const Stmt &stmt);
+
+/*! Collects the handle-valued `Bind` statements of a statement tree: each
+ * bound data pointer is mapped to the Var it is bound from (a buffer data
+ * Var), or to nullptr when the bound value is not a plain buffer data
+ * reference (an external pointer or a reinterpret). The map is the may-alias
+ * oracle shared by Verify (contract checks) and Legalize (store ordering):
+ * resolving a data pointer through it identifies the storage it denotes. */
+void CollectHandleBindAliases(
+    const Stmt &stmt, std::map<const VarNode *, const VarNode *> *out);
+
+/*!
+ * \brief One relational node kind: how to take its operands, its PTODSL compare
+ * name, and how to rebuild it when both operands stay scalar.
+ *
+ * The (node kind, compare name, scalar semantics) triple lives here once so a
+ * new relational kind cannot drift between the verifier's whitelist, the
+ * vectorizer's dispatch and its lane-uniform fold.
+ */
+struct RelationalKind {
+  /*! \brief Fill a/b (when non-null) with the node's operands, in the node's
+   *  own (a, b) order, and report whether \p e is of this kind. */
+  bool (*take)(const PrimExpr &e, PrimExpr *a, PrimExpr *b);
+  /*! \brief PTODSL compare name: "eq" / "ne" / "lt" / "le" / "gt" / "ge". */
+  const char *cmp;
+  /*! \brief Rebuild the comparison for two lane-uniform operands. */
+  PrimExpr (*fold)(const PrimExpr &a, const PrimExpr &b);
+};
+
+/*!
+ * \brief Match \p e against the relational table: on a hit fill a/b (either may
+ * be null) with the node's operands and return the entry, else return nullptr.
+ */
+const RelationalKind *MatchRelational(const PrimExpr &e, PrimExpr *a,
+                                      PrimExpr *b);
+
+/*!
+ * \brief Look the table up by PTODSL compare name; nullptr when unknown.
+ */
+const RelationalKind *RelationalByName(const char *cmp);
+
+/*!
+ * \brief Collect a flat list of stores from \p stmt (a store, a no-op, or a
+ * Seq of those). Returns false when the statement is any other shape.
+ */
+bool CollectStores(const Stmt &stmt,
+                   std::vector<const BufferStoreNode *> *out);
 } // namespace pto
 } // namespace tl
 } // namespace tvm

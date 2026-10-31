@@ -37,6 +37,7 @@
  * the masked store never writes past E.
  */
 
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -46,6 +47,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -156,6 +158,12 @@ private:
         "tl.vmi.vsqrt",
         "tl.vmi.vcvt",
         "tl.vmi.vinterpret_cast",
+        "tl.vmi.vcmp",
+        "tl.vmi.vcmps",
+        "tl.vmi.vsel",
+        "tl.vmi.vand",
+        "tl.vmi.vor",
+        "tl.vmi.vnot",
         "tl.access_ptr",
     };
     bool discardable = true;
@@ -545,10 +553,10 @@ private:
         For(kept_var, make_zero(kept_var->dtype),
             IntImm(kept_var->dtype, static_cast<int64_t>(kept_extent)),
             ForKind::kSerial, kept_body);
-    if (!has_tail) {
-      return kept_loop;
-    }
-    return SeqStmt::Flatten(AllocBuffer(remaining_buffer_), kept_loop);
+    Stmt result =
+        has_tail ? SeqStmt::Flatten(AllocBuffer(remaining_buffer_), kept_loop)
+                 : kept_loop;
+    return result;
   }
 
   // Substitute the analysis chunk var with the real loop var q (and keep
@@ -645,6 +653,10 @@ private:
       return;
     }
     if (const auto *store = body.as<BufferStoreNode>()) {
+      ICHECK(!store->predicate.defined())
+          << "[VectorizeParallelToPTO] internal error: predicated store passed "
+             "Verify; predicated stores must be rejected by "
+             "VerifyParallelToPTO";
       Array<Stmt> pre;
       PrimExpr value = ConvertExpr(store->value, &pre);
       auto access = pto_analysis::AnalyzeBufferAccess(
@@ -819,8 +831,28 @@ private:
       return ConvertBinary(div->a, div->b, "vdiv", pre);
     }
     if (const auto *call = expr.as<CallNode>()) {
-      // Hardware-backed unary math (fabs/exp/log/sqrt); the mapping lives in
-      // the shared utils table (see IsSupportedVectorUnaryOp for the matrix).
+      // Lane-mask boolean combinations come first. They are not unary
+      // math, so the strict unary-math mapping below must not see them
+      // (it only covers fabs/exp/log/sqrt). The frontend infinity()
+      // constant never arrives here: Legalize rewrites it to FloatImm.
+      std::string name;
+      if (const auto *op_node = call->op.as<OpNode>()) {
+        name = op_node->name;
+      }
+      if (const char *mask_op = pto_analysis::MaskLogicVmiOpName(name)) {
+        const bool is_not = std::string_view(mask_op) == "vnot";
+        ICHECK_EQ(call->args.size(), is_not ? 1 : 2);
+        if (is_not) {
+          // A scalar bool operand still needs the lane-mask form: vnot only
+          // accepts a VMI vector or mask argument.
+          PrimExpr a = AsLaneMask(ConvertExpr(call->args[0], pre), pre);
+          DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+          return EmitBind("mnot", Call(mask_ty, VmiOp("vnot"), {a}), pre);
+        }
+        return ConvertMaskLogic(call->args[0], call->args[1], mask_op, pre);
+      }
+      // Hardware-backed unary math (fabs/exp/log/sqrt); the dtype matrix
+      // mirrors the ISA documentation (see IsSupportedVectorUnaryOp).
       auto call_op = call->op.as<Op>();
       ICHECK(call_op.has_value())
           << "[VectorizeParallelToPTO] internal error: non-Op call passed "
@@ -912,9 +944,222 @@ private:
           << VectorDType(cast->dtype, lanes_);
       return current;
     }
+    if (const auto *andn = expr.as<AndNode>()) {
+      return ConvertMaskLogic(andn->a, andn->b, "vand", pre);
+    }
+    if (const auto *orn = expr.as<OrNode>()) {
+      return ConvertMaskLogic(orn->a, orn->b, "vor", pre);
+    }
+    if (const auto *notn = expr.as<NotNode>()) {
+      PrimExpr a = AsLaneMask(ConvertExpr(notn->a, pre), pre);
+      DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+      ICHECK(a.dtype().lanes() > 1)
+          << "[VectorizeParallelToPTO] vnot expects a lane mask";
+      return EmitBind("mnot", Call(mask_ty, VmiOp("vnot"), {a}), pre);
+    }
+    if (const auto *sel = expr.as<SelectNode>()) {
+
+      // A Select inside a Parallel body may test a lane-uniform condition
+      // (it depends only on the non-vectorized coordinates, e.g. a row
+      // index). PTODSL has no scalar predicate, so the
+      // compare is redone in the vector domain and the result is a mask
+      // that is either all-true or all-false; a bare scalar bool has no
+      // operands to compare, so it is widened and compared against zero.
+      PrimExpr cond;
+      if (RelationalCmpName(sel->condition) != nullptr) {
+        cond = ConvertRelationalToMask(sel->condition, pre);
+      } else {
+        // Convert first: a `Bind` var may be declared bool while it holds a
+        // lane mask, so the source dtype is not the deciding fact.
+        cond = ConvertExpr(sel->condition, pre);
+        if (IsScalarBool(cond)) {
+          cond = ScalarBoolToMask(cond, pre);
+        }
+      }
+      PrimExpr tval = ConvertExpr(sel->true_value, pre);
+      PrimExpr fval = ConvertExpr(sel->false_value, pre);
+      if (tval.dtype().lanes() == 1) {
+        tval = BroadcastToLanes("brc", tval, pre);
+      }
+      if (fval.dtype().lanes() == 1) {
+        fval = BroadcastToLanes("brc", fval, pre);
+      }
+      ICHECK(cond.dtype().lanes() > 1)
+          << "[VectorizeParallelToPTO] unsupported Select condition: expected "
+             "a lane mask, a lane-uniform comparison, or a scalar bool; got a "
+             "scalar `"
+          << sel->condition->GetTypeKey()
+          << "`. Rewrite the test as a comparison, or make it lane-varying.";
+      return EmitBind(
+          "vsel", Call(tval.dtype(), VmiOp("vsel"), {cond, tval, fval}), pre);
+    }
+    PrimExpr rel_a;
+    PrimExpr rel_b;
+    if (const pto::RelationalKind *rel =
+        pto::MatchRelational(expr, &rel_a, &rel_b)) {
+      return ConvertCompare(rel_a, rel_b, rel->cmp, pre);
+    }
     LOG(FATAL) << "[VectorizeParallelToPTO] internal error: unsupported "
                   "expression passed Verify: "
                << expr->GetTypeKey();
+  }
+
+  // Relational node -> PTODSL compare name, or nullptr for other nodes.
+  static const char *RelationalCmpName(const PrimExpr &e) {
+    const pto::RelationalKind *rel = pto::MatchRelational(e, nullptr, nullptr);
+    return rel != nullptr ? rel->cmp : nullptr;
+  }
+
+  // A bool with no lanes: a kernel parameter, a value read from a 1-element
+  // buffer, or the result of scalar-only arithmetic. PTODSL has no scalar
+  // predicate, so such a value cannot be lowered as-is.
+  static bool IsScalarBool(const PrimExpr &e) {
+    return e.dtype().is_bool() && e.dtype().lanes() == 1;
+  }
+
+  // Materialise a scalar bool as a lane mask that is either all-true or
+  // all-false, which is exactly the semantics of applying one scalar
+  // predicate to a whole vector. A VMI mask must be produced by
+  // pto.vmi.create_mask, so the flag becomes the active-lane count: all lanes
+  // when it is true, none when it is false. The mask therefore stays in the
+  // VMI domain from the start, with no vector operand and no carrier dtype.
+  PrimExpr ScalarBoolToMask(const PrimExpr &flag, Array<Stmt> *pre) {
+    DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+    PrimExpr active = EmitBind(
+        "pcount",
+        Select(flag, IntImm(DataType::Int(32), static_cast<int>(lanes_)),
+               IntImm(DataType::Int(32), 0)),
+        pre);
+    return EmitBind(
+        "cmask", Call(mask_ty, VmiOp("create_mask"), {active},
+                      {{"size",
+                        IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+        pre);
+  }
+
+  // Boolean EQ/NE over lane masks (a mask with a scalar bool included):
+  // vcmp/vcmps take vregs and the VMI element type set has no one-bit bool,
+  // so build the truth table out of vand/vor/vnot instead.
+  PrimExpr BoolCompareToMask(const PrimExpr &a, const PrimExpr &b,
+                             const char *cmp, Array<Stmt> *pre) {
+    DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+    PrimExpr am = AsLaneMask(a, pre);
+    PrimExpr bm = AsLaneMask(b, pre);
+    PrimExpr na = EmitBind("mnot", Call(mask_ty, VmiOp("vnot"), {am}), pre);
+    PrimExpr nb = EmitBind("mnot", Call(mask_ty, VmiOp("vnot"), {bm}), pre);
+    if (std::string(cmp) == "eq") {
+      PrimExpr keep =
+          EmitBind("vand", Call(mask_ty, VmiOp("vand"), {am, bm}), pre);
+      PrimExpr drop =
+          EmitBind("vand", Call(mask_ty, VmiOp("vand"), {na, nb}), pre);
+      return EmitBind("vor", Call(mask_ty, VmiOp("vor"), {keep, drop}), pre);
+    }
+    PrimExpr left =
+        EmitBind("vand", Call(mask_ty, VmiOp("vand"), {am, nb}), pre);
+    PrimExpr right =
+        EmitBind("vand", Call(mask_ty, VmiOp("vand"), {na, bm}), pre);
+    return EmitBind("vor", Call(mask_ty, VmiOp("vor"), {left, right}), pre);
+  }
+
+  // Turn a value that may still be a scalar bool into a lane mask. Anything
+  // that is already a lane vector (a real mask) passes through untouched.
+  PrimExpr AsLaneMask(const PrimExpr &value, Array<Stmt> *pre) {
+    if (value.dtype().lanes() > 1) {
+      return value;
+    }
+    if (IsScalarBool(value)) {
+      return ScalarBoolToMask(value, pre);
+    }
+    return value;
+  }
+
+  // Materialise a relational condition as a lane mask even when both sides
+  // are lane-uniform: broadcast the scalars and compare vector-wise. The
+  // resulting mask is all-true or all-false, which is exactly the semantics
+  // of a scalar predicate applied to a whole vector.
+  PrimExpr ConvertRelationalToMask(const PrimExpr &cond, Array<Stmt> *pre) {
+    PrimExpr lhs;
+    PrimExpr rhs;
+    const pto::RelationalKind *rel = pto::MatchRelational(cond, &lhs, &rhs);
+    ICHECK(rel != nullptr) << "not a relational condition";
+    const char *cmp = rel->cmp;
+    Array<Stmt> local;
+    PrimExpr a = ConvertExpr(lhs, &local);
+    PrimExpr b = ConvertExpr(rhs, &local);
+    for (const auto &s : local) {
+      pre->push_back(s);
+    }
+    if ((std::string(cmp) == "eq" || std::string(cmp) == "ne") &&
+        a.dtype().is_bool() && b.dtype().is_bool()) {
+      return BoolCompareToMask(a, b, cmp, pre);
+    }
+    if (a.dtype().lanes() == 1 && b.dtype().lanes() == 1) {
+      // Two lane-uniform operands: compare as plain scalars and lift the
+      // bool result. Broadcasting first would build a one-bit VMI vreg, and
+      // VMI only carries 8/16/32-bit elements.
+      const pto::RelationalKind *kind = pto::RelationalByName(cmp);
+      ICHECK(kind != nullptr)
+          << "[VectorizeParallelToPTO] internal error: unknown cmp " << cmp;
+      return ScalarBoolToMask(kind->fold(a, b), pre);
+    }
+    if (a.dtype().lanes() == 1) {
+      a = BroadcastToLanes("brc", a, pre);
+    }
+    if (b.dtype().lanes() == 1) {
+      b = BroadcastToLanes("brc", b, pre);
+    }
+    return EmitBind(
+        "vcmp",
+        Call(DataType::Bool(static_cast<int>(lanes_)), VmiOp("vcmp"),
+             {a, b, mask_var_, StringImm(cmp)}),
+        pre);
+  }
+
+  PrimExpr ConvertCompare(const PrimExpr &lhs, const PrimExpr &rhs,
+                          const char *cmp, Array<Stmt> *pre) {
+    PrimExpr a = ConvertExpr(lhs, pre);
+    PrimExpr b = ConvertExpr(rhs, pre);
+    // Boolean EQ/NE must use the mask truth table on every entry point, not
+    // only the Select-condition path.
+    if ((std::string(cmp) == "eq" || std::string(cmp) == "ne") &&
+        a.dtype().is_bool() && b.dtype().is_bool()) {
+      return BoolCompareToMask(a, b, cmp, pre);
+    }
+    bool a_vec = a.dtype().lanes() > 1;
+    bool b_vec = b.dtype().lanes() > 1;
+    DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+    if (!a_vec && !b_vec) {
+      // Lane-uniform compare: keep scalar relational (Select of scalars is
+      // rare inside Parallel; Verify still allows it). The scalar semantics
+      // come from the shared relational table, not a second copy of it.
+      const pto::RelationalKind *kind = pto::RelationalByName(cmp);
+      ICHECK(kind != nullptr)
+          << "[VectorizeParallelToPTO] internal error: unknown cmp " << cmp;
+      return kind->fold(a, b);
+    }
+    if (a_vec && !b_vec) {
+      return EmitBind(
+          "vcmps",
+          Call(mask_ty, VmiOp("vcmps"), {a, b, mask_var_, StringImm(cmp)}),
+          pre);
+    }
+    if (!a_vec && b_vec) {
+      a = BroadcastToLanes("brc", a, pre);
+    }
+    return EmitBind(
+        "vcmp", Call(mask_ty, VmiOp("vcmp"), {a, b, mask_var_, StringImm(cmp)}),
+        pre);
+  }
+
+  PrimExpr ConvertMaskLogic(const PrimExpr &lhs, const PrimExpr &rhs,
+                            const char *op_name, Array<Stmt> *pre) {
+    PrimExpr a = AsLaneMask(ConvertExpr(lhs, pre), pre);
+    PrimExpr b = AsLaneMask(ConvertExpr(rhs, pre), pre);
+    DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+    ICHECK(a.dtype().lanes() > 1 && b.dtype().lanes() > 1)
+        << "[VectorizeParallelToPTO] " << op_name
+        << " expects lane masks (a non-bool scalar operand has no lane mask)";
+    return EmitBind(op_name, Call(mask_ty, VmiOp(op_name), {a, b}), pre);
   }
 
   PrimExpr ConvertBinary(const PrimExpr &lhs, const PrimExpr &rhs,

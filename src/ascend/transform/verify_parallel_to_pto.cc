@@ -27,6 +27,7 @@
 #include <tvm/tirx/transform.h>
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -44,6 +45,9 @@ namespace pto_analysis = ::tvm::tl::pto;
 
 namespace {
 
+// Collects every handle-valued Bind (a data-pointer alias) of a statement
+// tree, so a converted region can reject uses of those aliases before any
+// scope check consumes the set.
 class VerifyParallelToPTOImpl : public StmtExprVisitor {
 public:
   void Verify(const PrimFunc &f) {
@@ -58,6 +62,7 @@ public:
       defs_.insert(kv.second->data.get());
     }
     CollectVolatileAllocs(f->body);
+    pto::CollectHandleBindAliases(f->body, &alias_src_);
     VisitStmt(f->body);
   }
 
@@ -242,6 +247,21 @@ private:
 
   private:
     void CheckScope(const Buffer &buffer) {
+      // A data pointer bound by a handle Bind (Bind(q, A.data); DeclBuffer(B,
+      // data=q)) is a second view of one storage. When the bound value
+      // resolves to a buffer data Var, the pairing/ordering analysis follows
+      // the alias, so the view is admitted; pointers with no resolvable
+      // buffer source (external pointers, reinterpret casts) stay rejected.
+      auto alias_it = parent_->alias_src_.find(buffer->data.get());
+      if (alias_it != parent_->alias_src_.end() &&
+          alias_it->second == nullptr) {
+        std::ostringstream oss;
+        oss << "buffer `" << buffer->name
+            << "` is declared over a bound data pointer whose source cannot "
+               "be resolved (an external pointer or a reinterpret cast), "
+               "which is not supported inside a converting region";
+        parent_->Fail("memory access", oss.str());
+      }
       // Volatile accesses are outside the supported contract
       // (an unused volatile read must not be DCE-deleted, and a live
       // uniform volatile read must not change its read count through the
@@ -261,8 +281,8 @@ private:
             << buffer->name << "` has scope global); stage through UB first";
         parent_->Fail("memory access", oss.str());
       }
-      // Only UB accesses are currently supported. local /
-      // local.fragment / shared.l1 (L1) and other scopes are rejected.
+      // The remaining scopes only support UB accesses. local /
+      // shared.l1 (L1) and other scopes are rejected.
       if (scope != "shared" && scope != "shared.dyn") {
         std::ostringstream oss;
         oss << "buffer `" << buffer->name << "` has scope `" << scope
@@ -367,10 +387,18 @@ private:
                     "loops (serial/pipelined/while) inside T.Parallel are "
                     "not yet supported");
     }
-    void VisitStmt_(const IfThenElseNode *) final {
-      parent_->Fail("loop structure",
-                    "conditional branches inside T.Parallel are not yet "
-                    "supported");
+    void VisitStmt_(const IfThenElseNode *op) final {
+      // The restricted lane-varying conditional forms are admitted.
+      // LegalizeParallelToPTO rewrites them into the Select form
+      // before VectorizeParallelToPTO runs, so the admitted shape is exactly
+      // what Legalize can rewrite: buffer stores, no-ops, a SeqStmt of those,
+      // or a nested conditional whose destinations are lane-varying
+      // (lane-uniform stores stay rejected by the store check).
+      CheckComputeValue(op->condition, "if condition");
+      CheckConditionalBranch(op->then_case, "then");
+      if (op->else_case.defined()) {
+        CheckConditionalBranch(op->else_case.value(), "else");
+      }
     }
     void VisitStmt_(const WhileNode *) final {
       parent_->Fail("loop structure",
@@ -480,6 +508,59 @@ private:
       return ctx;
     }
 
+    // Statements allowed inside a conditional branch under T.Parallel: the
+    // branch must stay rewritable as Select arm(s) — buffer stores, no-ops,
+    // SeqStmt of those, or a nested conditional (which recurses through the
+    // same checks).
+    void CheckConditionalBranch(const Stmt &stmt, const char *which) {
+      if (const auto *seq = stmt.as<SeqStmtNode>()) {
+        for (const Stmt &sub : seq->seq) {
+          CheckConditionalBranch(sub, which);
+        }
+        return;
+      }
+      if (const auto *nested = stmt.as<IfThenElseNode>()) {
+        VisitStmt_(nested);
+        return;
+      }
+      if (const auto *store = stmt.as<BufferStoreNode>()) {
+        // Run the access checks first: a lane-uniform destination keeps its
+        // own diagnostic, the pairing contract only covers per-lane stores.
+        VisitStmt_(store);
+        CheckPairedDestination(store);
+        return;
+      }
+      if (pto_analysis::IsNoOpStmt(stmt)) {
+        return;
+      }
+      std::ostringstream oss;
+      oss << "If " << which
+          << "-branch under T.Parallel must be buffer stores, nested "
+             "conditionals or no-ops (the Select-rewritable shape); other "
+             "statements are not supported at this stage";
+      parent_->Fail("loop structure", oss.str());
+    }
+
+    // A conditional store becomes one arm of a value choice, so
+    // LegalizeParallelToPTO pairs the two arms by destination address. That
+    // works for the per-lane form -- leading indices constant and the last
+    // index equal to the T.Parallel variable up to a constant offset -- so
+    // every other address shape is rejected here instead of failing late in
+    // Legalize with a misleading "both arms must write the same destination"
+    // error. The shifted window's 32-byte alignment is codegen legality's
+    // contract (VerifyPTOCodegenLegality), not this rule's.
+    void CheckPairedDestination(const BufferStoreNode *store) {
+      if (!pto_analysis::IsPairableDestination(store->indices, loop_var_)) {
+        std::ostringstream oss;
+        oss << "buffer `" << store->buffer->name
+            << "` is written inside a T.Parallel conditional with an address the "
+               "value-choice rewrite cannot pair: the leading indices must be "
+               "compile-time constants and the last index must be the "
+               "T.Parallel variable up to a constant offset";
+        parent_->Fail("memory access", oss.str());
+      }
+    }
+
     // The unified reference check. One StmtExprVisitor
     // covers every expression position — values, load/store indices and
     // metadata node/value — relying on the base class's complete descent
@@ -576,12 +657,15 @@ private:
     }
 
     /*! The two-operand value nodes, one shared recursion shape: both
-     * operands run through the same check, and each kind additionally
-     * applies the VMI operation matrix. `vmi_op` carries the kind's VMI op
-     * (vadd/vsub/vmul/vdiv). The unary Not and the three-operand Select are
-     * handled separately by the caller. */
+     * operands run through the same check, and the arithmetic kinds
+     * additionally apply the VMI operation matrix. `vmi_op` carries the
+     * kind's VMI op for Add/Sub/Mul/Div (vadd/vsub/vmul/vdiv) and is
+     * nullptr for the relational / boolean kinds that Legalize and
+     * Vectorize express as vcmp+vsel / vand|vor|vnot (recursion only).
+     * The unary Not and the three-operand Select are handled separately
+     * by the caller. */
     struct BinaryOperands {
-      const char *vmi_op;
+      const char *vmi_op = nullptr;
       DataType dtype;
       PrimExpr a;
       PrimExpr b;
@@ -601,6 +685,17 @@ private:
       if (const auto *n = e.as<DivNode>()) {
         return BinaryOperands{"vdiv", n->dtype, n->a, n->b};
       }
+      PrimExpr rel_a;
+      PrimExpr rel_b;
+      if (pto::MatchRelational(e, &rel_a, &rel_b) != nullptr) {
+        return BinaryOperands{nullptr, e.dtype(), rel_a, rel_b};
+      }
+      if (const auto *n = e.as<AndNode>()) {
+        return BinaryOperands{nullptr, n->dtype, n->a, n->b};
+      }
+      if (const auto *n = e.as<OrNode>()) {
+        return BinaryOperands{nullptr, n->dtype, n->a, n->b};
+      }
       return std::nullopt;
     }
 
@@ -613,21 +708,105 @@ private:
     // stays rejected.
     void CheckBinaryOpTypes(const PrimExpr &expr) {
       std::function<void(const PrimExpr &)> check = [&](const PrimExpr &e) {
+        // Ordered comparison of bool operands has no lane-mask lowering;
+        // only EQ/NE is expressed in the mask domain.
+        {
+          PrimExpr rel_a;
+          PrimExpr rel_b;
+          const pto::RelationalKind *rel =
+              pto::MatchRelational(e, &rel_a, &rel_b);
+          if (rel != nullptr && std::string(rel->cmp) != "eq" &&
+              std::string(rel->cmp) != "ne" && rel_a.dtype().is_bool() &&
+              rel_b.dtype().is_bool()) {
+            LOG(FATAL) << "[VerifyParallelToPTO] type: ordered comparison "
+                          "of bool operands has no lane-mask lowering";
+          }
+        }
         if (auto bin = GetBinaryOperands(e)) {
           check(bin->a);
           check(bin->b);
-          CheckOneOp(bin->vmi_op, bin->dtype, bin->a, bin->b);
+          if (bin->vmi_op != nullptr) {
+            CheckOneOp(bin->vmi_op, bin->dtype, bin->a, bin->b);
+          }
           return;
         }
         if (const auto *cast = e.as<CastNode>()) {
           check(cast->value);
           return;
         }
+        // Select, like the relational / boolean nodes of
+        // GetBinaryOperands, is expressed by Legalize and Vectorize as
+        // vcmp+vsel. Operands recurse through the same check, so lane
+        // classification and dtype rules still apply to whatever feeds
+        // them.
+        if (const auto *sel = e.as<SelectNode>()) {
+          if (sel->true_value.dtype().is_bool() ||
+              sel->false_value.dtype().is_bool()) {
+            LOG(FATAL) << "[VerifyParallelToPTO] type: a bool-valued "
+                          "Select has no vreg lowering";
+          }
+          check(sel->condition);
+          check(sel->true_value);
+          check(sel->false_value);
+          return;
+        }
+        if (const auto *notn = e.as<NotNode>()) {
+          check(notn->a);
+          return;
+        }
+        // Min/Max are rewritten to Select by Legalize, but their operands must
+        // still pass the same type rules here (e.g. the integer-bitwise ban).
+        if (const auto *minn = e.as<MinNode>()) {
+          // Legalize rewrites Min/Max to Select, which would introduce a
+          // bool-ordered comparison and a bool-valued Select after Verify.
+          if (minn->dtype.is_bool()) {
+            LOG(FATAL) << "[VerifyParallelToPTO] type: Min/Max of bool "
+                          "operands has no lane-mask lowering";
+          }
+          check(minn->a);
+          check(minn->b);
+          return;
+        }
+        if (const auto *maxn = e.as<MaxNode>()) {
+          // Same gate as Min: Legalize rewrites Max to Select, which would
+          // introduce a bool-ordered compare and a bool-valued Select.
+          if (maxn->dtype.is_bool()) {
+            LOG(FATAL) << "[VerifyParallelToPTO] type: Min/Max of bool "
+                          "operands has no lane-mask lowering";
+          }
+          check(maxn->a);
+          check(maxn->b);
+          return;
+        }
         if (const auto *call = e.as<CallNode>()) {
           if (auto call_op = call->op.as<Op>()) {
             const std::string &name = call_op.value()->name;
-            if (name == "tirx.fabs" || name == "tirx.exp" ||
-                name == "tirx.log" || name == "tirx.sqrt") {
+            // Boolean mask-combine calls (the shared
+            // tirx.bitwise_* / tir.And|Or|Not admission table) and the
+            // tl/tir.infinity() constant.
+            // A mask combine only has a lowering for bool (lane-mask) values.
+            if (pto_analysis::MaskLogicVmiOpName(name) != nullptr) {
+              // An integer bitwise call is rejected with a proper diagnostic;
+              // CheckBinaryOpTypes is static, so report via LOG(FATAL) (the
+              // same channel Fail uses).
+              if (!call->dtype.is_bool()) {
+                LOG(FATAL)
+                    << "[VerifyParallelToPTO] type: bitwise mask combine `"
+                    << name
+                    << "` requires bool (lane-mask) operands; an integer "
+                       "bitwise call has no lane-mask lowering";
+              }
+              for (const auto &arg : call->args) {
+                check(arg);
+              }
+              return;
+            }
+            if (name == "tl.infinity" || name == "tir.infinity") {
+              return;
+            }
+            // The tirx.fabs/exp/log/sqrt unary math table; the original
+            // tirx op name stays the CheckOneUnaryOp key.
+            if (pto_analysis::VectorUnaryVmiOpName(name) != nullptr) {
               check(call->args[0]);
               CheckOneUnaryOp(name.c_str(), call->dtype, call->args[0]);
               return;
@@ -805,24 +984,18 @@ private:
 
     void VerifyAccess(const Buffer &buffer, const Array<PrimExpr> &indices,
                       bool is_write, const Optional<PrimExpr> &predicate) {
-      // Predicated accesses have no supported lowering; only
-      // absent or provably-true predicates are accepted.
+      // A predicated access has no lowering: the vectorizer writes whole
+      // chunks, so a predicate could only be honoured by a store mask or a
+      // destination read-back. Reject the field itself -- dropping even a
+      // provably-true predicate would turn a conditional write into an
+      // unconditional one.
       if (predicate.defined()) {
-        // The predicate is an expression position too — a
-        // provably-true predicate (e.g. `True || ghost > 0`) could hide
-        // undefined vars that Vectorize then silently drops with the
-        // predicate. Run the same reference check as every other
-        // position before the true-check.
         CheckDefinedVars(predicate.value());
-        arith::Analyzer probe;
-        PrimExpr simplified = probe.Simplify(predicate.value());
-        if (!is_one(simplified)) {
-          std::ostringstream oss;
-          oss << "buffer `" << buffer->name
-              << "` has a non-trivial access predicate; predicated "
-                 "load/store is not yet supported";
-          parent_->Fail("memory access", oss.str());
-        }
+        std::ostringstream oss;
+        oss << "buffer `" << buffer->name
+            << "` carries an access predicate; predicated load/store is not "
+               "supported, remove the predicate from the source";
+        parent_->Fail("memory access", oss.str());
       }
       try {
         auto access = pto_analysis::AnalyzeBufferAccess(
@@ -911,6 +1084,10 @@ private:
     // Flat sequence semantics: the bound var is visible to all
     // subsequent statements of the enclosing scope; the scope owners
     // above restore the environment on exit.
+    // A handle-valued Bind aliases a data pointer (Bind(q, A.data)); the
+    // function-level pre-pass has recorded the alias in alias_src_, so the
+    // scope checks resolve the view's storage through it. Plain PTO
+    // functions without a converting region keep their behaviour.
     defs_.insert(op->var.get());
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -1286,8 +1463,12 @@ private:
         CheckRegionExprDefined(idx, "region-level store index");
       }
       if (store->predicate.defined()) {
-        CheckRegionExprDefined(store->predicate.value(),
-                               "region-level store predicate");
+        SetRegionContext();
+        std::ostringstream oss;
+        oss << "region-level store into buffer `" << store->buffer->name
+            << "` carries an access predicate; predicated store is not "
+               "supported, remove the predicate from the source";
+        Fail("memory access", oss.str());
       }
       return;
     }
@@ -1331,6 +1512,12 @@ private:
   // (blockIdx, outer/VF-internal binds) and leaked sibling-scope loop
   // vars into every unit.
   std::set<const VarNode *> defs_;
+  // Handle-valued Binds seen anywhere in the function: each bound data
+  // pointer maps to the Var it is bound from, or to nullptr when the bound
+  // value is not a plain buffer data reference. A buffer declared over a
+  // mapped pointer is a second view of one storage; only pointers with no
+  // resolvable source stay rejected (see CheckScope).
+  std::map<const VarNode *, const VarNode *> alias_src_;
   // Data Vars of AllocBuffers annotated tirx.volatile (collected
   // function-wide by CollectVolatileAllocs; identity-matched at every
   // access inside a converting region).
