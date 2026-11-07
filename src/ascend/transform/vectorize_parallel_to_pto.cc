@@ -986,25 +986,36 @@ private:
     }
     if (const auto *sel = expr.as<SelectNode>()) {
 
-      // A Select inside a Parallel body may test a lane-uniform condition
-      // (it depends only on the non-vectorized coordinates, e.g. a row
-      // index). PTODSL has no scalar predicate, so the
-      // compare is redone in the vector domain and the result is a mask
-      // that is either all-true or all-false; a bare scalar bool has no
-      // operands to compare, so it is widened and compared against zero.
+      // A Select takes one of two representations. When the condition and
+      // both arms are lane-uniform, the value stays scalar: a scalar Select
+      // is valid PTODSL (codegen emits pto.select), and keeping it scalar
+      // preserves the scalar-domain dtype contract Verify admitted --
+      // Legalize's Min/Max rewrite produces exactly this shape, and the
+      // scalar domain covers arithmetic whose VMI counterpart does not
+      // exist (e.g. int8 multiply). When any part varies per lane, PTODSL
+      // has no vector predicate, so the condition becomes a lane mask (the
+      // compare is redone in the vector domain, all-true or all-false for a
+      // lane-uniform test), a scalar arm is broadcast, and the Select
+      // lowers to one vsel.
       PrimExpr cond;
       if (RelationalCmpName(sel->condition) != nullptr) {
-        cond = ConvertRelationalToMask(sel->condition, pre);
+        cond = ConvertCondition(sel->condition, pre);
       } else {
         // Convert first: a `Bind` var may be declared bool while it holds a
         // lane mask, so the source dtype is not the deciding fact.
         cond = ConvertExpr(sel->condition, pre);
-        if (IsScalarBool(cond)) {
-          cond = ScalarBoolToMask(cond, pre);
-        }
       }
       PrimExpr tval = ConvertExpr(sel->true_value, pre);
       PrimExpr fval = ConvertExpr(sel->false_value, pre);
+      if (IsScalarBool(cond) && tval.dtype().lanes() == 1 &&
+          fval.dtype().lanes() == 1) {
+        // Fully lane-uniform: the scalar Select survives; a later vector
+        // consumer broadcasts it at the combination point.
+        return Select(cond, tval, fval);
+      }
+      if (IsScalarBool(cond)) {
+        cond = ScalarBoolToMask(cond, pre);
+      }
       if (tval.dtype().lanes() == 1) {
         tval = BroadcastToLanes("brc", tval, pre);
       }
@@ -1038,8 +1049,8 @@ private:
   }
 
   // A bool with no lanes: a kernel parameter, a value read from a 1-element
-  // buffer, or the result of scalar-only arithmetic. PTODSL has no scalar
-  // predicate, so such a value cannot be lowered as-is.
+  // buffer, or the result of scalar-only arithmetic. It is a valid scalar
+  // Select condition; a mask consumer lifts it via ScalarBoolToMask.
   static bool IsScalarBool(const PrimExpr &e) {
     return e.dtype().is_bool() && e.dtype().lanes() == 1;
   }
@@ -1100,11 +1111,12 @@ private:
     return value;
   }
 
-  // Materialise a relational condition as a lane mask even when both sides
-  // are lane-uniform: broadcast the scalars and compare vector-wise. The
-  // resulting mask is all-true or all-false, which is exactly the semantics
-  // of a scalar predicate applied to a whole vector.
-  PrimExpr ConvertRelationalToMask(const PrimExpr &cond, Array<Stmt> *pre) {
+  // Materialise a relational condition in its natural representation: the
+  // scalar bool when both sides are lane-uniform (the fully-scalar Select
+  // consumes it; a mask consumer lifts it via ScalarBoolToMask), a lane
+  // mask otherwise. Broadcasting two scalars first would build a one-bit
+  // VMI vreg, and VMI only carries 8/16/32-bit elements.
+  PrimExpr ConvertCondition(const PrimExpr &cond, Array<Stmt> *pre) {
     PrimExpr lhs;
     PrimExpr rhs;
     const pto::RelationalKind *rel = pto::MatchRelational(cond, &lhs, &rhs);
@@ -1117,17 +1129,17 @@ private:
       pre->push_back(s);
     }
     if ((std::string(cmp) == "eq" || std::string(cmp) == "ne") &&
-        a.dtype().is_bool() && b.dtype().is_bool()) {
+        a.dtype().is_bool() && b.dtype().is_bool() &&
+        (a.dtype().lanes() > 1 || b.dtype().lanes() > 1)) {
       return BoolCompareToMask(a, b, cmp, pre);
     }
     if (a.dtype().lanes() == 1 && b.dtype().lanes() == 1) {
-      // Two lane-uniform operands: compare as plain scalars and lift the
-      // bool result. Broadcasting first would build a one-bit VMI vreg, and
-      // VMI only carries 8/16/32-bit elements.
+      // Two lane-uniform operands: fold to the scalar bool with the shared
+      // relational table's semantics.
       const pto::RelationalKind *kind = pto::RelationalByName(cmp);
       ICHECK(kind != nullptr)
           << "[VectorizeParallelToPTO] internal error: unknown cmp " << cmp;
-      return ScalarBoolToMask(kind->fold(a, b), pre);
+      return kind->fold(a, b);
     }
     if (a.dtype().lanes() == 1) {
       a = BroadcastToLanes("brc", a, pre);

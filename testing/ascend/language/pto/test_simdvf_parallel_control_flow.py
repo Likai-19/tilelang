@@ -345,6 +345,57 @@ def test_minmax_legalizes_without_residual_max_min_nodes():
     assert "tl.vmi.vsel" in names, "the rewritten Min/Max must lower to vsel"
 
 
+def _k_uniform_minmax_scalar(E=256, lanes=64):
+    """`T.min` over two runtime int8 scalars, folded into a varying add."""
+
+    @T.prim_func
+    def main(
+        M: T.int8,
+        N: T.int8,
+        A: T.Tensor((E,), "int8"),
+        Y: T.Tensor((E,), "int8"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "int8")
+            y = T.alloc_shared((E,), "int8")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    c = T.min(M, N)
+                    y[i] = a[i] + c * c
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_uniform_minmax_select_stays_scalar_in_the_unit():
+    """Legalize rewrites Min/Max to Select even when both operands are
+    lane-uniform runtime scalars, so the converted value must stay scalar:
+    a fully lane-uniform Select is a valid PTODSL value (pto.select), and
+    keeping it scalar preserves the scalar-domain arithmetic Verify
+    admitted -- promoting it to a vreg would turn `c * c` into an int8
+    vector multiply the VMI element set does not carry."""
+
+    stages, error = _lower_capture(_k_uniform_minmax_scalar())
+    assert error is None, f"the uniform Min/Max form must lower, got: {error}"
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert names.get("tl.vmi.vsel", 0) == 0, (
+        f"a fully lane-uniform Select must not become a vsel, got {names}"
+    )
+    assert names.get("tl.vmi.vcmp", 0) == 0 and names.get("tl.vmi.vcmps", 0) == 0, (
+        f"the uniform condition must fold as a scalar compare, got {names}"
+    )
+    # The scalar value reaches the varying add and is broadcast exactly at
+    # that combination point (one vbrc for the scalar addend); the Select
+    # itself survives as a scalar TIR node.
+    assert names.get("tl.vmi.vbrc", 0) == 1, (
+        f"only the add's scalar operand should be broadcast, got {names}"
+    )
+    assert _selects(stages["vectorize"]), "the scalar Select must survive"
+
+
 @pytest.mark.pto
 def test_explicit_padding_keeps_its_else_branch():
     E, lanes = 150, 128
