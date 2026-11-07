@@ -1163,3 +1163,321 @@ def test_per_lane_scalar_inside_a_unit_is_rejected():
     assert "only UB (shared/shared.dyn) accesses are supported" in str(error), (
         f"expected the scope diagnostic, got: {error}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Conditions that read a destination written by the same conditional
+# ---------------------------------------------------------------------------
+
+
+def _condition_snapshots(mod):
+    return _collect(
+        mod,
+        lambda n: isinstance(n, tvm.tirx.Bind)
+        and n.var.name.startswith("cond_snapshot_"),
+    )
+
+
+def _mentions(expr, var):
+    """True when *var* occurs anywhere in *expr* (a nested Select included)."""
+    found = []
+    tvm.tirx.stmt_functor.post_order_visit(
+        tvm.tirx.Evaluate(expr),
+        lambda node: found.append(
+            isinstance(node, tvm.tirx.Var) and node.same_as(var)
+        ),
+    )
+    return any(found)
+
+
+def _ordered_plan_nodes(mod):
+    """Return Bind/BufferStore nodes in their emitted statement order."""
+    ordered = []
+
+    def visit(stmt):
+        if isinstance(stmt, tvm.tirx.SeqStmt):
+            for child in stmt.seq:
+                visit(child)
+        elif isinstance(stmt, tvm.tirx.For):
+            visit(stmt.body)
+        elif isinstance(stmt, tvm.tirx.SBlock):
+            visit(stmt.body)
+        elif isinstance(stmt, tvm.tirx.SBlockRealize):
+            visit(stmt.block)
+        elif isinstance(stmt, tvm.tirx.AttrStmt):
+            visit(stmt.body)
+        elif isinstance(stmt, (tvm.tirx.Bind, tvm.tirx.BufferStore)):
+            ordered.append(stmt)
+
+    visit(_body_of(mod))
+    return ordered
+
+
+def _k_single_in_place(E=256, lanes=64):
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if a[i] > T.float32(0.0):
+                        a[i] = T.float32(0.0)
+            T.copy(a, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_single_in_place_write_does_not_need_a_condition_snapshot():
+    stages, error = _lower_capture(_k_single_in_place())
+    assert error is None, f"a single in-place write must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    assert not _if_then_elses(legalized)
+    assert not _condition_snapshots(legalized), (
+        "one final store cannot re-evaluate the condition after another write"
+    )
+    stores = _stores(legalized)
+    assert len(stores) == 1, f"expected one folded store, got {stores}"
+    assert isinstance(stores[0].value, tvm.tirx.Select)
+    assert "a" in _expr_loads(stores[0].value), (
+        "the missing side must keep the destination's old value"
+    )
+    assert "tl.vmi.vsel" in _vmi_call_names(stages["vectorize"])
+
+
+def _k_multi_in_place(E=256, lanes=64):
+    @T.prim_func
+    def main(
+        A: T.Tensor((E,), "float32"),
+        B: T.Tensor((E,), "float32"),
+        Y: T.Tensor((E,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            b = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    b[i] = T.float32(7.0)
+                    if a[i] > T.float32(0.0):
+                        a[i] = T.float32(0.0)
+                        y[i] = T.float32(1.0)
+                    else:
+                        a[i] = T.float32(-1.0)
+                        y[i] = T.float32(2.0)
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_multi_in_place_writes_share_one_entry_condition_snapshot():
+    stages, error = _lower_capture(_k_multi_in_place())
+    assert error is None, f"multi in-place writes must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    snapshots = _condition_snapshots(legalized)
+    assert len(snapshots) == 1, f"expected one entry snapshot, got {snapshots}"
+    condition = snapshots[0].var
+    selects = _selects(legalized)
+    assert len(selects) == 2, f"both destinations need a value choice: {selects}"
+    for select in selects:
+        assert select.condition.same_as(condition), (
+            "every store must use the entry condition, not re-read A after a write"
+        )
+
+    ordered = _ordered_plan_nodes(legalized)
+    snapshot_index = next(
+        i for i, node in enumerate(ordered)
+        if isinstance(node, tvm.tirx.Bind) and node.var.same_as(condition)
+    )
+    assert snapshot_index > 0, "the condition snapshot must precede both stores"
+    assert all(
+        not isinstance(node, tvm.tirx.BufferStore) or
+        not isinstance(node.value, tvm.tirx.Select)
+        for node in ordered[:snapshot_index]
+    ), "no value-choice store may execute before the entry condition"
+
+
+def _k_one_sided_multi_in_place(E=256, lanes=64):
+    @T.prim_func
+    def main(
+        A: T.Tensor((E,), "float32"),
+        Y: T.Tensor((E,), "float32"),
+        Z: T.Tensor((E,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            z = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if a[i] > T.float32(0.0):
+                        a[i] = T.float32(0.0)
+                        z[i] = T.float32(1.0)
+            T.copy(a, Y)
+            T.copy(z, Z)
+
+    return main
+
+
+@pytest.mark.pto
+def test_one_sided_multi_in_place_shares_one_entry_condition_snapshot():
+    """One arm that updates its own condition input twice still snapshots once.
+
+    The acceptance case "the condition reads A, the branch rewrites A and then
+    writes B" without an ``else``: both stores must reuse the entry condition,
+    and the missing side reads the destination back.
+    """
+    stages, error = _lower_capture(_k_one_sided_multi_in_place())
+    assert error is None, f"a one-sided in-place update pair must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    snapshots = _condition_snapshots(legalized)
+    assert len(snapshots) == 1, f"expected one entry snapshot, got {snapshots}"
+    condition = snapshots[0].var
+    selects = _selects(legalized)
+    assert len(selects) == 2, f"both destinations need a value choice: {selects}"
+    for select in selects:
+        assert select.condition.same_as(condition), (
+            "the second store must reuse the entry condition, not re-read A"
+        )
+        # A one-sided arm keeps the destination's old value on the false side.
+        assert isinstance(select.false_value, tvm.tirx.BufferLoad), (
+            "the false side of a one-sided value choice reads the destination back"
+        )
+
+
+def _k_nested_condition_after_write(E=256, lanes=64):
+    @T.prim_func
+    def main(
+        A: T.Tensor((E,), "float32"),
+        C: T.Tensor((E,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            b = T.alloc_shared((E,), "float32")
+            c = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if a[i] > T.float32(0.0):
+                        b[i] = a[i] - T.float32(1.0)
+                        if b[i] > T.float32(0.0):
+                            b[i] = T.float32(0.0)
+                            c[i] = T.float32(1.0)
+            T.copy(c, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_nested_condition_snapshot_stays_after_the_preceding_write():
+    stages, error = _lower_capture(_k_nested_condition_after_write())
+    assert error is None, f"a nested in-place condition must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    snapshots = _condition_snapshots(legalized)
+    assert len(snapshots) == 1, f"only the inner condition needs a snapshot: {snapshots}"
+    ordered = _ordered_plan_nodes(legalized)
+    snapshot_index = next(
+        i for i, node in enumerate(ordered)
+        if isinstance(node, tvm.tirx.Bind)
+        and node.var.name.startswith("cond_snapshot_")
+    )
+    assert snapshot_index > 0
+    preceding = ordered[snapshot_index - 1]
+    assert isinstance(preceding, tvm.tirx.BufferStore)
+    assert preceding.buffer.name == "b", (
+        "the inner condition must be evaluated after B is written, not hoisted "
+        "to the outer condition's entry"
+    )
+    tail = [
+        node
+        for node in ordered[snapshot_index + 1:]
+        if isinstance(node, tvm.tirx.BufferStore)
+    ]
+    assert tail, "the inner writes must follow the condition snapshot"
+    for node in tail:
+        # The inner writes consume the snapshot; an enclosing conditional wraps
+        # them again with its own condition, so the snapshot is not necessarily
+        # the outermost Select condition.
+        assert _mentions(node.value, snapshots[0].var), (
+            "every inner write must consume the entry condition snapshot"
+        )
+
+
+def _k_serial_condition(E=256, lanes=64):
+    @T.prim_func
+    def main(X: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            x = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(X, x)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    for k in T.serial(3):
+                        if x[i] > T.float32(0.0):
+                            x[i] = x[i] + T.float32(1.0)
+                            y[i] = x[i]
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_condition_snapshot_stays_inside_the_serial_shell():
+    stages, error = _lower_capture(_k_serial_condition())
+    assert error is None, f"a serial in-place condition must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    snapshots = _condition_snapshots(legalized)
+    assert snapshots, "the multiple writes need a condition snapshot"
+    shells = _collect(
+        legalized,
+        lambda n: isinstance(n, tvm.tirx.For)
+        and n.kind == tvm.tirx.ForKind.SERIAL
+        and n.loop_var.name == "k",
+    )
+    assert shells, "the source serial shell must survive"
+    for snapshot in snapshots:
+        contained = []
+        for shell in shells:
+            tvm.tirx.stmt_functor.post_order_visit(
+                shell.body,
+                lambda node: contained.append(node.same_as(snapshot)),
+            )
+        assert any(contained), (
+            "a serial condition must be evaluated inside every iteration"
+        )
+
+
+def _k_multi_without_condition_conflict(E=256, lanes=64):
+    @T.prim_func
+    def main(X: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            x = T.alloc_shared((E,), "float32")
+            a = T.alloc_shared((E,), "float32")
+            b = T.alloc_shared((E,), "float32")
+            T.copy(X, x)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if x[i] > T.float32(0.0):
+                        a[i] = T.float32(0.0)
+                        b[i] = T.float32(1.0)
+            T.copy(b, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_multi_writes_with_unchanged_condition_input_add_no_snapshot():
+    stages, error = _lower_capture(_k_multi_without_condition_conflict())
+    assert error is None, f"an independent condition must lower, got: {error}"
+    assert not _condition_snapshots(stages["legalize"]), (
+        "two Selects over an unchanged input may share the original expression"
+    )
