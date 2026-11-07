@@ -582,15 +582,30 @@ bool IsPairableDestination(const Array<PrimExpr> &indices, const Var &vector_var
   // affine form keeps the pad's read-back per-lane (each lane reads exactly
   // its own element) and stays inside AnalyzeBufferAccess's kContinuous
   // contract. Simplify-based rather than structural so `i + 8`, `8 + i` and
-  // `i * 1` are all accepted, while `2 * i` (offset simplifies to `i`) and
-  // everything with a non-constant leading index are rejected.
+  // `i * 1` are all accepted, while `2 * i` (offset simplifies to `i`) is
+  // rejected.
   arith::Analyzer analyzer;
   PrimExpr offset = analyzer.Simplify(indices.back() - vector_var);
   if (!offset.as<IntImmNode>()) {
     return false;
   }
+  // A leading index may be anything except a reference to the vectorized
+  // variable: the kept coordinate of a 2D unit, an outer serial variable or
+  // a runtime scalar are all uniform over the chunk, and VerifyAccess proves
+  // the full address continuous (start + lane, strides and bind aliases
+  // resolved) before this rule runs -- a leading lane term would break
+  // exactly that proof. The pad's read-back reuses these indices, so the
+  // per-lane read stays well-defined.
   for (size_t i = 0; i + 1 < indices.size(); ++i) {
-    if (!indices[i].as<IntImmNode>()) {
+    bool references_vector_var = false;
+    PostOrderVisit(Evaluate(indices[i]), [&](const ObjectRef &node) {
+      if (const auto *v = node.as<VarNode>()) {
+        if (v == vector_var.get()) {
+          references_vector_var = true;
+        }
+      }
+    });
+    if (references_vector_var) {
       return false;
     }
   }

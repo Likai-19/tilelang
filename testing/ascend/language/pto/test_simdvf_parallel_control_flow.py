@@ -1181,6 +1181,94 @@ def test_conditional_offset_destination_folds():
     names = _vmi_call_names(stages["vectorize"])
     assert "tl.vmi.vsel" in names, f"the value choice must lower to vsel, got {names}"
 
+
+
+def _k_2d_kept_row_conditional_inner(E=128, F=4, lanes=64):
+    """2D inner-vectorized: the kept row coordinate is the leading index."""
+
+    @T.prim_func
+    def main(A: T.Tensor((F, E), "int32"), C: T.Tensor((F, E), "int32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((F, E), "int32")
+            c = T.alloc_shared((F, E), "int32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i, j in T.Parallel(F, E):
+                    if a[i, j] > 0:
+                        c[i, j] = a[i, j] + 1
+            T.copy(c, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_2d_inner_vectorized_row_coordinate_conditional_write_folds():
+    """A 2D unit whose inner dimension is vectorized and whose conditional
+    destination uses the kept row coordinate as the leading index (`c[i, j]`).
+    The leading index is uniform over the chunk and the address stays
+    `start + lane` per row -- VerifyAccess proves that continuity before the
+    pairing rule runs, so the fold must not require an IntImm there."""
+
+    stages, error = _lower_capture(_k_2d_kept_row_conditional_inner())
+    assert error is None, f"the row-coordinate conditional must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    assert not _if_then_elses(legalized), "the branch must be legalized away"
+    stores = _stores(legalized)
+    assert len(stores) == 1, f"expected the folded store, got {len(stores)}"
+    assert stores[0].predicate is None, "the folded store must stay unpredicated"
+    assert _selects(legalized), "the arm must become a value choice"
+    assert "c" in _expr_loads(stores[0].value), (
+        "the missing side must read the destination's old value back, got "
+        f"{sorted(_expr_loads(stores[0].value))}"
+    )
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert "tl.vmi.vsel" in names, f"the value choice must lower to vsel, got {names}"
+
+
+def _k_2d_kept_row_conditional_outer(E=128, F=4, lanes=64):
+    """2D outer-vectorized: the kept inner coordinate is the leading index."""
+
+    @T.prim_func
+    def main(A: T.Tensor((F, E), "int32"), C: T.Tensor((F, E), "int32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((F, E), "int32")
+            c = T.alloc_shared((F, E), "int32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i, j in T.Parallel(E, F):
+                    if a[j, i] > 0:
+                        c[j, i] = a[j, i] + 1
+            T.copy(c, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_2d_outer_vectorized_row_coordinate_conditional_write_folds():
+    """The outer-vectorized counterpart (`c[j, i]`, vectorized outer variable
+    last): the kept inner coordinate leads -- the same uniform-leading form
+    seen from the other side of the layout choice."""
+
+    stages, error = _lower_capture(_k_2d_kept_row_conditional_outer())
+    assert error is None, f"the kept-coordinate conditional must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    assert not _if_then_elses(legalized), "the branch must be legalized away"
+    stores = _stores(legalized)
+    assert len(stores) == 1, f"expected the folded store, got {len(stores)}"
+    assert stores[0].predicate is None, "the folded store must stay unpredicated"
+    assert _selects(legalized), "the arm must become a value choice"
+    assert "c" in _expr_loads(stores[0].value), (
+        "the missing side must read the destination's old value back, got "
+        f"{sorted(_expr_loads(stores[0].value))}"
+    )
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert "tl.vmi.vsel" in names, f"the value choice must lower to vsel, got {names}"
+
+
 def _k_per_lane_scalar_in_unit(E=150, lanes=64, dtype="float32"):
     """A per-lane scalar (`T.alloc_var`) used inside a T.Parallel unit."""
     P = (E + lanes - 1) // lanes * lanes

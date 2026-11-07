@@ -321,8 +321,8 @@ public:
     return true;
   }
 
-  // Lane-private address: leading indices compile-time constants, and the last
-  // index equal to the T.Parallel variable up to a constant offset. The offset
+  // Lane-private address: leading indices free of the T.Parallel variable,
+  // and the last index equal to it up to a constant offset. The offset
   // keeps every lane reading exactly its own element, so the pad read-back stays
   // well-defined; the shifted window's allocation and 32-byte alignment are the
   // caller's and codegen legality's contracts. The form check is shared with

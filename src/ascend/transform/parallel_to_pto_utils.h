@@ -178,8 +178,9 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
                                  const Map<Var, PrimExpr> &bind_env = {});
 
 /*! The destination form a conditional store must satisfy to be pairable
- * into one value choice: leading indices compile-time constants, and the
- * last index equal to the vectorized variable up to a constant offset.
+ * into one value choice: leading indices free of the vectorized variable,
+ * and the last index equal to the vectorized variable up to a constant
+ * offset.
  * The offset may be negative -- the shifted window is the caller's
  * allocation contract, exactly as for unconditional stores, and the
  * 32-byte alignment of the shifted window is

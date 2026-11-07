@@ -634,8 +634,9 @@ private:
 
     // A conditional store becomes one arm of a value choice, so
     // LegalizeParallelToPTO pairs the two arms by destination address. That
-    // works for the per-lane form -- leading indices constant and the last
-    // index equal to the T.Parallel variable up to a constant offset -- so
+    // works for the per-lane form -- leading indices free of the
+    // T.Parallel variable and the last index equal to it up to a constant
+    // offset -- so
     // every other address shape is rejected here instead of failing late in
     // Legalize with a misleading "both arms must write the same destination"
     // error. The shifted window's 32-byte alignment is codegen legality's
@@ -645,9 +646,9 @@ private:
         std::ostringstream oss;
         oss << "buffer `" << store->buffer->name
             << "` is written inside a T.Parallel conditional with an address the "
-               "value-choice rewrite cannot pair: the leading indices must be "
-               "compile-time constants and the last index must be the "
-               "T.Parallel variable up to a constant offset";
+               "value-choice rewrite cannot pair: the leading indices must not "
+               "reference the T.Parallel variable and the last index must be "
+               "the T.Parallel variable up to a constant offset";
         parent_->Fail("memory access", oss.str());
       }
     }
