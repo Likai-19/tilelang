@@ -6,7 +6,7 @@
  * \brief Read-only input-contract verification for the PTO Parallel
  * vectorize path. Runs on the PTO target only.
  *
- * The pass checks every SIMD_VF block that contains a T.Parallel unit:
+ * The pass checks every SIMD_VF block containing T.Parallel, reduce or fill:
  * lanes validity, loop structure/ranges, lane fragment presence and
  * invertibility, per-access patterns (continuous / lane-uniform), the
  * value-expression whitelist, element dtype constraints and region-level
@@ -18,9 +18,9 @@
  * sees exactly what is defined where it appears. The first error
  * terminates compilation with a `[VerifyParallelToPTO]` diagnostic.
  *
- * Pure hand-written VMI regions (no T.Parallel) and SIMT_VF blocks are
- * skipped entirely; a region without T.Parallel does not need the lanes
- * annotation.
+ * Pure hand-written VMI regions without high-level operations and SIMT_VF
+ * blocks are skipped entirely. Direct tile operations use the VF lanes
+ * annotation independently of any neighboring Parallel unit.
  */
 
 #include <tvm/tirx/stmt_functor.h>
@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "../../transform/common/attr.h"
+#include "buffer_version.h"
 #include "parallel_to_pto_utils.h"
 
 namespace tvm {
@@ -114,7 +115,7 @@ private:
   int64_t ReadLanes(const SBlockNode *block) {
     auto anno = block->annotations.Get("tl.simdvf_lanes");
     if (!anno.has_value()) {
-      Fail("lanes", "SIMD_VF block with T.Parallel must carry the "
+      Fail("lanes", "SIMD_VF block with high-level operations must carry the "
                     "tl.simdvf_lanes annotation (written by "
                     "T.SimdVF(lanes=...))");
     }
@@ -139,6 +140,19 @@ private:
   public:
     RegionVisitor(VerifyParallelToPTOImpl *parent) : parent_(parent) {}
 
+    void VisitStmt_(const EvaluateNode *op) final {
+      if (const auto *call_node = op->value.as<CallNode>()) {
+        Call call = GetRef<Call>(call_node);
+        if (pto_analysis::IsPtoDirectReduce(call) ||
+            pto_analysis::IsPtoFill(call)) {
+          // Only this root call is a supported statement. Its arguments and
+          // annotations must still reject any nested direct tile operations.
+          StmtExprVisitor::VisitExpr_(call_node);
+          return;
+        }
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
     void VisitStmt_(const BufferStoreNode *op) final {
       CheckScope(op->buffer);
       // The base visitor skips BufferStore.predicate
@@ -160,6 +174,14 @@ private:
       StmtExprVisitor::VisitExpr_(op);
     }
     void VisitExpr_(const CallNode *op) final {
+      Call call = GetRef<Call>(op);
+      if (pto_analysis::IsPtoDirectReduce(call) ||
+          pto_analysis::IsPtoFill(call)) {
+        parent_->Fail("tileop position",
+                      "direct reduce and fill/clear must appear as a direct "
+                      "Evaluate(Call) statement; Bind values and other nested "
+                      "expressions are not supported");
+      }
       if (const auto *op_node = op->op.as<OpNode>()) {
         std::string name = op_node->name;
         if (name.rfind("tl.vmi.", 0) == 0) {
@@ -167,9 +189,6 @@ private:
               "mixing",
               "hand-written tl.vmi.* calls cannot be mixed with T.Parallel "
               "inside a converting SIMD_VF block");
-        }
-        if (name == "tl.tileop.reduce") {
-          parent_->Fail("expression", "cross-lane reduce is not supported");
         }
       }
       StmtExprVisitor::VisitExpr_(op);
@@ -864,6 +883,7 @@ private:
   // scalars (blockIdx, outer binds) are no longer rejected.
   // ------------------------------------------------------------------
   void VisitStmt_(const ForNode *op) final {
+    analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
     if (op->kind != ForKind::kParallel) {
       std::set<const VarNode *> saved = defs_;
       defs_.insert(op->loop_var.get());
@@ -878,6 +898,15 @@ private:
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tl::attr::kBufferVersion) {
+      BufferVersionMap saved = buffer_versions_;
+      for (const auto &[storage, count] : op->node.cast<BufferVersionMap>()) {
+        buffer_versions_.Set(storage, count);
+      }
+      StmtExprVisitor::VisitStmt_(op);
+      buffer_versions_ = std::move(saved);
+      return;
+    }
     if (op->attr_key == tirx::attr::thread_extent) {
       if (const auto *iv = op->node.as<IterVarNode>()) {
         // blockIdx/cthread bindings (e.g. `with T.Kernel(2) as bx`) are
@@ -885,6 +914,11 @@ private:
         // no-threadIdx-inside-the-converting-region rule is
         // unaffected: it is enforced by the RegionVisitor inside the
         // region, not here.
+        // Keep the launch range in the same analyzer used by CheckPtoFill;
+        // otherwise a scalar value such as values[bx] is rejected even
+        // though bx is provably in [0, thread_extent).
+        With<arith::ConstraintContext> launch_bounds(
+            &analyzer_, iv->var >= 0 && iv->var < op->value);
         std::set<const VarNode *> saved = defs_;
         defs_.insert(iv->var.get());
         StmtExprVisitor::VisitStmt_(op);
@@ -971,7 +1005,7 @@ private:
     // Shared region scan: same implementation as Vectorize.
     const Stmt &region = op->body;
     pto_analysis::PtoRegionScan scan = pto_analysis::ScanPtoRegion(region);
-    if (!scan.has_any_parallel) {
+    if (!scan.has_any_parallel && !scan.has_direct_reduce && !scan.has_fill) {
       // Pure hand-written VMI region (possibly with control flow): skipped
       // entirely; no lanes annotation required.
       defs_ = std::move(saved);
@@ -1093,7 +1127,7 @@ private:
         return pto_analysis::InvertPtoLaneLayout(unit);
       } catch (const pto_analysis::PtoAnalysisError &err) {
         Fail("layout", err.what());
-        return pto_analysis::PtoInverseMapping{};
+        return pto_analysis::PtoInverseMapping();
       }
     }();
     if (mapping.lanes != lanes) {
@@ -1182,6 +1216,8 @@ private:
       }
       std::set<const VarNode *> saved = defs_;
       defs_.insert(for_node->loop_var.get());
+      analyzer_.Bind(for_node->loop_var,
+                     Range::FromMinExtent(for_node->min, for_node->extent));
       WalkRegion(for_node->body, units, lanes, next_unit);
       defs_ = std::move(saved);
       return;
@@ -1252,6 +1288,24 @@ private:
       // definition itself is registered.
       SetRegionContext();
       CheckRegionExprDefined(bind->value, "region-level bind");
+      PrimExpr scalar_source = bind->value;
+      bool converts_float = false;
+      while (const auto *conversion = scalar_source.as<CastNode>()) {
+        DataType from = conversion->value.dtype();
+        DataType to = conversion->dtype;
+        if (from.is_scalar() && to.is_scalar() && from != to &&
+            (from.is_float() || from.is_bfloat16()) &&
+            (to.is_float() || to.is_bfloat16())) {
+          converts_float = true;
+        }
+        scalar_source = conversion->value;
+      }
+      if (converts_float && scalar_source.as<BufferLoadNode>()) {
+        Fail("dtype",
+             "region-level floating-point casts of UB reads have no scalar "
+             "lowering inside SIMD_VF; put the casts directly in T.fill or "
+             "use a lane-varying T.Parallel value");
+      }
       defs_.insert(bind->var.get());
       return;
     }
@@ -1283,6 +1337,24 @@ private:
     if (const auto *eval = stmt.as<EvaluateNode>()) {
       SetRegionContext();
       CheckRegionExprDefined(eval->value, "region-level evaluate value");
+      if (const auto *call_node = eval->value.as<CallNode>()) {
+        Call call = GetRef<Call>(call_node);
+        if (pto_analysis::IsPtoDirectReduce(call)) {
+          try {
+            pto_analysis::CheckPtoDirectReduce(call, &analyzer_,
+                                               buffer_versions_);
+          } catch (const pto_analysis::PtoAnalysisError &error) {
+            Fail("reduce", error.what());
+          }
+        } else if (pto_analysis::IsPtoFill(call)) {
+          try {
+            pto_analysis::CheckPtoFill(call, lanes, &analyzer_,
+                                       buffer_versions_);
+          } catch (const pto_analysis::PtoAnalysisError &error) {
+            Fail("fill/clear", error.what());
+          }
+        }
+      }
       return;
     }
     if (const auto *ite = stmt.as<IfThenElseNode>()) {
@@ -1332,6 +1404,7 @@ private:
   // Lane count of the converting region under check (0 when unknown); part of
   // the region/unit diagnostic context.
   int64_t current_lanes_ = 0;
+  BufferVersionMap buffer_versions_;
 };
 
 } // namespace

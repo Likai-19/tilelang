@@ -7,10 +7,12 @@
 #include "parallel_to_pto_utils.h"
 
 #include <tvm/arith/pattern.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 
 #include "../../layout/utils.h"
+#include "../../op/utils.h"
 
 #include <functional>
 #include <sstream>
@@ -23,6 +25,389 @@ using namespace tirx;
 using ffi::Array;
 using ffi::GetRef;
 using ffi::Map;
+
+bool IsPtoDirectReduce(const Call &call) {
+  return call->op.same_as(Op::Get("tl.tileop.reduce"));
+}
+
+bool IsPtoFill(const Call &call) {
+  return call->op.same_as(Op::Get("tl.tileop.fill"));
+}
+
+namespace {
+
+// These helpers decode buffer metadata without validating TileOp admission or
+// constructing a lowering plan. Verify and Vectorize interpret the same
+// compiler-generated version prefix and physical strides.
+int PtoVersionPrefix(const BufferRegion &region, arith::Analyzer *analyzer,
+                     const Map<Var, int> &buffer_versions) {
+  const Buffer &buffer = region->buffer;
+  auto versions = buffer_versions.Get(buffer->data);
+  if (versions.has_value() && versions.value() > 1 &&
+      buffer->shape.size() > 1 &&
+      analyzer->CanProveEqual(buffer->shape[0], versions.value()) &&
+      analyzer->CanProveEqual(region->region[0]->extent, 1)) {
+    return 1;
+  }
+  return 0;
+}
+
+Array<PrimExpr> PtoBufferStrides(const Buffer &buffer,
+                                 arith::Analyzer *analyzer) {
+  if (!buffer->strides.empty()) {
+    return buffer->strides;
+  }
+  Array<PrimExpr> result;
+  PrimExpr stride = Integer(1);
+  for (size_t i = buffer->shape.size(); i-- > 0;) {
+    result.insert(result.begin(), stride);
+    stride = analyzer->Simplify(stride * buffer->shape[i]);
+  }
+  return result;
+}
+
+int PtoFillContinuousAxis(const BufferRegion &destination,
+                          const Array<PrimExpr> &strides, int prefix,
+                          arith::Analyzer *analyzer) {
+  // A trailing singleton can have stride 1 as well. Prefer an axis with
+  // actual elements so a compact column such as [128, 1] remains one full run.
+  for (int axis = static_cast<int>(strides.size()) - 1; axis >= prefix;
+       --axis) {
+    if (analyzer->CanProveEqual(strides[axis], 1) &&
+        !analyzer->CanProveEqual(destination->region[axis]->extent, 1)) {
+      return axis;
+    }
+  }
+  int axis = static_cast<int>(strides.size()) - 1;
+  return analyzer->CanProveEqual(strides[axis], 1) ? axis : prefix;
+}
+
+} // namespace
+
+void CheckPtoFill(const Call &call, int64_t lanes, arith::Analyzer *analyzer,
+                  const Map<Var, int> &buffer_versions) {
+  auto fail = [](const std::string &message) {
+    throw PtoAnalysisError("fill/clear: " + message);
+  };
+  if (call->args.size() != 2) {
+    fail("expected destination region and scalar value");
+  }
+  BufferRegion destination = NormalizeToBufferRegion(call->args[0]);
+  Buffer dst = destination->buffer;
+  if ((dst.scope() != "shared" && dst.scope() != "shared.dyn") ||
+      !dst->axis_separators.empty()) {
+    fail("only ordinary UB (shared/shared.dyn) destinations are supported; "
+         "Fragment fill/clear is not supported");
+  }
+  DataType dtype = dst->dtype;
+  if (dtype.lanes() != 1 ||
+      !((dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32)) ||
+        dtype.is_bfloat16() ||
+        ((dtype.is_int() || dtype.is_uint()) &&
+         (dtype.bits() == 8 || dtype.bits() == 16 || dtype.bits() == 32)))) {
+    fail("unsupported destination dtype");
+  }
+  int prefix = PtoVersionPrefix(destination, analyzer, buffer_versions);
+  int rank = static_cast<int>(dst->shape.size()) - prefix;
+  if (rank != 1 && rank != 2) {
+    fail("requires a logical 1D/2D destination");
+  }
+  auto positive_constant = [&](const PrimExpr &expr) {
+    const auto *value = expr.as<IntImmNode>();
+    if (!value || value->value <= 0) {
+      fail("buffer shapes and strides must be positive compile-time integers");
+    }
+    return value->value;
+  };
+  for (size_t i = prefix; i < dst->shape.size(); ++i) {
+    positive_constant(dst->shape[i]);
+    const Range &range = destination->region[i];
+    if (!analyzer->CanProveEqual(range->min, 0)) {
+      fail("nonzero destination region starts are not supported; use a "
+           "zero-origin region");
+    }
+    positive_constant(range->extent);
+    if (!analyzer->CanProve(range->extent <= dst->shape[i])) {
+      fail("destination region must be provably in bounds");
+    }
+  }
+  Array<PrimExpr> strides = PtoBufferStrides(dst, analyzer);
+  for (const PrimExpr &stride : strides) {
+    positive_constant(stride);
+  }
+  if (!analyzer->CanProveEqual(dst->elem_offset, 0)) {
+    fail("nonzero destination storage offsets are not supported; use a "
+         "zero-origin destination view");
+  }
+  int64_t alignment = 256 / dtype.bits();
+  if (prefix != 0 &&
+      !analyzer->CanProveEqual(floormod(strides[0], alignment), 0)) {
+    fail("destination version slots must be 32-byte aligned");
+  }
+  int axis = PtoFillContinuousAxis(destination, strides, prefix, analyzer);
+  if (!analyzer->CanProveEqual(strides[axis], 1)) {
+    fail("requires a unit-stride axis");
+  }
+  int64_t run_extent =
+      Downcast<IntImm>(destination->region[axis]->extent)->value;
+  if (run_extent % lanes != 0) {
+    fail("tail regions are not supported; the contiguous extent must be a "
+         "multiple of SimdVF lanes");
+  }
+  if (rank == 2) {
+    int outer_axis = prefix + (axis == prefix ? 1 : 0);
+    if (!analyzer->CanProveEqual(destination->region[outer_axis]->extent, 1)) {
+      if (positive_constant(strides[outer_axis]) <
+          positive_constant(dst->shape[axis])) {
+        fail("destination strides must describe non-overlapping rows or "
+             "columns");
+      }
+      if (!analyzer->CanProveEqual(floormod(strides[outer_axis], alignment),
+                                   0)) {
+        fail("destination row or column starts must be 32-byte aligned");
+      }
+    }
+  }
+  PrimExpr value = analyzer->Simplify(cast(dtype, call->args[1]));
+  std::function<void(const PrimExpr &)> check_value = [&](const PrimExpr
+                                                              &value) {
+    if (!value.dtype().is_scalar()) {
+      fail("fill value must be a uniform scalar");
+    }
+    if (value.as<IntImmNode>() || value.as<FloatImmNode>() ||
+        value.as<VarNode>()) {
+      return;
+    }
+    if (const auto *load = value.as<BufferLoadNode>()) {
+      if (load->buffer.scope() != "shared" &&
+          load->buffer.scope() != "shared.dyn") {
+        fail("scalar fill-value reads must use ordinary UB");
+      }
+      if (load->predicate.defined()) {
+        fail("predicated scalar fill-value reads are not supported");
+      }
+      for (size_t i = 0; i < load->indices.size(); ++i) {
+        if (SideEffect(load->indices[i]) != CallEffectKind::kPure ||
+            !analyzer->CanProve(load->indices[i] >= 0) ||
+            !analyzer->CanProve(load->indices[i] < load->buffer->shape[i])) {
+          fail("scalar fill-value indices must be pure and provably in bounds");
+        }
+      }
+      return;
+    }
+    if (const auto *conversion = value.as<CastNode>()) {
+      CastContext context;
+      context.value_kind = CastValueKind::kScalar;
+      context.logical_lanes = 1;
+      std::string reason;
+      if (!PlanValueCast(conversion, context, &reason).has_value()) {
+        fail(reason);
+      }
+      check_value(conversion->value);
+      return;
+    }
+    fail("fill value must be a constant, uniform scalar or one UB read with "
+         "supported scalar casts");
+  };
+  check_value(value);
+}
+
+PtoFillPlan PlanPtoFill(const Call &call, arith::Analyzer *analyzer,
+                        const Map<Var, int> &buffer_versions) {
+  // Verify owns admission and diagnostics. Planning consumes its established
+  // invariants without rerunning the checks or changing the input IR.
+  PtoFillPlan plan;
+  plan.destination = NormalizeToBufferRegion(call->args[0]);
+  const Buffer &dst = plan.destination->buffer;
+  int prefix = PtoVersionPrefix(plan.destination, analyzer, buffer_versions);
+  int rank = static_cast<int>(dst->shape.size()) - prefix;
+  Array<PrimExpr> strides = PtoBufferStrides(dst, analyzer);
+  plan.continuous_axis =
+      PtoFillContinuousAxis(plan.destination, strides, prefix, analyzer);
+  plan.run_extent =
+      Downcast<IntImm>(plan.destination->region[plan.continuous_axis]->extent)
+          ->value;
+  if (rank == 2) {
+    plan.outer_axis = prefix + (plan.continuous_axis == prefix ? 1 : 0);
+    plan.outer_extent =
+        Downcast<IntImm>(plan.destination->region[plan.outer_axis]->extent)
+            ->value;
+  }
+  plan.value = analyzer->Simplify(cast(dst->dtype, call->args[1]));
+  return plan;
+}
+
+void CheckPtoDirectReduce(const Call &call, arith::Analyzer *analyzer,
+                          const Map<Var, int> &buffer_versions) {
+  auto fail = [&](const std::string &message) {
+    throw PtoAnalysisError("direct reduce: " + message);
+  };
+  if (call->args.size() != 5) {
+    fail("expected source, destination, operation, dim and clear");
+  }
+  const auto *kind = call->args[2].as<StringImmNode>();
+  const auto *dim = call->args[3].as<IntImmNode>();
+  const auto *clear = call->args[4].as<IntImmNode>();
+  if (!kind || !dim || !clear || (clear->value != 0 && clear->value != 1)) {
+    fail("requires constant dim, operation and boolean clear");
+  }
+  std::string operation = kind->value;
+  if (operation != "sum" && operation != "max" && operation != "min" &&
+      operation != "abssum" && operation != "absmax") {
+    fail("only sum, max, min, abssum and absmax are supported");
+  }
+  for (const auto &[key, value] : call->annotations) {
+    if (key == "batch" || key == "nan_propagate") {
+      const auto *integer = value.as<IntImmNode>();
+      if (!integer || integer->value != (key == "batch" ? 1 : 0)) {
+        fail("requires batch=1 and nan_propagate=False");
+      }
+    }
+  }
+  BufferRegion source = NormalizeToBufferRegion(call->args[0]);
+  BufferRegion destination = NormalizeToBufferRegion(call->args[1]);
+  Buffer src = source->buffer;
+  Buffer dst = destination->buffer;
+  auto ub = [](const Buffer &buffer) {
+    return buffer.scope() == "shared" || buffer.scope() == "shared.dyn";
+  };
+  if (!ub(src) || !ub(dst) || !src->axis_separators.empty() ||
+      !dst->axis_separators.empty()) {
+    fail("source and destination must be ordinary linear UB buffers");
+  }
+  if (src->data.same_as(dst->data)) {
+    fail("overlapping source/destination storage is not supported");
+  }
+  DataType from = src->dtype;
+  DataType to = dst->dtype;
+  bool same =
+      from == to && ((to.is_float() && (to.bits() == 16 || to.bits() == 32)) ||
+                     ((to.is_int() || to.is_uint()) && to.bits() == 32));
+  bool widen = to == DataType::Float(32) &&
+               (from == DataType::Float(16) || from.is_bfloat16());
+  if ((!same && !widen) || from.lanes() != 1 || to.lanes() != 1) {
+    fail("unsupported source/accumulator dtype combination");
+  }
+  auto logical_shape = [&](const BufferRegion &region, int *prefix) {
+    const Buffer &buffer = region->buffer;
+    if (region->region.size() != buffer->shape.size()) {
+      fail("region rank does not match its buffer");
+    }
+    *prefix = PtoVersionPrefix(region, analyzer, buffer_versions);
+    Array<PrimExpr> shape;
+    for (size_t i = *prefix; i < buffer->shape.size(); ++i) {
+      const Range &range = region->region[i];
+      if (!analyzer->CanProveEqual(range->min, 0) ||
+          !analyzer->CanProveEqual(range->extent, buffer->shape[i])) {
+        fail("requires complete logical source and destination regions");
+      }
+      shape.push_back(buffer->shape[i]);
+    }
+    return shape;
+  };
+  int source_prefix = 0;
+  int destination_prefix = 0;
+  Array<PrimExpr> src_shape = logical_shape(source, &source_prefix);
+  Array<PrimExpr> dst_shape = logical_shape(destination, &destination_prefix);
+  int rank = src_shape.size();
+  if ((rank != 1 && rank != 2) || dim->value < 0 || dim->value >= rank) {
+    fail("requires a logical 1D/2D source and a valid reduction dim");
+  }
+  auto positive = [&](const PrimExpr &expr) {
+    const auto *integer = expr.as<IntImmNode>();
+    if (!integer || integer->value <= 0) {
+      fail("all logical extents must be positive compile-time integers");
+    }
+    return integer->value;
+  };
+  for (const PrimExpr &extent : src_shape) {
+    positive(extent);
+  }
+  for (const PrimExpr &extent : dst_shape) {
+    positive(extent);
+  }
+  int reduction_axis = dim->value;
+  int output_axis = rank == 1 ? 0 : 1 - reduction_axis;
+  int64_t output_extent = rank == 1 ? 1 : positive(src_shape[output_axis]);
+  bool keep_dims = dst_shape.size() == src_shape.size();
+  if (rank == 1) {
+    if (dst_shape.size() != 1 || positive(dst_shape[0]) != 1) {
+      fail("1D reduction requires destination shape [1]");
+    }
+  } else if (keep_dims) {
+    if (positive(dst_shape[reduction_axis]) != 1 ||
+        positive(dst_shape[output_axis]) != output_extent) {
+      fail("keepdims destination shape does not match the reduction");
+    }
+  } else if (dst_shape.size() != 1 || positive(dst_shape[0]) != output_extent) {
+    fail("destination shape does not match the reduction");
+  }
+  int destination_output_axis =
+      destination_prefix + (keep_dims && rank == 2 ? output_axis : 0);
+  Array<PrimExpr> src_strides = PtoBufferStrides(src, analyzer);
+  Array<PrimExpr> dst_strides = PtoBufferStrides(dst, analyzer);
+  for (const PrimExpr &stride : src_strides) {
+    positive(stride);
+  }
+  for (const PrimExpr &stride : dst_strides) {
+    positive(stride);
+  }
+  if (rank == 2) {
+    int64_t rows = positive(src_shape[0]);
+    int64_t columns = positive(src_shape[1]);
+    int64_t row_stride = positive(src_strides[source_prefix]);
+    int64_t column_stride = positive(src_strides[source_prefix + 1]);
+    if (!((column_stride == 1 && row_stride >= columns) ||
+          (row_stride == 1 && column_stride >= rows))) {
+      fail("source strides must describe non-overlapping rows or columns");
+    }
+  }
+  bool reduce_across_lanes =
+      analyzer->CanProveEqual(src_strides[source_prefix + reduction_axis], 1);
+  if (!reduce_across_lanes &&
+      (rank != 2 ||
+       !analyzer->CanProveEqual(src_strides[source_prefix + output_axis], 1) ||
+       !analyzer->CanProveEqual(dst_strides[destination_output_axis], 1))) {
+    fail("no supported unit-stride reduction/output axis");
+  }
+}
+
+PtoDirectReducePlan PlanPtoDirectReduce(const Call &call,
+                                        arith::Analyzer *analyzer,
+                                        const Map<Var, int> &buffer_versions) {
+  PtoDirectReducePlan plan;
+  plan.source = NormalizeToBufferRegion(call->args[0]);
+  plan.destination = NormalizeToBufferRegion(call->args[1]);
+  plan.operation = Downcast<StringImm>(call->args[2])->value;
+  plan.clear = Downcast<IntImm>(call->args[4])->value != 0;
+  const Buffer &src = plan.source->buffer;
+  const Buffer &dst = plan.destination->buffer;
+  plan.accumulator_dtype = dst->dtype;
+  plan.source_prefix = PtoVersionPrefix(plan.source, analyzer, buffer_versions);
+  plan.destination_prefix =
+      PtoVersionPrefix(plan.destination, analyzer, buffer_versions);
+  plan.logical_rank = static_cast<int>(src->shape.size()) - plan.source_prefix;
+  plan.reduction_axis = Downcast<IntImm>(call->args[3])->value;
+  plan.output_axis = plan.logical_rank == 1 ? 0 : 1 - plan.reduction_axis;
+  plan.reduction_extent =
+      Downcast<IntImm>(src->shape[plan.source_prefix + plan.reduction_axis])
+          ->value;
+  plan.output_extent =
+      plan.logical_rank == 1
+          ? 1
+          : Downcast<IntImm>(src->shape[plan.source_prefix + plan.output_axis])
+                ->value;
+  bool keep_dims =
+      static_cast<int>(dst->shape.size()) - plan.destination_prefix ==
+      plan.logical_rank;
+  plan.destination_output_axis =
+      plan.destination_prefix +
+      (keep_dims && plan.logical_rank == 2 ? plan.output_axis : 0);
+  Array<PrimExpr> src_strides = PtoBufferStrides(src, analyzer);
+  plan.reduce_across_lanes = analyzer->CanProveEqual(
+      src_strides[plan.source_prefix + plan.reduction_axis], 1);
+  return plan;
+}
 
 std::string AccessPatternToString(AccessPattern pattern) {
   switch (pattern) {
@@ -853,9 +1238,80 @@ void DiscoverUnitsShared(const Stmt &stmt, PtoRegionScan *scan) {
 PtoRegionScan ScanPtoRegion(const Stmt &region) {
   PtoRegionScan scan;
   DiscoverUnitsShared(region, &scan);
-  std::vector<const ForNode *> all;
-  CollectAllParallelDeep(region, all);
-  scan.has_any_parallel = !all.empty();
+  class TileOpScanner : public StmtExprVisitor {
+  public:
+    explicit TileOpScanner(PtoRegionScan *scan) : scan_(scan) {}
+    void VisitStmt_(const AttrStmtNode *op) final {
+      if (auto node = op->node.try_cast<PrimExpr>()) {
+        VisitExpr(node.value());
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+    void VisitStmt_(const BufferStoreNode *op) final {
+      if (op->predicate.defined()) {
+        VisitExpr(op->predicate.value());
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+    void VisitExpr_(const BufferLoadNode *op) final {
+      if (op->predicate.defined()) {
+        VisitExpr(op->predicate.value());
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+    void VisitStmt_(const SBlockNode *op) final {
+      StmtExprVisitor::VisitStmt_(op);
+      // The scan starts at the enclosing SIMD_VF's body. Another VF on
+      // this lexical path would be checked with the outer lanes and then
+      // lowered with its own lanes, so it cannot be a transparent wrapper.
+      if (op->name_hint == "SIMD_VF") {
+        scan_->has_unsupported_wrapper = true;
+        scan_->issue = "nested SIMD_VF blocks are not supported; use "
+                       "sequential T.SimdVF regions";
+      }
+    }
+    void VisitStmt_(const ForNode *op) final {
+      scan_->has_any_parallel |= op->kind == ForKind::kParallel;
+      int saved = forbidden_depth_;
+      if (op->kind != ForKind::kSerial && op->kind != ForKind::kUnrolled) {
+        ++forbidden_depth_;
+      }
+      StmtExprVisitor::VisitStmt_(op);
+      forbidden_depth_ = saved;
+    }
+    void VisitStmt_(const IfThenElseNode *op) final {
+      ++forbidden_depth_;
+      StmtExprVisitor::VisitStmt_(op);
+      --forbidden_depth_;
+    }
+    void VisitStmt_(const WhileNode *op) final {
+      ++forbidden_depth_;
+      StmtExprVisitor::VisitStmt_(op);
+      --forbidden_depth_;
+    }
+    void VisitExpr_(const CallNode *op) final {
+      bool reduce = IsPtoDirectReduce(GetRef<Call>(op));
+      bool fill = IsPtoFill(GetRef<Call>(op));
+      if (reduce || fill) {
+        scan_->has_direct_reduce |= reduce;
+        scan_->has_fill |= fill;
+        if (forbidden_depth_ != 0) {
+          scan_->has_unsupported_wrapper = true;
+          scan_->issue = "direct reduce and fill/clear require a region-level "
+                         "statement outside "
+                         "Parallel, If/While and thread-bound loops";
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+  private:
+    PtoRegionScan *scan_;
+    int forbidden_depth_ = 0;
+  };
+  TileOpScanner tileop_scanner(&scan);
+  tileop_scanner(region);
+
   if (scan.has_any_parallel && scan.units.empty()) {
     // A Parallel exists but only under an unsupported wrapper.
     scan.has_unsupported_wrapper = true;

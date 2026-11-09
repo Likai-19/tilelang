@@ -361,6 +361,61 @@ Optional<CastPlan> PlanValueCast(const CastNode *cast,
  * supported; otherwise a short description of the offending node. */
 std::optional<std::string> FindUnsupportedExprNode(const PrimExpr &expr);
 
+/*! Logical direct-reduction plan, independent of physical register width. */
+struct PtoDirectReducePlan {
+  BufferRegion source;
+  BufferRegion destination;
+  int source_prefix = 0;
+  int destination_prefix = 0;
+  int logical_rank = 0;
+  int reduction_axis = 0;
+  int output_axis = 0;
+  int destination_output_axis = 0;
+  int64_t reduction_extent = 0;
+  int64_t output_extent = 0;
+  bool reduce_across_lanes = false;
+  bool clear = true;
+  std::string operation;
+  DataType accumulator_dtype;
+};
+
+/*! Whether the call denotes a direct tile reduction. */
+bool IsPtoDirectReduce(const Call &call);
+
+/*! Check direct-reduce admission without building a lowering plan.
+ * Throws PtoAnalysisError for unsupported calls; does not change IR. VF lanes
+ * and lexical structure are checked by VerifyParallelToPTO itself. */
+void CheckPtoDirectReduce(const Call &call, arith::Analyzer *analyzer,
+                          const Map<Var, int> &buffer_versions = {});
+
+/*! Build a direct-reduce lowering plan for already verified input.
+ * Requires CheckPtoDirectReduce and the VF checks to have succeeded. */
+PtoDirectReducePlan
+PlanPtoDirectReduce(const Call &call, arith::Analyzer *analyzer,
+                    const Map<Var, int> &buffer_versions = {});
+
+/*! Ordinary UB fill plan. Version coordinates remain in destination. */
+struct PtoFillPlan {
+  BufferRegion destination;
+  PrimExpr value;
+  int continuous_axis = 0;
+  int outer_axis = -1;
+  int64_t run_extent = 0;
+  int64_t outer_extent = 1;
+};
+
+bool IsPtoFill(const Call &call);
+
+/*! Check fill/clear admission without building a lowering plan.
+ * Throws PtoAnalysisError for unsupported calls; does not change IR. */
+void CheckPtoFill(const Call &call, int64_t lanes, arith::Analyzer *analyzer,
+                  const Map<Var, int> &buffer_versions = {});
+
+/*! Build a fill/clear lowering plan for already verified input.
+ * Requires CheckPtoFill and the VF checks to have succeeded. */
+PtoFillPlan PlanPtoFill(const Call &call, arith::Analyzer *analyzer,
+                        const Map<Var, int> &buffer_versions = {});
+
 /*! Result of scanning a SIMD_VF region for parallel units. Shared by
  * Verify and Vectorize so both passes agree on skip/reject/convert
  * decisions. */
@@ -372,10 +427,14 @@ struct PtoRegionScan {
    * rejects with \p issue; Vectorize treats it as an internal error. */
   bool has_unsupported_wrapper = false;
   std::string issue;
-  /*! True when the region contains a Parallel requiring lane conversion
-   * (directly or under wrappers). Explicit legacy SIMD nests are excluded;
-   * regions with no converting Parallel retain their hand-written behavior. */
+  /*! True when the region contains any T.Parallel (directly or under wrappers).
+   * A region without Parallel, direct reduce or fill/clear remains on the
+   * existing hand-written VMI path. */
   bool has_any_parallel = false;
+  /*! True when a direct reduce occurs anywhere in the region. */
+  bool has_direct_reduce = false;
+  /*! True when a region-level fill/clear occurs in the region. */
+  bool has_fill = false;
 };
 
 /*! Scan a SIMD_VF region body (the SBlock's body, including any scope

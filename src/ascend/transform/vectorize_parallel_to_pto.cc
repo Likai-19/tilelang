@@ -47,8 +47,10 @@
 #include <set>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "buffer_version.h"
 #include "parallel_to_pto_utils.h"
 
 namespace tvm {
@@ -239,6 +241,9 @@ class VectorizeParallelToPTOImpl : public StmtExprMutator {
 public:
   static PrimFunc Substitute(PrimFunc f) {
     VectorizeParallelToPTOImpl mutator;
+    for (const Var &parameter : f->params) {
+      mutator.parameters_.insert(parameter);
+    }
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = mutator.VisitStmt(f->body);
     return GetRef<PrimFunc>(fptr);
@@ -264,7 +269,7 @@ private:
     // skip/reject/convert decisions cannot drift apart.
     const Stmt &region = op->body;
     pto_analysis::PtoRegionScan scan = pto_analysis::ScanPtoRegion(region);
-    if (!scan.has_any_parallel) {
+    if (!scan.has_any_parallel && !scan.has_direct_reduce && !scan.has_fill) {
       // Pure hand-written VMI region (possibly with control flow): skipped
       // by both passes; no lanes annotation needed.
       return StmtExprMutator::VisitStmt_(op);
@@ -273,9 +278,6 @@ private:
         << "[VectorizeParallelToPTO] internal error: unsupported wrapper "
            "structure passed Verify: "
         << scan.issue;
-    ICHECK(!scan.units.empty())
-        << "[VectorizeParallelToPTO] internal error: parallel units lost "
-           "after scan";
 
     Stmt new_body;
     {
@@ -289,9 +291,12 @@ private:
       for (const For &unit : scan.units) {
         mappings.push_back(pto_analysis::InvertPtoLaneLayout(unit));
       }
-      // Lanes come from the first unit's layout; all units in one VF
-      // share the same L (Verify enforces the annotation consistency).
-      int64_t lanes = mappings[0].lanes;
+      // Read the VF annotation directly: a reduce-only VF has no Parallel
+      // layout from which to recover lanes. Verify checks layout consistency
+      // when Parallel units are also present.
+      auto lanes_annotation = op->annotations.Get("tl.simdvf_lanes");
+      ICHECK(lanes_annotation.has_value());
+      int64_t lanes = Downcast<IntImm>(lanes_annotation.value())->value;
       // A full mask binding per VF, shared by the divisible units. A
       // region whose units all have non-divisible extents never uses it
       // (every unit builds its own per-chunk dynamic mask), so the
@@ -334,14 +339,376 @@ private:
         Stmt converted = ConvertUnit(scan.units[i], mappings[i]);
         new_region = ReplaceStmt(new_region, scan.units[i], converted);
       }
-      new_body = new_region;
+      int64_t saved_lanes = current_vf_lanes_;
+      current_vf_lanes_ = lanes;
+      new_body = VisitStmt(new_region);
+      current_vf_lanes_ = saved_lanes;
     }
+
+    pto_analysis::PtoRegionScan residual =
+        pto_analysis::ScanPtoRegion(new_body);
+    ICHECK(!residual.has_direct_reduce && !residual.has_fill)
+        << "[VectorizeParallelToPTO] direct tileops "
+           "must be standalone Evaluate(Call) statements";
 
     // new_body is (mask bind + region with all units converted); the
     // scope AttrStmt wrapper, if any, is inside it already.
     return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint, new_body,
                   op->init, op->alloc_buffers, op->match_buffers,
                   op->annotations);
+  }
+
+  Stmt LowerDirectReduce(const Call &call, int64_t lanes) {
+    pto_analysis::PtoDirectReducePlan plan =
+        pto_analysis::PlanPtoDirectReduce(call, &analyzer_, buffer_versions_);
+    bool absolute = plan.operation == "abssum" || plan.operation == "absmax";
+    bool sum = plan.operation == "sum" || plan.operation == "abssum";
+    bool maximum = plan.operation == "max" || plan.operation == "absmax";
+    auto i32 = [](int64_t value) { return IntImm(DataType::Int(32), value); };
+    DataType vector_dtype = plan.accumulator_dtype.with_lanes(lanes);
+    DataType mask_dtype = DataType::Bool(lanes);
+    Buffer accumulator =
+        tirx::decl_buffer({i32(1)}, vector_dtype, "reduce_acc", "local.var");
+    Var chunk("reduce_chunk", DataType::Int(32));
+    Var output("reduce_output", DataType::Int(32));
+    Var reduction("reduce_index", DataType::Int(32));
+    Var full_mask("reduce_domain", mask_dtype);
+    Var active_mask("reduce_active", mask_dtype);
+    auto mask = [&](const PrimExpr &active) {
+      return Call(mask_dtype, VmiOp("create_mask"), {active},
+                  {{"size", i32(lanes)}});
+    };
+    auto pointer = [&](const BufferRegion &region,
+                       const Array<PrimExpr> &indices, int64_t extent, int rw) {
+      return Call(DataType::Handle(), tl::access_ptr(),
+                  {BufferLoad(region->buffer, indices), i32(extent), i32(rw)});
+    };
+    auto source_indices = [&](const PrimExpr &out, const PrimExpr &red) {
+      Array<PrimExpr> indices;
+      for (const Range &range : plan.source->region) {
+        indices.push_back(range->min);
+      }
+      indices.Set(plan.source_prefix + plan.reduction_axis, red);
+      if (plan.logical_rank == 2) {
+        indices.Set(plan.source_prefix + plan.output_axis, out);
+      }
+      return indices;
+    };
+    auto destination_indices = [&](const PrimExpr &out) {
+      Array<PrimExpr> indices;
+      for (const Range &range : plan.destination->region) {
+        indices.push_back(range->min);
+      }
+      indices.Set(plan.destination_output_axis, out);
+      return indices;
+    };
+    auto load = [&](const PrimExpr &out, const PrimExpr &red,
+                    Array<Stmt> *statements) {
+      DataType src_dtype = plan.source->buffer->dtype;
+      int64_t footprint =
+          ((lanes + 2048 / src_dtype.bits() - 1) / (2048 / src_dtype.bits())) *
+          (2048 / src_dtype.bits());
+      PrimExpr value = EmitBind(
+          "reduce_load",
+          Call(src_dtype.with_lanes(lanes), VmiOp("vload"),
+               {pointer(plan.source, source_indices(out, red), footprint, 1),
+                i32(0)},
+               {{"size", i32(lanes)}}),
+          statements);
+      if (src_dtype != plan.accumulator_dtype) {
+        value =
+            EmitBind("reduce_cast",
+                     Call(vector_dtype, VmiOp("vcvt"), {value},
+                          {{"to_dtype",
+                            StringImm(TvmDtypeName(plan.accumulator_dtype))}}),
+                     statements);
+      }
+      if (absolute && !plan.accumulator_dtype.is_uint()) {
+        value =
+            EmitBind("reduce_abs", Call(vector_dtype, VmiOp("vabs"), {value}),
+                     statements);
+      }
+      return value;
+    };
+    auto read_accumulator = [&]() { return BufferLoad(accumulator, {i32(0)}); };
+    const char *fold_name = sum ? "vadd" : maximum ? "vmax" : "vmin";
+    auto seed = [&](const PrimExpr &first, const PrimExpr &active,
+                    Array<Stmt> *statements) -> PrimExpr {
+      if (plan.operation != "absmax") {
+        return first;
+      }
+      // Match the common Ascend/CUDA reducer's zero-initialized partial
+      PrimExpr zero = EmitBind("reduce_zero",
+                               Call(vector_dtype, VmiOp("vbrc"),
+                                    {make_zero(plan.accumulator_dtype)},
+                                    {{"size", i32(lanes)}}),
+                               statements);
+      return EmitBind("reduce_seed",
+                      Call(vector_dtype, VmiOp("vmax"), {zero, first, active}),
+                      statements);
+    };
+    Array<Stmt> body;
+    if (plan.reduce_across_lanes) {
+      PrimExpr first = load(output, i32(0), &body);
+      first = seed(first, full_mask, &body);
+      body.push_back(BufferStore(accumulator, first, {i32(0)}));
+      auto accumulate = [&](const PrimExpr &red, const PrimExpr &active,
+                            bool keep_inactive) {
+        Array<Stmt> update;
+        PrimExpr next = load(output, red, &update);
+        PrimExpr folded = EmitBind("reduce_fold",
+                                   Call(vector_dtype, VmiOp(fold_name),
+                                        {read_accumulator(), next, active}),
+                                   &update);
+        if (keep_inactive) {
+          folded = EmitBind("reduce_merge",
+                            Call(vector_dtype, VmiOp("vsel"),
+                                 {active, folded, read_accumulator()}),
+                            &update);
+        }
+        update.push_back(BufferStore(accumulator, folded, {i32(0)}));
+        return SeqStmt::Flatten(update);
+      };
+      int64_t full_chunks = plan.reduction_extent / lanes;
+      int64_t tail_lanes = plan.reduction_extent % lanes;
+      // The seed already covers the first chunk. Complete chunks need no
+      // remaining-lane calculation or merge with the previous accumulator.
+      if (full_chunks > 1) {
+        body.push_back(For(chunk, i32(1), i32(full_chunks - 1),
+                           ForKind::kSerial,
+                           accumulate(chunk * i32(lanes), full_mask, false)));
+      }
+      if (full_chunks > 0 && tail_lanes != 0) {
+        body.push_back(Bind(active_mask, mask(i32(tail_lanes))));
+        body.push_back(accumulate(i32(full_chunks * lanes), active_mask, true));
+      }
+      ffi::Map<ffi::String, ObjectRef> annotations;
+      if (sum && plan.accumulator_dtype.is_float()) {
+        annotations.Set("reassoc", IntImm(DataType::Bool(), 1));
+      }
+      const char *reduce_name = sum ? "vcadd" : maximum ? "vcmax" : "vcmin";
+      PrimExpr result =
+          EmitBind("reduce_result",
+                   Call(plan.accumulator_dtype, VmiOp(reduce_name),
+                        {read_accumulator(), full_mask}, annotations),
+                   &body);
+      if (!plan.clear) {
+        PrimExpr previous = EmitBind(
+            "reduce_previous",
+            Call(plan.accumulator_dtype, VmiOp("vload"),
+                 {pointer(plan.destination, destination_indices(output), 1, 1),
+                  i32(0)},
+                 {{"size", i32(1)}}),
+            &body);
+        PrimExpr one = EmitBind("reduce_one",
+                                Call(DataType::Bool(), VmiOp("create_mask"),
+                                     {i32(1)}, {{"size", i32(1)}}),
+                                &body);
+        // Merge the previous output only after the cross-lane reduction;
+        // seeding every lane with it would count it VL times for sum.
+        result = EmitBind("reduce_update",
+                          Call(plan.accumulator_dtype, VmiOp(fold_name),
+                               {previous, result, one}),
+                          &body);
+      }
+      body.push_back(Evaluate(Call(
+          DataType::Void(), VmiOp("vstore"),
+          {result, pointer(plan.destination, destination_indices(output), 1, 2),
+           i32(0)})));
+      Stmt output_loop = For(output, i32(0), i32(plan.output_extent),
+                             ForKind::kSerial, SeqStmt::Flatten(body));
+      Stmt compute = SeqStmt::Flatten(
+          Bind(full_mask, mask(i32(std::min(plan.reduction_extent, lanes)))),
+          output_loop);
+      return SeqStmt::Flatten(AllocBuffer(accumulator),
+                              AttrStmt(accumulator->data, "tl.vmi.alloc_kind",
+                                       StringImm("data"), compute));
+    }
+    body.push_back(
+        Bind(active_mask, mask(i32(plan.output_extent) - chunk * i32(lanes))));
+    PrimExpr first = load(chunk * i32(lanes), i32(0), &body);
+    first = seed(first, active_mask, &body);
+    body.push_back(BufferStore(accumulator, first, {i32(0)}));
+    Array<Stmt> update;
+    PrimExpr next = load(chunk * i32(lanes), reduction, &update);
+    PrimExpr folded = EmitBind("reduce_fold",
+                               Call(vector_dtype, VmiOp(fold_name),
+                                    {read_accumulator(), next, active_mask}),
+                               &update);
+    update.push_back(BufferStore(accumulator, folded, {i32(0)}));
+    if (plan.reduction_extent > 1) {
+      body.push_back(For(reduction, i32(1), i32(plan.reduction_extent - 1),
+                         ForKind::kSerial, SeqStmt::Flatten(update)));
+    }
+    if (!plan.clear) {
+      int64_t physical_lanes = 2048 / plan.accumulator_dtype.bits();
+      int64_t footprint =
+          ((lanes + physical_lanes - 1) / physical_lanes) * physical_lanes;
+      PrimExpr previous = EmitBind(
+          "reduce_previous",
+          Call(vector_dtype, VmiOp("vload"),
+               {pointer(plan.destination,
+                        destination_indices(chunk * i32(lanes)), footprint, 1),
+                i32(0)},
+               {{"size", i32(lanes)}}),
+          &body);
+      PrimExpr combined =
+          EmitBind("reduce_update",
+                   Call(vector_dtype, VmiOp(fold_name),
+                        {previous, read_accumulator(), active_mask}),
+                   &body);
+      body.push_back(BufferStore(accumulator, combined, {i32(0)}));
+    }
+    body.push_back(Evaluate(
+        Call(DataType::Void(), VmiOp("vstore"),
+             {read_accumulator(),
+              pointer(plan.destination, destination_indices(chunk * i32(lanes)),
+                      lanes, 2),
+              i32(0), active_mask})));
+    // Full chunks and the tail use the same vector reduction. Loads may read
+    // complete physical lanes; active_mask limits the fold and output store.
+    int64_t chunks = (plan.output_extent + lanes - 1) / lanes;
+    Stmt compute = For(chunk, i32(0), i32(chunks), ForKind::kSerial,
+                       SeqStmt::Flatten(body));
+    return SeqStmt::Flatten(AllocBuffer(accumulator),
+                            AttrStmt(accumulator->data, "tl.vmi.alloc_kind",
+                                     StringImm("data"), compute));
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tl::attr::kBufferVersion) {
+      BufferVersionMap saved = buffer_versions_;
+      for (const auto &[storage, count] : op->node.cast<BufferVersionMap>()) {
+        buffer_versions_.Set(storage, count);
+      }
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      buffer_versions_ = std::move(saved);
+      return result;
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  bool IsScalarFillParameter(const PrimExpr &value) const {
+    if (value.dtype() != DataType::Float(16) &&
+        value.dtype() != DataType::Float(32)) {
+      return false;
+    }
+    if (const auto *parameter = value.as<VarNode>()) {
+      return parameters_.count(GetRef<Var>(parameter)) != 0;
+    }
+    if (const auto *conversion = value.as<CastNode>()) {
+      return IsScalarFillParameter(conversion->value);
+    }
+    return false;
+  }
+
+  Stmt LowerFill(const Call &call, int64_t lanes) {
+    pto_analysis::PtoFillPlan plan =
+        pto_analysis::PlanPtoFill(call, &analyzer_, buffer_versions_);
+    auto i32 = [](int64_t value) { return IntImm(DataType::Int(32), value); };
+    Buffer dst = plan.destination->buffer;
+    DataType dtype = dst->dtype;
+    Array<Stmt> statements;
+    // Capture once at the source statement, before any destination store.
+    // Constants stay literals so the VMI bridge retains their exact dtype.
+    PrimExpr value = plan.value;
+    bool scalar_parameter = IsScalarFillParameter(value);
+    PrimExpr load_value = value;
+    std::vector<DataType> float_casts;
+    if (!scalar_parameter) {
+      while (const auto *conversion = load_value.as<CastNode>()) {
+        if (!(conversion->dtype.is_float() ||
+              conversion->dtype.is_bfloat16()) ||
+            !(conversion->value.dtype().is_float() ||
+              conversion->value.dtype().is_bfloat16())) {
+          break;
+        }
+        float_casts.push_back(conversion->dtype);
+        load_value = conversion->value;
+      }
+    }
+    if (!load_value.as<BufferLoadNode>() && !load_value.as<VarNode>()) {
+      // Integer casts and constants retain their scalar lowering. Floating
+      // UB snapshots and parameters use vector conversions below, preserving
+      // every intermediate rounding rather than collapsing a cast chain.
+      load_value = value;
+      float_casts.clear();
+    }
+    if (const auto *load = load_value.as<BufferLoadNode>()) {
+      // Capture the scalar once before any store; a later store may write
+      // the same element from which this uniform value was loaded.
+      PrimExpr address = Call(DataType::Handle(), tl::access_ptr(),
+                              {GetRef<BufferLoad>(load), i32(1), i32(1)});
+      value = EmitBind("fill_value",
+                       Call(load_value.dtype(), VmiOp("vload"),
+                            {address, i32(0)}, {{"size", i32(1)}}),
+                       &statements);
+    } else if (!scalar_parameter && !load_value.as<IntImmNode>() &&
+               !load_value.as<FloatImmNode>()) {
+      value = EmitBind("fill_value", load_value, &statements);
+    }
+    DataType broadcast_dtype = float_casts.empty() ? dtype : load_value.dtype();
+    PrimExpr vector =
+        EmitBind("fill_vector",
+                 Call(broadcast_dtype.with_lanes(lanes), VmiOp("vbrc"), {value},
+                      {{"size", i32(lanes)}}),
+                 &statements);
+    for (auto conversion = float_casts.rbegin();
+         conversion != float_casts.rend(); ++conversion) {
+      // Keep the scalar snapshot in its loaded dtype. PTOAS has no complete
+      // layout route for narrow one-lane vcvt -> broadcast -> wide store;
+      // broadcasting the uniform input before vcvt preserves the same cast
+      // per element and uses the validated full-VL conversion route.
+      vector =
+          EmitBind("fill_cast",
+                   Call(conversion->with_lanes(lanes), VmiOp("vcvt"), {vector},
+                        {{"to_dtype", StringImm(TvmDtypeName(*conversion))}}),
+                   &statements);
+    }
+    PrimExpr mask = EmitBind("fill_mask",
+                             Call(DataType::Bool(lanes), VmiOp("create_mask"),
+                                  {i32(lanes)}, {{"size", i32(lanes)}}),
+                             &statements);
+    Var row("fill_row", DataType::Int(32));
+    Var chunk("fill_chunk", DataType::Int(32));
+    Array<PrimExpr> indices;
+    for (const Range &range : plan.destination->region) {
+      indices.push_back(range->min);
+    }
+    if (plan.outer_axis >= 0) {
+      indices.Set(plan.outer_axis, row);
+    }
+    indices.Set(plan.continuous_axis, chunk * i32(lanes));
+    PrimExpr pointer = Call(DataType::Handle(), tl::access_ptr(),
+                            {BufferLoad(dst, indices), i32(lanes), i32(2)});
+    Stmt body = Evaluate(Call(DataType::Void(), VmiOp("vstore"),
+                              {vector, pointer, i32(0), mask}));
+    body = For(chunk, i32(0), i32(plan.run_extent / lanes), ForKind::kSerial,
+               body);
+    if (plan.outer_axis >= 0) {
+      body = For(row, i32(0), i32(plan.outer_extent), ForKind::kSerial, body);
+    }
+    statements.push_back(body);
+    return SeqStmt::Flatten(statements);
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    if (current_vf_lanes_ != 0) {
+      if (const auto *call = op->value.as<CallNode>()) {
+        if (pto_analysis::IsPtoDirectReduce(GetRef<Call>(call))) {
+          return LowerDirectReduce(GetRef<Call>(call), current_vf_lanes_);
+        }
+        if (pto_analysis::IsPtoFill(GetRef<Call>(call))) {
+          return LowerFill(GetRef<Call>(call), current_vf_lanes_);
+        }
+      }
+    }
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   // Replace one statement (the unit's For) with its conversion, recursing
@@ -1024,6 +1391,9 @@ private:
    * extent (invalid for divisible units). */
   tirx::Buffer remaining_buffer_{};
   int tmp_counter_ = 0;
+  int64_t current_vf_lanes_ = 0;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> parameters_;
+  BufferVersionMap buffer_versions_;
   Map<Var, PrimExpr> bind_env_; // analysis env: original var -> def expr
   Map<Var, Var> value_map_;     // value env: original var -> converted var
 };
