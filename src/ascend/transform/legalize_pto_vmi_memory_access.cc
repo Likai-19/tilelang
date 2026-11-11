@@ -61,6 +61,7 @@
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "ascend/target_utils.h"
+#include "pto_indexed_memory.h"
 #include "span_utils.h"
 
 namespace tvm {
@@ -1382,11 +1383,34 @@ void CheckIndexedAddressSnapshot(const AccessAddress &address,
   }
 }
 
-struct IndexedOwner {
-  Buffer buffer;
-  PrimExpr origin;
-  PrimExpr extent;
-};
+// The hand-written path also supports dtype-changing views. Preserve that
+// validation while sharing the indexed owner descriptor representation.
+using IndexedOwner = pto::IndexedMemoryOwner;
+
+IndexedOwner ValidateIndexedOwnerStorage(arith::Analyzer *analyzer,
+                                         const Buffer &owner,
+                                         const std::string &op_name,
+                                         const Span &span) {
+  if (std::optional<std::string> tight = OwnerTightReason(analyzer, owner)) {
+    Fail(op_name + " owner is not usable: " + tight.value(), span);
+  }
+  Array<PrimExpr> owner_origin = owner.OffsetOf(BufferZeros(owner));
+  if (owner_origin.size() != 1) {
+    Fail(op_name +
+             " owner requires a single scalar linear origin; axis separators "
+             "are not supported",
+         span);
+  }
+  PrimExpr origin = owner_origin[0];
+  if (!analyzer->CanProveEqual(origin, IntConst(0))) {
+    std::ostringstream oss;
+    oss << op_name << " owner origin must be provably zero, but elem_offset "
+        << origin << " (buffer " << BufferContext(owner)
+        << ") is not provably zero";
+    Fail(oss.str(), span);
+  }
+  return {owner, origin, OwnerExtent(analyzer, owner, op_name, span)};
+}
 
 bool IsByteAddressableIndexedType(DataType dtype) {
   return dtype.is_scalar() && !dtype.is_bool() && !dtype.is_float4_e2m1fn() &&
@@ -1517,35 +1541,14 @@ IndexedOwner ValidateIndexedOwner(arith::Analyzer *analyzer,
     CheckIndexedAddressSnapshot(address, op_name, span);
   }
   ValidateUbBuffer(owner, op_name + " owner", span);
-  if (std::optional<std::string> tight = OwnerTightReason(analyzer, owner)) {
-    Fail(op_name + " owner is not usable: " + tight.value(), span);
-  }
-  Array<PrimExpr> owner_origin_expr = owner.OffsetOf(BufferZeros(owner));
-  if (owner_origin_expr.size() != 1) {
-    Fail(op_name +
-             " owner requires a single scalar linear origin; axis separators "
-             "are not supported",
-         span);
-  }
-  PrimExpr origin = owner_origin_expr[0];
-  if (!analyzer->CanProveEqual(origin, IntConst(0))) {
-    std::ostringstream oss;
-    oss << op_name << " owner origin must be provably zero, but elem_offset "
-        << origin << " (buffer " << BufferContext(owner)
-        << ") is not provably zero";
-    Fail(oss.str(), span);
-  }
-
+  IndexedOwner owner_storage =
+      ValidateIndexedOwnerStorage(analyzer, owner, op_name, span);
   if (address.buffer->dtype == owner->dtype) {
-    // Keep the original owner Buffer and symbolic capacity expression intact
-    // on the existing same-dtype path.
-    PrimExpr extent = OwnerExtent(analyzer, owner, op_name, span);
-    return {owner, origin, extent};
+    return owner_storage;
   }
 
-  PrimExpr owner_extent = OwnerExtent(analyzer, owner, op_name, span);
   PrimExpr typed_extent =
-      ConvertOwnerCapacity(analyzer, owner_extent, owner->dtype,
+      ConvertOwnerCapacity(analyzer, owner_storage.extent, owner->dtype,
                            address.buffer->dtype, op_name, span);
   ValidateDtypeChangingView(analyzer, address, owner, typed_extent, op_name,
                             span);
@@ -2108,42 +2111,12 @@ private:
                      "access address",
            span);
     }
-    if (!analyzer_->CanProve(instruction_offset >= 0)) {
-      Fail(op_name +
-               " requires the instruction base offset D = S - O + offset to be "
-               "provably non-negative and inside the owner",
-           span);
-    }
-    // Compare D against the int64 owner capacity in a signed domain that
-    // preserves D.  D keeps its original expression and dtype in the emitted
-    // instruction; only this comparison widens it.  Narrowing a wide D can
-    // wrap, or abort while the analyzer builds an out-of-range literal, before
-    // any proof is attempted.  Widen an unsigned 64-bit D only after its range
-    // is proven to fit the signed 64-bit domain.
-    PrimExpr capacity_offset = instruction_offset;
-    const bool offset_comparable =
-        RepresentableInInt64(analyzer_, capacity_offset);
-    if (offset_comparable) {
-      capacity_offset = WidenToInt64(capacity_offset);
-    }
-    if (!offset_comparable ||
-        !analyzer_->CanProve(capacity_offset < owner.extent)) {
-      std::ostringstream oss;
-      oss << op_name
-          << " requires the instruction base offset D = S - O + offset to be "
-             "provably inside the owner (D < whole-owner element capacity)";
-      if (!offset_comparable) {
-        oss << "; D has an unsigned 64-bit range that cannot be compared with "
-               "the int64 capacity without losing integer precision";
-      }
-      Fail(oss.str(), span);
-    }
+    pto::CheckIndexedMemoryBase(owner, instruction_offset, analyzer_, op_name,
+                                span);
 
-    // The owner descriptor replaces any existing caller-declared extent.  All
-    // non-address operands, annotations and the result dtype are kept verbatim;
-    // gather offset vectors are never converted or folded into D.
-    PrimExpr pointer = MakeDescriptor(owner.buffer, BufferZeros(owner.buffer),
-                                      owner.extent, is_gather ? 1 : 2);
+    // The owner descriptor replaces any existing caller-declared extent. All
+    // other operands are unchanged; vector offsets never enter scalar D.
+    PrimExpr pointer = pto::MakeIndexedMemoryDescriptor(owner, !is_gather);
     Array<PrimExpr> args;
     args.reserve(call->args.size());
     for (size_t index = 0; index < call->args.size(); ++index) {
@@ -2212,6 +2185,69 @@ Stmt LegalizeVmiStmt(Stmt stmt, arith::Analyzer *analyzer) {
 }
 
 } // namespace
+
+namespace pto {
+
+IndexedMemoryOwner GetIndexedMemoryOwner(
+    const Buffer &source, const std::vector<Buffer> &active_allocations,
+    arith::Analyzer *analyzer, const std::string &context, const Span &span) {
+  Buffer owner = FindAllocationOwner(active_allocations, source, context, span);
+  // Capacity is an allocation-time snapshot. Inspect source nodes before
+  // arithmetic simplification can erase a mutable read or call.
+  if (std::optional<std::string> stability =
+          OwnerCapacityStabilityReason(owner)) {
+    Fail(context + " " + stability.value(), span);
+  }
+  ValidateUbBuffer(source, context + " source", span);
+  ValidateUbBuffer(owner, context + " owner", span);
+  if (source->dtype != owner->dtype) {
+    std::ostringstream oss;
+    oss << context << " requires the source element dtype " << source->dtype
+        << " to match the owner element dtype " << owner->dtype;
+    Fail(oss.str(), span);
+  }
+  return ValidateIndexedOwnerStorage(analyzer, owner, context, span);
+}
+
+void CheckIndexedMemoryBase(const IndexedMemoryOwner &owner,
+                            const PrimExpr &instruction_offset,
+                            arith::Analyzer *analyzer,
+                            const std::string &context, const Span &span) {
+  if (!IsIntegerScalar(instruction_offset)) {
+    Fail(context + " requires a scalar integer instruction offset", span);
+  }
+  if (!analyzer->CanProve(instruction_offset >= 0)) {
+    Fail(context +
+             " requires the instruction base offset D = S - O + offset to be "
+             "provably non-negative and inside the owner",
+         span);
+  }
+  // Compare in int64 without changing D in the emitted instruction.
+  PrimExpr capacity_offset = instruction_offset;
+  const bool comparable = RepresentableInInt64(analyzer, capacity_offset);
+  if (comparable) {
+    capacity_offset = WidenToInt64(capacity_offset);
+  }
+  if (!comparable || !analyzer->CanProve(capacity_offset < owner.extent)) {
+    std::ostringstream oss;
+    oss << context
+        << " requires the instruction base offset D = S - O + offset to be "
+           "provably inside the owner (D < whole-owner element capacity)";
+    if (!comparable) {
+      oss << "; D has an unsigned 64-bit range that cannot be compared with "
+             "the int64 capacity without losing integer precision";
+    }
+    Fail(oss.str(), span);
+  }
+}
+
+PrimExpr MakeIndexedMemoryDescriptor(const IndexedMemoryOwner &owner,
+                                     bool is_write) {
+  return MakeDescriptor(owner.buffer, BufferZeros(owner.buffer), owner.extent,
+                        is_write ? 2 : 1);
+}
+
+} // namespace pto
 
 namespace transform {
 

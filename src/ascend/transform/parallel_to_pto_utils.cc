@@ -15,6 +15,7 @@
 #include "../../op/utils.h"
 
 #include <functional>
+#include <memory>
 #include <sstream>
 
 namespace tvm {
@@ -415,6 +416,8 @@ std::string AccessPatternToString(AccessPattern pattern) {
     return "continuous";
   case AccessPattern::kLaneUniform:
     return "lane-uniform";
+  case AccessPattern::kIndexed:
+    return "indexed";
   default:
     return "unknown";
   }
@@ -472,7 +475,8 @@ PtoInverseMapping InvertPtoLaneLayout(const For &loop) {
         "pto_parallel_loop_layout requires replicate_size == 1");
   }
 
-  const int64_t *lanes_ptr = as_const_int(fragment->ThreadExtent());
+  PrimExpr thread_extent = fragment->ThreadExtent();
+  const int64_t *lanes_ptr = as_const_int(thread_extent);
   if (lanes_ptr == nullptr || *lanes_ptr <= 0) {
     throw PtoAnalysisError(
         "pto_parallel_loop_layout thread extent must be a positive constant");
@@ -770,143 +774,189 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
   access.elem_dtype = buffer->dtype;
   access.is_write = is_write;
 
-  // Resolve Bind aliases in the indices first: a bound index var
-  // must follow its definition, not be treated as lane-independent. The
-  // resolver rejects chains that exceed the limit instead of silently
-  // stopping.
-  //
-  // Only *pure coordinate* aliases (loop vars, arithmetic over
-  // loop vars/consts) may be expanded. A Bind whose definition contains a
-  // BufferLoad holds an SSA value: re-expanding it into a memory read can
-  // cross a same-point store and wrongly cancel (the loaded value and the
-  // current buffer state differ). Addresses that depend on loaded values
-  // have no supported lowering and are rejected here.
-  Array<PrimExpr> resolved;
-  for (const auto &idx : indices) {
-    auto opt = ResolveIndexAliases(idx, bind_env);
-    if (!opt.has_value()) {
-      std::ostringstream oss;
-      oss << "buffer `" << buffer->name
-          << "`: bind alias chain in index is too deep, cyclic, or "
-             "depends on a loaded value (data-dependent addresses are "
-             "not yet supported)";
-      throw PtoAnalysisError(oss.str());
+  Optional<Var> kept_var;
+  int64_t kept_extent = 0;
+  if (mapping.is_2d && mapping.serial_var() != nullptr) {
+    kept_var = GetRef<Var>(mapping.serial_var());
+    kept_extent =
+        mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
+  }
+  PtoAddressAnalysis analyzed = AnalyzePtoAddress(
+      buffer, indices, loop_var, mapping.index_expr, mapping.lane_var,
+      mapping.chunk_var, mapping.lanes, mapping.chunk_count, kept_var,
+      kept_extent, bind_env, analyzer);
+  access.original_offset = analyzed.original_offset;
+  access.scalar_base_offset = analyzed.scalar_base_offset;
+  access.relative_extent = analyzed.relative_extent;
+  access.source_indices = analyzed.source_indices;
+  access.indices_after_inverse = analyzed.indices_after_inverse;
+  access.start_indices = analyzed.start_indices;
+  switch (analyzed.pattern) {
+  case PtoAddressPattern::kContinuous:
+    access.pattern = AccessPattern::kContinuous;
+    break;
+  case PtoAddressPattern::kLaneUniform:
+    access.pattern = AccessPattern::kLaneUniform;
+    break;
+  case PtoAddressPattern::kIndexed:
+    access.pattern = AccessPattern::kIndexed;
+    break;
+  }
+  return access;
+}
+
+PrimExpr PreparePtoIndexedOffset(const MemoryAccess &access,
+                                 const PrimExpr &relative) {
+  PrimExpr native = relative;
+  while (const auto *conversion = native.as<CastNode>()) {
+    const DataType from = conversion->value.dtype();
+    const DataType to = conversion->dtype;
+    if (!(from.is_int() || from.is_uint()) || !(to.is_int() || to.is_uint()) ||
+        from.bits() >= to.bits() || !conversion->annotations.empty()) {
+      break;
     }
-    resolved.push_back(opt.value());
+    native = conversion->value;
   }
-  // Address expressions must only contain supported
-  // nodes; opaque calls in addresses have no lowering rule and would be
-  // silently collapsed to one evaluation per chunk.
-  for (const auto &idx : resolved) {
-    if (!IsSupportedAddressExpr(idx)) {
-      std::ostringstream oss;
-      oss << "buffer `" << buffer->name
-          << "`: address expression contains a loaded value or an "
-             "unsupported call (loaded values and opaque/extern calls "
-             "cannot appear in addresses; they would be evaluated once per "
-             "chunk instead of per element)";
-      throw PtoAnalysisError(oss.str());
+  PrimExpr result = relative;
+  if (native.dtype().bits() == 16) {
+    for (const PrimExpr &index : access.source_indices) {
+      if (ExprDeepEqual()(native, index)) {
+        result = native;
+        break;
+      }
     }
   }
-
-  // indices_after_inverse: substitute loop_var with the inverse mapping's
-  // own expression (mapping.index_expr — the single source of truth; do
-  // not rebuild chunk * L + lane here).
-  Array<PrimExpr> indices_after_inverse;
-  for (const auto &idx : resolved) {
-    indices_after_inverse.push_back(analyzer->Simplify(
-        SubstituteVar(idx, loop_var.get(), mapping.index_expr)));
-  }
-  access.indices_after_inverse = indices_after_inverse;
-
-  // start_indices: bind lane = 0.
-  Array<PrimExpr> start_indices;
-  for (const auto &idx : indices_after_inverse) {
-    start_indices.push_back(analyzer->Simplify(
-        SubstituteVar(idx, mapping.lane_var.get(), make_zero(idx.dtype()))));
-  }
-  access.start_indices = start_indices;
-
-  // data_offset via ElemOffset (handles strides / elem_offset / versions).
-  Array<PrimExpr> elem_offsets = buffer->ElemOffset(indices_after_inverse);
-  if (elem_offsets.size() != 1) {
+  if (result.dtype().bits() > access.elem_dtype.bits()) {
     std::ostringstream oss;
-    oss << "buffer `" << buffer->name
-        << "`: ElemOffset must return exactly one physical axis, got "
-        << elem_offsets.size();
+    oss << "indexed " << result.dtype().bits()
+        << "-bit offsets require implicit narrowing to "
+        << access.elem_dtype.bits()
+        << " bits; use a native 16-bit index or an explicit source Cast only "
+           "after ensuring the complete element offset is representable";
     throw PtoAnalysisError(oss.str());
   }
-  access.data_offset = analyzer->Simplify(elem_offsets[0]);
+  return result;
+}
 
-  Array<PrimExpr> start_elem_offsets = buffer->ElemOffset(start_indices);
-  ICHECK_EQ(start_elem_offsets.size(), 1u);
-  access.start_offset = analyzer->Simplify(start_elem_offsets[0]);
+namespace {
 
-  // Classify with a *complete* proof: continuous means
-  // data_offset == start_offset + lane over the whole [0, L) lane range,
-  // not a two-point difference. Bind the ranges and require the analyzer
-  // to prove the identity; anything it cannot prove is rejected.
-  // The lane-uniform check shares this range-bound proof
-  // analyzer — with an unbound analyzer a chunk-uniform address such as
-  // (i // L) * L cannot be proven equal to its lane=0 substitution (the
-  // proof needs 0 <= lane < L), so legal inputs were mis-rejected.
-  arith::Analyzer proof;
-  proof.Bind(
-      mapping.lane_var,
-      Range::FromMinExtent(make_zero(mapping.lane_var->dtype),
-                           IntImm(mapping.lane_var->dtype, mapping.lanes)));
-  // The chunk proof domain is the per-row padded chunk range
-  // [0, Q) with Q = P / L on the vectorized dimension — for a 2D unit the
-  // *in-row* chunk count, never the global position K*Q (the global
-  // flattened position only appears in the Fragment forward/inverse
-  // layout checks, not in address proofs).
-  proof.Bind(mapping.chunk_var,
-             Range::FromMinExtent(
-                 make_zero(mapping.chunk_var->dtype),
-                 IntImm(mapping.chunk_var->dtype, mapping.chunk_count)));
-  // In a 2D unit the kept coordinate is bounded by its own loop
-  // extent — a fact the layout candidate already uses when it accepts
-  // the unit. Binding it here keeps the final proof domain
-  // identical to the candidate's, so range-dependent but legal addresses
-  // (e.g. a term multiplied by i // 4 with i in [0, 4)) prove continuous.
-  // This adds no facts beyond the loop definitions; it proves nothing
-  // about buffer bounds or cross-point dependencies.
-  if (mapping.is_2d && mapping.serial_var() != nullptr) {
-    const VarNode *serial = mapping.serial_var();
-    const int64_t kept_extent =
+// Only coordinates and their integer arithmetic can be generated at a narrower
+// width without converting an already loaded vector. Check every intermediate
+// on active iterations. Tail offsets are sanitized before indexed memory
+// operations, so integer wrap in an inactive lane cannot affect an access.
+bool CanGenerateUint16Offsets(const PrimExpr &offset, const Var &loop_var,
+                              const PtoInverseMapping &mapping,
+                              arith::Analyzer *analyzer) {
+  std::unique_ptr<arith::Analyzer> proof = analyzer->Clone();
+  proof->Bind(loop_var, Range::FromMinExtent(
+                            make_zero(loop_var.dtype()),
+                            IntImm(loop_var.dtype(), mapping.logical_extent)));
+  Optional<Var> kept;
+  if (mapping.is_2d) {
+    kept = mapping.select_inner ? mapping.outer_var : mapping.inner_var;
+    int64_t extent =
         mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
-    proof.Bind(GetRef<Var>(serial),
-               Range::FromMinExtent(make_zero(serial->dtype),
-                                    IntImm(serial->dtype, kept_extent)));
+    proof->Bind(kept.value(),
+                Range::FromMinExtent(make_zero(kept.value().dtype()),
+                                     IntImm(kept.value().dtype(), extent)));
   }
-  {
-    PrimExpr identity =
-        access.data_offset - (access.start_offset + mapping.lane_var);
-    if (proof.CanProveEqual(identity, make_zero(identity.dtype()))) {
-      access.pattern = AccessPattern::kContinuous;
-      return access;
+  std::function<bool(const PrimExpr &)> check = [&](const PrimExpr &expr) {
+    if (expr.dtype() != DataType::Int(32) &&
+        expr.dtype() != DataType::UInt(32)) {
+      return false;
     }
-  }
-
-  // Lane-uniform: the offset does not depend on lane at the current
-  // program point (version/outer-coordinate indices may stay). Proven
-  // over the full lane range with the same bound analyzer.
-  {
-    PrimExpr at_zero =
-        proof.Simplify(SubstituteVar(access.data_offset, mapping.lane_var.get(),
-                                     make_zero(access.data_offset.dtype())));
-    if (proof.CanProveEqual(access.data_offset, at_zero)) {
-      access.pattern = AccessPattern::kLaneUniform;
-      return access;
+    if (const auto *add = expr.as<AddNode>()) {
+      if (!check(add->a) || !check(add->b)) {
+        return false;
+      }
+    } else if (const auto *sub = expr.as<SubNode>()) {
+      if (!check(sub->a) || !check(sub->b)) {
+        return false;
+      }
+    } else if (const auto *mul = expr.as<MulNode>()) {
+      if (!check(mul->a) || !check(mul->b)) {
+        return false;
+      }
+    } else if (!expr.as<IntImmNode>() && !expr.as<VarNode>()) {
+      return false;
     }
-  }
+    arith::ConstIntBound bound = proof->const_int_bound(expr);
+    return bound->min_value >= 0 && bound->max_value <= 65535;
+  };
+  return check(offset);
+}
 
-  std::ostringstream oss;
-  oss << "buffer `" << buffer->name
-      << "`: cannot prove the address is continuous "
-         "(data_offset == start + lane over the full lane range) or "
-         "lane-uniform; only these two patterns are supported";
-  throw PtoAnalysisError(oss.str());
+} // namespace
+
+PtoIndexedAccessPlan PlanPtoIndexedAccess(const MemoryAccess &access,
+                                          const IndexedMemoryOwner &owner,
+                                          const Var &loop_var,
+                                          const PtoInverseMapping &mapping,
+                                          arith::Analyzer *analyzer) {
+  PtoIndexedAccessPlan plan{make_zero(DataType::Int(32)),
+                            access.original_offset, false};
+  // A large allocation can still be addressed directly when every active
+  // coordinate offset fits ui16. Its unused capacity need not fit the window.
+  if (access.elem_dtype.bits() == 16 &&
+      CanGenerateUint16Offsets(plan.offsets, loop_var, mapping, analyzer)) {
+    plan.uint16_offsets = true;
+    return plan;
+  }
+  if (access.elem_dtype.bits() == 16 &&
+      !analyzer->CanProve(owner.extent <= 65536)) {
+    plan.rebased = true;
+    plan.base = access.scalar_base_offset;
+    if (!analyzer->CanProve(access.relative_extent > 0) ||
+        !analyzer->CanProve(access.relative_extent <= 65536)) {
+      throw PtoAnalysisError("B16 indexed access requires a ui16 relative "
+                             "window of at most 65536 elements");
+    }
+    // Keep emitted expressions independent of the caller's simplification
+    // facts, so Verify and Vectorize prepare the same relative offset.
+    arith::Analyzer expression_analyzer;
+    plan.offsets = expression_analyzer.Simplify(access.original_offset -
+                                                access.scalar_base_offset);
+  }
+  if (access.elem_dtype.bits() == 16 && plan.offsets.dtype().bits() == 32 &&
+      CanGenerateUint16Offsets(plan.offsets, loop_var, mapping, analyzer)) {
+    plan.uint16_offsets = true;
+  } else {
+    plan.offsets = PreparePtoIndexedOffset(access, plan.offsets);
+  }
+  return plan;
+}
+
+void CheckPtoIndexedAccessPlan(const PtoIndexedAccessPlan &plan,
+                               const IndexedMemoryOwner &owner,
+                               const Var &loop_var,
+                               const PtoInverseMapping &mapping,
+                               arith::Analyzer *analyzer) {
+  if (!plan.rebased) {
+    return;
+  }
+  std::unique_ptr<arith::Analyzer> proof = analyzer->Clone();
+  proof->Bind(mapping.chunk_var,
+              Range::FromMinExtent(
+                  make_zero(mapping.chunk_var.dtype()),
+                  IntImm(mapping.chunk_var.dtype(), mapping.chunk_count)));
+  if (mapping.is_2d) {
+    const Var kept =
+        mapping.select_inner ? mapping.outer_var : mapping.inner_var;
+    const int64_t extent =
+        mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
+    proof->Bind(kept, Range::FromMinExtent(make_zero(kept.dtype()),
+                                           IntImm(kept.dtype(), extent)));
+  }
+  PrimExpr base = SubstituteVar(plan.base, loop_var.get(), mapping.index_expr);
+  base = proof->Simplify(SubstituteVar(base, mapping.lane_var.get(),
+                                       make_zero(mapping.lane_var.dtype())));
+  if (!proof->CanProve(base >= 0) || !proof->CanProve(base < owner.extent)) {
+    std::ostringstream oss;
+    oss << "B16 indexed access requires the scalar instruction base D to be "
+           "provably inside the owner (0 <= D < "
+        << owner.extent << "), but the rebased access produces base " << base;
+    throw PtoAnalysisError(oss.str());
+  }
 }
 
 bool IsSupportedElementDType(DataType dtype) {
@@ -1271,7 +1321,8 @@ PtoRegionScan ScanPtoRegion(const Stmt &region) {
       }
     }
     void VisitStmt_(const ForNode *op) final {
-      scan_->has_any_parallel |= op->kind == ForKind::kParallel;
+      scan_->has_any_parallel |=
+          op->kind == ForKind::kParallel && !UsesExplicitSIMD(op->body);
       int saved = forbidden_depth_;
       if (op->kind != ForKind::kSerial && op->kind != ForKind::kUnrolled) {
         ++forbidden_depth_;
@@ -1442,7 +1493,10 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
       return LaneUse::kVarying;
     } catch (const PtoAnalysisError &err) {
       if (reason != nullptr) {
-        *reason = err.what();
+        std::ostringstream oss;
+        oss << "nested access to buffer `" << load->buffer->name
+            << "`: " << err.what();
+        *reason = oss.str();
       }
       return LaneUse::kUnknown;
     }

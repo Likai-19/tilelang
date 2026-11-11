@@ -10,11 +10,12 @@
  * LayoutInference and verified by VerifyParallelToPTO. Per parallel unit:
  *   1. invert the lane fragment through the shared helper (the inverse
  *      layout's own Forward result is the single source of truth);
- *   2. build the chunk loop for q in [0, E/L), mapping the loop variable
- *      to q * L + lane;
+ *   2. build one chunk loop q in [0, ceil(E/L)), mapping the logical
+ *      index to q * L + lane;
  *   3. classify every access via the shared MemoryAccess analysis
  *      (continuous -> vload/vstore via tl.access_ptr(start, L, rw);
- *      lane-uniform -> scalar BufferLoad with lane bound to 0);
+ *      lane-uniform load -> scalar BufferLoad; indexed load/store and
+ *      lane-uniform store -> masked gather/scatter with element offsets);
  *   4. convert value expressions (value roles tracked by result dtype);
  *      every VMI with a return value is bound through EmitBind before use;
  *   5. delete the consumed layout annotation, keep the SIMD_VF block
@@ -23,18 +24,13 @@
  * Supported shapes: 1D parallel units and two-layer adjacent Parallel nests
  * (2D — the nest converts as one unit with the layout
  * annotation on its outermost For); sequential units allowed; static
- * divisible extents; full masks. A third parallel layer or any other
+ * extents with full or tail masks. A third parallel layer or any other
  * unsupported structure is rejected by Verify.
  *
- * Non-divisible extents emit a tail chunk whose vload reads the full L
- * lanes from its chunk base: the ISA intentionally keeps load instructions
- * unmasked for performance, so the per-chunk tail mask constrains
- * computation and stores only, never the load. Reading the full L lanes
- * past the logical tail is still safe on device — the top 8K of UB is
- * reserved as stack space, so the extra read-only lanes cannot fault; they
- * carry undefined values that the compute and store masks keep out of the
- * valid outputs. Compact outputs of exactly E elements remain safe because
- * the masked store never writes past E.
+ * Non-divisible extents use a per-chunk mask in the same loop. Continuous
+ * vload is unmasked: the caller must provide initialized readable padding
+ * for every complete logical vector. Indexed offsets are sanitized in every
+ * iteration when the unit has a tail, and passed directly otherwise.
  */
 
 #include <tvm/tirx/builtin.h>
@@ -52,6 +48,7 @@
 
 #include "buffer_version.h"
 #include "parallel_to_pto_utils.h"
+#include "pto_indexed_memory.h"
 
 namespace tvm {
 namespace tl {
@@ -131,10 +128,10 @@ private:
   static bool DiscardableRhs(const PrimExpr &rhs) {
     // Positive "allowed to discard" set: a Call may disappear
     // only when it is one of the tl.vmi.* ops this pass actually emits as
-    // a Bind RHS and that is pure/read-only by construction — vload
-    // (read), vbrc, vci, vadd, vmul and vcvt (pure), enumerated from the
-    // ConvertUnit/VmiOp call sites — or the pure tl.access_ptr address
-    // descriptor nested inside a vload operand (already whitelisted as a
+    // a Bind RHS and that is pure/read-only by construction — vload/vgather
+    // (reads) and arithmetic, select or conversion ops (pure), enumerated from
+    // the ConvertUnit/VmiOp call sites — or the pure tl.access_ptr address
+    // descriptor nested inside a load operand (already whitelisted as a
     // pure index intrinsic by IsSupportedAddressExpr). vstore never
     // appears as a Bind RHS; any other Call — call_extern, other tl.* or
     // an unknown op — keeps its Bind. Plain UB BufferLoads are
@@ -145,19 +142,11 @@ private:
     // are rejected there, and opaque calls are already excluded
     // from addresses.
     static const std::set<std::string> kDiscardable = {
-        "tl.vmi.vload",
-        "tl.vmi.vbrc",
-        "tl.vmi.vci",
-        "tl.vmi.vadd",
-        "tl.vmi.vsub",
-        "tl.vmi.vmul",
-        "tl.vmi.vdiv",
-        "tl.vmi.vabs",
-        "tl.vmi.vexp",
-        "tl.vmi.vln",
-        "tl.vmi.vsqrt",
-        "tl.vmi.vcvt",
-        "tl.vmi.vinterpret_cast",
+        "tl.vmi.vload",  "tl.vmi.vgather", "tl.vmi.vsel",
+        "tl.vmi.vbrc",   "tl.vmi.vci",     "tl.vmi.vadd",
+        "tl.vmi.vsub",   "tl.vmi.vmul",    "tl.vmi.vdiv",
+        "tl.vmi.vabs",   "tl.vmi.vexp",    "tl.vmi.vln",
+        "tl.vmi.vsqrt",  "tl.vmi.vcvt",    "tl.vmi.vinterpret_cast",
         "tl.access_ptr",
     };
     bool discardable = true;
@@ -250,6 +239,18 @@ public:
   }
 
 private:
+  // AllocBuffer is a flat definition visible to later siblings. Every other
+  // statement restores the owner environment on leaving its lexical scope.
+  Stmt VisitStmt(const Stmt &stmt) final {
+    if (stmt.as<AllocBufferNode>()) {
+      return StmtExprMutator::VisitStmt(stmt);
+    }
+    const size_t allocation_mark = active_allocations_.size();
+    Stmt result = StmtExprMutator::VisitStmt(stmt);
+    active_allocations_.resize(allocation_mark);
+    return result;
+  }
+
   // ------------------------------------------------------------------
   // Unified unit discovery (shared rules with Verify).
   // A SIMD_VF region contains zero or more *sequential* parallel units.
@@ -262,6 +263,9 @@ private:
   // SIMD_VF block entry
   // ------------------------------------------------------------------
   Stmt VisitStmt_(const SBlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers) {
+      active_allocations_.push_back(buffer);
+    }
     if (op->name_hint != "SIMD_VF") {
       return StmtExprMutator::VisitStmt_(op);
     }
@@ -297,20 +301,15 @@ private:
       auto lanes_annotation = op->annotations.Get("tl.simdvf_lanes");
       ICHECK(lanes_annotation.has_value());
       int64_t lanes = Downcast<IntImm>(lanes_annotation.value())->value;
-      // A full mask binding per VF, shared by the divisible units. A
-      // region whose units all have non-divisible extents never uses it
-      // (every unit builds its own per-chunk dynamic mask), so the
-      // binding is only emitted when at least one divisible unit needs
-      // it.
-      bool any_divisible = false;
+      // Divisible units share a static full mask. Units with a tail use
+      // their own per-iteration mask throughout the unified chunk loop.
+      shared_mask_ = Var();
+      bool needs_full_mask = false;
       for (const pto_analysis::PtoInverseMapping &mapping : mappings) {
-        if (mapping.tail_lanes == 0) {
-          any_divisible = true;
-          break;
-        }
+        needs_full_mask |= mapping.tail_lanes == 0;
       }
       Stmt new_region = region;
-      if (any_divisible) {
+      if (needs_full_mask) {
         shared_mask_ = Var("mask", DataType::Bool(static_cast<int>(lanes)));
         PrimExpr mask_value = Call(
             DataType::Bool(static_cast<int>(lanes)), VmiOp("create_mask"),
@@ -336,8 +335,7 @@ private:
       // maps, counters) is reset per unit; the shared full mask, when
       // emitted, is visible to every unit.
       for (size_t i = 0; i < scan.units.size(); ++i) {
-        Stmt converted = ConvertUnit(scan.units[i], mappings[i]);
-        new_region = ReplaceStmt(new_region, scan.units[i], converted);
+        new_region = ReplaceStmt(new_region, scan.units[i], mappings[i]);
       }
       int64_t saved_lanes = current_vf_lanes_;
       current_vf_lanes_ = lanes;
@@ -585,7 +583,19 @@ private:
       buffer_versions_ = std::move(saved);
       return result;
     }
+    if (op->attr_key == tirx::attr::thread_extent) {
+      if (const auto *iv = op->node.as<IterVarNode>()) {
+        With<arith::ConstraintContext> launch_bounds(
+            &analyzer_, iv->var >= 0 && iv->var < op->value);
+        return StmtExprMutator::VisitStmt_(op);
+      }
+    }
     return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    active_allocations_.push_back(op->buffer);
+    return GetRef<Stmt>(op);
   }
 
   bool IsScalarFillParameter(const PrimExpr &value) const {
@@ -714,12 +724,29 @@ private:
   // Replace one statement (the unit's For) with its conversion, recursing
   // through the same wrapper kinds DiscoverUnits understands.
   Stmt ReplaceStmt(const Stmt &body, const For &target,
-                   const Stmt &replacement) {
+                   const pto_analysis::PtoInverseMapping &mapping) {
+    // Conversion needs the owner environment at the unit's source position,
+    // including allocations inside VF-local blocks and flat definitions.
+    struct AllocationScope {
+      std::vector<Buffer> *allocations;
+      size_t mark;
+      bool restore;
+      ~AllocationScope() {
+        if (restore) {
+          allocations->resize(mark);
+        }
+      }
+    } allocation_scope{&active_allocations_, active_allocations_.size(),
+                       body.as<AllocBufferNode>() == nullptr};
+    if (const auto *alloc = body.as<AllocBufferNode>()) {
+      active_allocations_.push_back(alloc->buffer);
+      return body;
+    }
     if (const auto *for_node = body.as<ForNode>()) {
       if (for_node == target.get()) {
-        return replacement;
+        return ConvertUnit(target, mapping);
       }
-      Stmt nb = ReplaceStmt(for_node->body, target, replacement);
+      Stmt nb = ReplaceStmt(for_node->body, target, mapping);
       if (nb.same_as(for_node->body)) {
         return body;
       }
@@ -731,21 +758,24 @@ private:
       Array<Stmt> new_seq;
       bool changed = false;
       for (const auto &s : seq->seq) {
-        Stmt ns = ReplaceStmt(s, target, replacement);
+        Stmt ns = ReplaceStmt(s, target, mapping);
         changed |= !ns.same_as(s);
         new_seq.push_back(ns);
       }
       return changed ? SeqStmt::Flatten(new_seq) : body;
     }
     if (const auto *attr = body.as<AttrStmtNode>()) {
-      Stmt nb = ReplaceStmt(attr->body, target, replacement);
+      Stmt nb = ReplaceStmt(attr->body, target, mapping);
       if (nb.same_as(attr->body)) {
         return body;
       }
       return AttrStmt(attr->node, attr->attr_key, attr->value, nb);
     }
     if (const auto *block = body.as<SBlockNode>()) {
-      Stmt nb = ReplaceStmt(block->body, target, replacement);
+      for (const Buffer &buffer : block->alloc_buffers) {
+        active_allocations_.push_back(buffer);
+      }
+      Stmt nb = ReplaceStmt(block->body, target, mapping);
       if (nb.same_as(block->body)) {
         return body;
       }
@@ -754,18 +784,12 @@ private:
                     block->match_buffers, block->annotations);
     }
     if (const auto *realize = body.as<SBlockRealizeNode>()) {
-      // nb is the replaced *body* of the block (a SeqStmt/For/etc.), not an
-      // SBlock: rebuild the block with the new body first.
-      SBlock block = realize->block;
-      Stmt nb = ReplaceStmt(block->body, target, replacement);
-      if (nb.same_as(block->body)) {
+      SBlock block =
+          Downcast<SBlock>(ReplaceStmt(realize->block, target, mapping));
+      if (block.same_as(realize->block)) {
         return body;
       }
-      SBlock new_block =
-          SBlock(block->iter_vars, block->reads, block->writes,
-                 block->name_hint, nb, block->init, block->alloc_buffers,
-                 block->match_buffers, block->annotations);
-      return SBlockRealize(realize->iter_values, realize->predicate, new_block);
+      return SBlockRealize(realize->iter_values, realize->predicate, block);
     }
     return body;
   }
@@ -778,164 +802,94 @@ private:
     // The inverse mapping comes from the region entry: it is the shared
     // source of truth for lanes, the mask plan and the body conversion
     // (see InvertPtoLaneLayout).
-    // Reset per-unit conversion state.
     bind_env_.clear();
     value_map_.clear();
     tmp_counter_ = 0;
-    // Keep the complete mapping (2D fields included) for the
-    // per-access analysis calls in ConvertBody.
     unit_mapping_ = mapping;
-
-    // For a 2D unit the vectorized coordinate is the selected
-    // dimension; the other one stays a serial loop var. The converted
-    // body is the innermost compute body.
-    const ForNode *inner = nullptr;
+    Optional<For> inner;
     if (const auto *body_for = loop->body.as<ForNode>()) {
       if (body_for->kind == ForKind::kParallel) {
-        inner = body_for;
+        inner = GetRef<For>(body_for);
       }
     }
-    const Var vector_var =
-        mapping.is_2d
-            ? (mapping.select_inner ? mapping.inner_var : mapping.outer_var)
-            : loop->loop_var;
-    loop_var_ = vector_var;
+    loop_var_ = mapping.is_2d ? (mapping.select_inner ? mapping.inner_var
+                                                      : mapping.outer_var)
+                              : loop->loop_var;
     lanes_ = mapping.lanes;
-    // The chunk loop covers the padded chunk count Q = P / L
-    // (mapping.chunk_count), which includes the tail chunk of a
-    // non-divisible extent.
-    nchunks_ = mapping.chunk_count;
-    chunk_var_ = Var("q", vector_var.dtype());
-    lane_var_ = mapping.lane_var; // analysis placeholder; never escapes
+    lane_var_ = mapping.lane_var;
     chunk_analysis_ = mapping.chunk_var;
-
-    // The substitution loop_var -> chunk_analysis_ * L + lane_var_ drives
-    // all address/index rewriting (same expression the shared helper
-    // uses).
     lane_indexed_expr_ = mapping.index_expr;
+    Var chunk("q", loop_var_.dtype());
+    chunk_index_ = chunk;
+    analyzer_.Bind(chunk, Range::FromMinExtent(
+                              make_zero(chunk.dtype()),
+                              IntImm(chunk.dtype(), mapping.chunk_count)));
+    if (mapping.is_2d) {
+      const Var kept =
+          mapping.select_inner ? mapping.outer_var : mapping.inner_var;
+      const int64_t extent =
+          mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
+      analyzer_.Bind(kept, Range::FromMinExtent(make_zero(kept.dtype()),
+                                                IntImm(kept.dtype(), extent)));
+    }
 
-    // A divisible extent uses the caller's shared full mask (constant
-    // across chunks). A non-divisible extent gets a per-unit scalar
-    // `remaining` that starts at the logical extent E and decreases by L
-    // per chunk; each chunk binds a dynamic create_mask(remaining, L)
-    // before the body and updates remaining at the chunk end. The tail
-    // chunk's mask zeroes the lanes past E, which protects the store
-    // (loads still read the full padded range — the caller guarantees
-    // its readability; the store mask never widens a write past E).
-    // The mask var must exist before the body conversion: the
-    // converted vstore/vadd reference it while the body is built.
+    // Decide once from the static extent. A tail-bearing unit keeps the
+    // existing element-wise remaining-mask loop, including its full chunks.
     const bool has_tail = mapping.tail_lanes != 0;
-    if (!has_tail) {
-      mask_var_ = shared_mask_;
-    } else {
-      // decl_buffer shapes the Var with a local.var pointer type; the
-      // codegen reads the scope from there and emits the scalar
-      // local-variable form the PTODSL surface expects.
-      remaining_buffer_ =
+    Buffer remaining;
+    if (has_tail) {
+      remaining =
           tirx::decl_buffer({IntImm(DataType::Int(32), 1)}, DataType::Int(32),
                             "remaining", "local.var");
-      // The per-chunk mask bind is emitted inside the chunk loop below;
-      // this var is what it binds and what the body references.
       mask_var_ = Var("mask", DataType::Bool(static_cast<int>(lanes_)));
-    }
-
-    // Convert the unit body statements in order. For a 2D unit this is
-    // the innermost compute body; the outer (kept) coordinate is
-    // re-emitted as a serial loop around the chunk loop.
-    Array<Stmt> unit_stmts;
-    ConvertBody(inner != nullptr ? static_cast<const Stmt &>(inner->body)
-                                 : static_cast<const Stmt &>(loop->body),
-                &unit_stmts);
-
-    // Drop binds whose value is never used (address-only aliases and
-    // unused source binds strand vci/vbrc/vadd/vload chains) before the
-    // chunk loop is built.
-    Stmt eliminated = DeadBindElim()(SeqStmt::Flatten(unit_stmts));
-    Array<Stmt> chunk_seq;
-    if (!has_tail) {
-      chunk_seq.push_back(std::move(eliminated));
     } else {
-      // Per-chunk mask bind + body + remaining update, in that order.
-      // mask_var_ was created before the body conversion.
-      PrimExpr remaining_load =
-          BufferLoad(remaining_buffer_, {make_zero(DataType::Int(32))});
-      PrimExpr mask_value =
-          Call(DataType::Bool(static_cast<int>(lanes_)), VmiOp("create_mask"),
-               {remaining_load},
-               {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}});
-      chunk_seq.push_back(Bind(mask_var_, mask_value));
-      chunk_seq.push_back(std::move(eliminated));
-      PrimExpr next_remaining =
-          remaining_load -
-          IntImm(DataType::Int(32), static_cast<int64_t>(lanes_));
-      chunk_seq.push_back(BufferStore(remaining_buffer_, next_remaining,
-                                      {make_zero(DataType::Int(32))}));
+      ICHECK(shared_mask_.defined());
+      mask_var_ = shared_mask_;
     }
-    Stmt chunk_body = SeqStmt::Flatten(chunk_seq);
-    Stmt chunk_loop =
-        For(chunk_var_, make_zero(chunk_var_->dtype),
-            IntImm(chunk_var_->dtype, static_cast<int64_t>(nchunks_)),
-            ForKind::kSerial, chunk_body);
-    if (inner == nullptr) {
-      if (!has_tail) {
-        return chunk_loop;
-      }
-      // remaining lives across the whole chunk loop: declare it, set it
-      // to E once before the loop.
-      Stmt init =
-          BufferStore(remaining_buffer_,
-                      IntImm(DataType::Int(32),
-                             static_cast<int64_t>(mapping.logical_extent)),
-                      {make_zero(DataType::Int(32))});
-      return SeqStmt::Flatten(AllocBuffer(remaining_buffer_),
-                              SeqStmt::Flatten(init, chunk_loop));
-    }
-    // 2D: keep the non-vectorized coordinate as the outer
-    // serial loop; the vectorized dimension becomes the chunk loop.
-    const Var kept_var =
-        mapping.select_inner ? loop->loop_var : inner->loop_var;
-    const int64_t kept_extent =
-        mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
-    Stmt kept_body = chunk_loop;
+
+    Array<Stmt> statements;
+    const Stmt &source = inner.defined() ? inner.value()->body : loop->body;
+    ConvertBody(source, &statements);
+    Stmt converted = DeadBindElim()(SeqStmt::Flatten(statements));
+    Array<Stmt> chunk_body;
     if (has_tail) {
-      // remaining resets to E inside the kept loop: every row starts a
-      // fresh recursion, so rows are independent and the tail chunk of
-      // each row masks exactly that row's tail lanes.
-      Stmt init =
-          BufferStore(remaining_buffer_,
-                      IntImm(DataType::Int(32),
-                             static_cast<int64_t>(mapping.logical_extent)),
-                      {make_zero(DataType::Int(32))});
-      kept_body = SeqStmt::Flatten(init, chunk_loop);
+      PrimExpr count = BufferLoad(remaining, {make_zero(DataType::Int(32))});
+      chunk_body.push_back(
+          Bind(mask_var_, Call(mask_var_.dtype(), VmiOp("create_mask"), {count},
+                               {{"size", IntImm(DataType::Int(32), lanes_)}})));
+      chunk_body.push_back(converted);
+      chunk_body.push_back(
+          BufferStore(remaining, count - IntImm(DataType::Int(32), lanes_),
+                      {make_zero(DataType::Int(32))}));
+    } else {
+      chunk_body.push_back(converted);
     }
-    Stmt kept_loop =
-        For(kept_var, make_zero(kept_var->dtype),
-            IntImm(kept_var->dtype, static_cast<int64_t>(kept_extent)),
-            ForKind::kSerial, kept_body);
-    if (!has_tail) {
-      return kept_loop;
+    Stmt body = For(chunk, make_zero(chunk.dtype()),
+                    IntImm(chunk.dtype(), mapping.chunk_count),
+                    ForKind::kSerial, SeqStmt::Flatten(chunk_body));
+    if (has_tail) {
+      Stmt init = BufferStore(remaining,
+                              IntImm(DataType::Int(32), mapping.logical_extent),
+                              {make_zero(DataType::Int(32))});
+      body = SeqStmt::Flatten(init, body);
     }
-    return SeqStmt::Flatten(AllocBuffer(remaining_buffer_), kept_loop);
+    if (inner.defined()) {
+      // Reset remaining inside the kept loop so every row/column has the
+      // same ceil(E/L) iterations and its own final partial mask.
+      const Var kept_var =
+          mapping.select_inner ? loop->loop_var : inner.value()->loop_var;
+      const int64_t kept_extent =
+          mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
+      body = For(kept_var, make_zero(kept_var.dtype()),
+                 IntImm(kept_var.dtype(), kept_extent), ForKind::kSerial, body);
+    }
+    return has_tail ? SeqStmt::Flatten(AllocBuffer(remaining), body) : body;
   }
 
-  // Substitute the analysis chunk var with the real loop var q (and keep
-  // the lane placeholder for lane-binding steps).
+  // Substitute the analysis chunk placeholder with the unified loop's q.
   PrimExpr BindChunkToQ(const PrimExpr &expr) const {
-    class Replacer : public ExprMutator {
-    public:
-      Replacer(const VarNode *from, const Var &to) : from_(from), to_(to) {}
-      PrimExpr VisitExpr_(const VarNode *op) final {
-        if (op == from_) {
-          return to_;
-        }
-        return ffi::GetRef<PrimExpr>(op);
-      }
-
-    private:
-      const VarNode *from_;
-      Var to_;
-    };
-    return Replacer(chunk_analysis_.get(), chunk_var_)(expr);
+    return pto_analysis::SubstituteVar(expr, chunk_analysis_.get(),
+                                       chunk_index_);
   }
 
   // Rewrite Var references inside metadata objects through value_map_
@@ -987,6 +941,177 @@ private:
     return ZeroLane(lane_var_)(expr);
   }
 
+  PrimExpr Broadcast(PrimExpr value, Array<Stmt> *pre) {
+    if (value.dtype().lanes() != 1)
+      return value;
+    return EmitBind("broadcast",
+                    Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"),
+                         {value},
+                         {{"size", IntImm(DataType::Int(32), lanes_)}}),
+                    pre);
+  }
+
+  bool IsUniform(const PrimExpr &expr) {
+    Optional<Var> kept_var;
+    int64_t kept_extent = 0;
+    if (unit_mapping_.is_2d) {
+      kept_var = unit_mapping_.select_inner ? unit_mapping_.outer_var
+                                            : unit_mapping_.inner_var;
+      kept_extent = unit_mapping_.select_inner ? unit_mapping_.outer_extent
+                                               : unit_mapping_.inner_extent;
+    }
+    return pto_analysis::IsPtoLaneUniform(
+        expr, loop_var_, lane_indexed_expr_, lane_var_, chunk_analysis_, lanes_,
+        unit_mapping_.chunk_count, kept_var, kept_extent, bind_env_);
+  }
+
+  PrimExpr ConvertScalarExpr(const PrimExpr &expr) {
+    class ScalarRemap : public ExprMutator {
+    public:
+      explicit ScalarRemap(VectorizeParallelToPTOImpl *parent)
+          : parent_(parent) {}
+      PrimExpr VisitExpr_(const VarNode *op) final {
+        auto it = parent_->value_map_.find(GetRef<Var>(op));
+        if (it != parent_->value_map_.end()) {
+          ICHECK_EQ((*it).second.dtype().lanes(), 1);
+          return (*it).second;
+        }
+        return GetRef<PrimExpr>(op);
+      }
+
+    private:
+      VectorizeParallelToPTOImpl *parent_;
+    } remap(this);
+    PrimExpr scalar = pto_analysis::SubstituteVar(
+        expr, loop_var_.get(), BindChunkToQ(lane_indexed_expr_));
+    scalar = analyzer_.Simplify(SubstituteLaneZero(scalar));
+    return analyzer_.Simplify(remap(scalar));
+  }
+
+  PrimExpr ScalarBufferLoad(const Buffer &buffer,
+                            const Array<PrimExpr> &indices) {
+    bool remap_metadata = false;
+    auto inspect = [&](const PrimExpr &expr) {
+      PostOrderVisit(expr, [&](const ObjectRef &node) {
+        if (const auto *var = node.as<VarNode>()) {
+          remap_metadata |=
+              var == loop_var_.get() || value_map_.count(GetRef<Var>(var));
+        }
+      });
+    };
+    for (const PrimExpr &shape : buffer->shape)
+      inspect(shape);
+    for (const PrimExpr &stride : buffer->strides)
+      inspect(stride);
+    inspect(buffer->elem_offset);
+    if (remap_metadata) {
+      // Flatten the complete address before remapping it: unused metadata
+      // may mention a vector Bind even when the physical address is scalar.
+      for (const Buffer &owner : active_allocations_) {
+        if (owner->data.same_as(buffer->data) &&
+            owner->dtype == buffer->dtype) {
+          Buffer flat = owner.GetFlattenedBuffer();
+          PrimExpr offset = ConvertScalarExpr(buffer->ElemOffset(indices)[0]);
+          return BufferLoad(flat,
+                            {analyzer_.Simplify(offset - flat->elem_offset)});
+        }
+      }
+    }
+    return BufferLoad(buffer, indices);
+  }
+
+  PrimExpr ConvertUint16Offset(const PrimExpr &expr, Array<Stmt> *pre) {
+    const DataType dtype = DataType::UInt(16);
+    const DataType vector_dtype = VectorDType(dtype, lanes_);
+    if (const auto *integer = expr.as<IntImmNode>()) {
+      return make_const(dtype, integer->value);
+    }
+    if (const auto *var = expr.as<VarNode>()) {
+      if (var == loop_var_.get()) {
+        PrimExpr base = analyzer_.Simplify(
+            BindChunkToQ(SubstituteLaneZero(lane_indexed_expr_)));
+        return EmitBind("offset_vci",
+                        Call(vector_dtype, VmiOp("vci"), {cast(dtype, base)},
+                             {{"size", IntImm(DataType::Int(32), lanes_)}}),
+                        pre);
+      }
+      return cast(dtype, ConvertScalarExpr(expr));
+    }
+    const PrimExpr *lhs;
+    const PrimExpr *rhs;
+    std::string operation;
+    if (const auto *add = expr.as<AddNode>()) {
+      lhs = &add->a;
+      rhs = &add->b;
+      operation = "vadd";
+    } else if (const auto *sub = expr.as<SubNode>()) {
+      lhs = &sub->a;
+      rhs = &sub->b;
+      operation = "vsub";
+    } else {
+      const auto *mul = expr.as<MulNode>();
+      ICHECK(mul) << "unsupported proved uint16 offset node "
+                  << expr->GetTypeKey();
+      lhs = &mul->a;
+      rhs = &mul->b;
+      operation = "vmul";
+    }
+    PrimExpr a = ConvertUint16Offset(*lhs, pre);
+    PrimExpr b = ConvertUint16Offset(*rhs, pre);
+    if (a.dtype().lanes() == 1 && b.dtype().lanes() == 1) {
+      if (operation == "vadd") {
+        return a + b;
+      }
+      if (operation == "vsub") {
+        return a - b;
+      }
+      return a * b;
+    }
+    return EmitBind("offset",
+                    Call(vector_dtype, VmiOp(operation),
+                         {Broadcast(a, pre), Broadcast(b, pre), mask_var_}),
+                    pre);
+  }
+
+  struct IndexedOperands {
+    PrimExpr pointer;
+    PrimExpr base;
+    PrimExpr offsets;
+  };
+
+  IndexedOperands LowerIndexed(const pto_analysis::MemoryAccess &access,
+                               const PrimExpr &mask, Array<Stmt> *pre) {
+    pto_analysis::IndexedMemoryOwner owner =
+        pto_analysis::GetIndexedMemoryOwner(access.buffer, active_allocations_,
+                                            &analyzer_,
+                                            "VectorizeParallelToPTO");
+    pto_analysis::PtoIndexedAccessPlan plan =
+        pto_analysis::PlanPtoIndexedAccess(access, owner, loop_var_,
+                                           unit_mapping_, &analyzer_);
+    PrimExpr base = plan.rebased ? ConvertScalarExpr(plan.base) : plan.base;
+    PrimExpr offsets =
+        Broadcast(plan.uint16_offsets ? ConvertUint16Offset(plan.offsets, pre)
+                                      : ConvertExpr(plan.offsets, pre),
+                  pre);
+    // A tail-bearing unit sanitizes offsets in every iteration. Divisible
+    // units pass the loaded/calculated offsets directly, without cleaning.
+    if (unit_mapping_.tail_lanes != 0) {
+      PrimExpr zero =
+          EmitBind("offset_zero",
+                   Call(offsets.dtype(), VmiOp("vbrc"),
+                        {make_zero(offsets.dtype().element_of())},
+                        {{"size", IntImm(DataType::Int(32), lanes_)}}),
+                   pre);
+      offsets = EmitBind(
+          "safe_offsets",
+          Call(offsets.dtype(), VmiOp("vsel"), {mask, offsets, zero}), pre);
+    }
+    // PTOAS normalizes signedness and widens narrow offset carriers.
+    // PreparePtoIndexedOffset rejects implicit narrowing before conversion.
+    return {pto_analysis::MakeIndexedMemoryDescriptor(owner, access.is_write),
+            base, offsets};
+  }
+
   // ------------------------------------------------------------------
   // Statement conversion (pre-binds first, then the statement)
   // ------------------------------------------------------------------
@@ -1000,7 +1125,10 @@ private:
     if (const auto *bind = body.as<BindNode>()) {
       // Whitelist is Verify's job; defensive check here.
       Array<Stmt> pre;
-      PrimExpr value = ConvertExpr(bind->value, &pre);
+      PrimExpr value = pto_analysis::IsPtoIndexDType(bind->value.dtype()) &&
+                               IsUniform(bind->value)
+                           ? ConvertScalarExpr(bind->value)
+                           : ConvertExpr(bind->value, &pre);
       // Pre-binds first, then the Bind itself.
       for (const auto &s : pre) {
         out->push_back(s);
@@ -1017,42 +1145,28 @@ private:
       auto access = pto_analysis::AnalyzeBufferAccess(
           store->buffer, store->indices, /*is_write=*/true, loop_var_,
           CurrentMapping(), &analyzer_, bind_env_);
+      value = Broadcast(value, &pre);
+      PrimExpr call;
       if (access.pattern == pto_analysis::AccessPattern::kContinuous) {
-        if (value.dtype().lanes() == 1) {
-          value = EmitBind(
-              "vbrc_val",
-              Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"), {value},
-                   {{"size",
-                     IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
-              &pre);
+        Array<PrimExpr> starts;
+        for (const PrimExpr &index : access.start_indices) {
+          starts.push_back(ConvertScalarExpr(BindChunkToQ(index)));
         }
-        Array<PrimExpr> start_idx;
-        for (const auto &idx : access.start_indices) {
-          start_idx.push_back(
-              analyzer_.Simplify(BindChunkToQ(SubstituteLaneZero(idx))));
-        }
-        PrimExpr ptr =
-            Call(DataType::Handle(), tl::access_ptr(),
-                 {BufferLoad(store->buffer, start_idx),
-                  IntImm(DataType::Int(32), static_cast<int>(lanes_)),
-                  IntImm(DataType::Int(32), 2)});
-        for (const auto &s : pre) {
-          out->push_back(s);
-        }
-        out->push_back(Evaluate(
-            Call(DataType::Void(), VmiOp("vstore"),
-                 {value, ptr, IntImm(DataType::Int(32), 0), mask_var_})));
+        PrimExpr ptr = Call(DataType::Handle(), tl::access_ptr(),
+                            {ScalarBufferLoad(store->buffer, starts),
+                             IntImm(DataType::Int(32), lanes_),
+                             IntImm(DataType::Int(32), 2)});
+        call = Call(DataType::Void(), VmiOp("vstore"),
+                    {value, ptr, IntImm(DataType::Int(32), 0), mask_var_});
       } else {
-        // Verify rejects lane-uniform stores (the current
-        // support boundary), so this branch is unreachable. Treat any
-        // survivor as an internal error, same style as the wrapper
-        // checks above.
-        ICHECK(false)
-            << "[VectorizeParallelToPTO] internal error: lane-uniform store `"
-            << store->buffer->name
-            << "` passed Verify; lane-uniform stores must be rejected by "
-               "VerifyParallelToPTO";
+        IndexedOperands operands = LowerIndexed(access, mask_var_, &pre);
+        call = Call(DataType::Void(), VmiOp("vscatter"),
+                    {value, operands.pointer, operands.base, operands.offsets,
+                     mask_var_});
       }
+      for (const Stmt &stmt : pre)
+        out->push_back(stmt);
+      out->push_back(Evaluate(call));
       return;
     }
     if (const auto *attr = body.as<AttrStmtNode>()) {
@@ -1127,12 +1241,11 @@ private:
       if (access.pattern == pto_analysis::AccessPattern::kContinuous) {
         Array<PrimExpr> start_idx;
         for (const auto &idx : access.start_indices) {
-          start_idx.push_back(
-              analyzer_.Simplify(BindChunkToQ(SubstituteLaneZero(idx))));
+          start_idx.push_back(ConvertScalarExpr(BindChunkToQ(idx)));
         }
         PrimExpr ptr =
             Call(DataType::Handle(), tl::access_ptr(),
-                 {BufferLoad(load->buffer, start_idx),
+                 {ScalarBufferLoad(load->buffer, start_idx),
                   IntImm(DataType::Int(32), static_cast<int>(lanes_)),
                   IntImm(DataType::Int(32), 1)});
         // VMI with a return value goes through EmitBind.
@@ -1142,6 +1255,15 @@ private:
                              {{"size", IntImm(DataType::Int(32),
                                               static_cast<int>(lanes_))}}),
                         pre);
+      }
+      if (access.pattern == pto_analysis::AccessPattern::kIndexed) {
+        IndexedOperands operands = LowerIndexed(access, mask_var_, pre);
+        return EmitBind(
+            "gather",
+            Call(VectorDType(load->dtype, lanes_), VmiOp("vgather"),
+                 {operands.pointer, operands.base, operands.offsets, mask_var_},
+                 {{"pmode", StringImm("zero")}}),
+            pre);
       }
       // lane-uniform scalar load: keep the BufferLoad (lane bound to 0,
       // chunk bound to q — indices resolve through the bind env
@@ -1153,9 +1275,9 @@ private:
       Array<PrimExpr> indices;
       for (const auto &idx : access.indices_after_inverse) {
         indices.push_back(
-            analyzer_.Simplify(BindChunkToQ(SubstituteLaneZero(idx))));
+            ConvertScalarExpr(BindChunkToQ(SubstituteLaneZero(idx))));
       }
-      return EmitBind("sload", BufferLoad(load->buffer, indices), pre);
+      return EmitBind("sload", ScalarBufferLoad(load->buffer, indices), pre);
     }
     if (const auto *var = expr.as<VarNode>()) {
       auto it = value_map_.find(GetRef<Var>(var));
@@ -1189,6 +1311,16 @@ private:
     }
     if (const auto *div = expr.as<DivNode>()) {
       return ConvertBinary(div->a, div->b, "vdiv", pre);
+    }
+    if (expr.as<ModNode>() || expr.as<MinNode>() || expr.as<MaxNode>() ||
+        expr.as<SelectNode>()) {
+      ICHECK(IsUniform(expr))
+          << "[VectorizeParallelToPTO] internal error: unsupported "
+             "lane-varying indexed coordinate passed Verify: "
+          << expr->GetTypeKey();
+      PrimExpr coordinate = pto_analysis::SubstituteVar(expr, loop_var_.get(),
+                                                        lane_indexed_expr_);
+      return ConvertScalarExpr(BindChunkToQ(coordinate));
     }
     if (const auto *call = expr.as<CallNode>()) {
       // Hardware-backed unary math (fabs/exp/log/sqrt); the dtype matrix
@@ -1288,6 +1420,9 @@ private:
           << VectorDType(cast->dtype, lanes_);
       return current;
     }
+    if (pto_analysis::IsPtoScalarCoordinate(expr, loop_var_, bind_env_)) {
+      return ConvertScalarExpr(expr);
+    }
     LOG(FATAL) << "[VectorizeParallelToPTO] internal error: unsupported "
                   "expression passed Verify: "
                << expr->GetTypeKey();
@@ -1377,22 +1512,19 @@ private:
 
   // Per-unit state.
   Var loop_var_;
-  Var chunk_var_;      // real emitted loop var (q)
-  Var chunk_analysis_; // analysis placeholder from the inverse mapping
-  Var lane_var_;       // analysis placeholder; never escapes
+  PrimExpr chunk_index_; // unified chunk loop Var
+  Var chunk_analysis_;   // analysis placeholder from the inverse mapping
+  Var lane_var_;         // analysis placeholder; never escapes
   PrimExpr lane_indexed_expr_;
   /*! The complete inverse mapping of the unit being converted
    * (2D fields included), consumed by CurrentMapping(). */
   pto_analysis::PtoInverseMapping unit_mapping_;
   int64_t lanes_ = 0;
-  int64_t nchunks_ = 0;
   Var mask_var_;
-  /*! Per-unit scalar buffer holding `remaining` for a non-divisible
-   * extent (invalid for divisible units). */
-  tirx::Buffer remaining_buffer_{};
   int tmp_counter_ = 0;
   int64_t current_vf_lanes_ = 0;
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> parameters_;
+  std::vector<Buffer> active_allocations_;
   BufferVersionMap buffer_versions_;
   Map<Var, PrimExpr> bind_env_; // analysis env: original var -> def expr
   Map<Var, Var> value_map_;     // value env: original var -> converted var

@@ -1490,26 +1490,47 @@ def test_wrapping_cast_condition_does_not_install_false_facts(context):
         _run(_sblock(body, work))
 
 
-def test_descriptor_construction_with_branch_assertion():
+@pytest.mark.parametrize("explicit, access_position", [(False, "then"), (True, "then"), (True, "else"), (True, "after")])
+def test_descriptor_construction_with_branch_assertion(explicit, access_position):
     work = _buffer((1, 128))
     i = tirx.Var("i", "int32")
     condition = tirx.Cast("uint32", i - 1) < _int(2, "uint32")
     assertion = tirx.AssertStmt(i < 2, tirx.StringImm("range"))
-    store = _evaluate(_vstore(_vec("value"), _load(work, [_int(0), 64 * i])))
-    tail = tirx.IfThenElse(condition, tirx.SeqStmt([assertion, store]), None)
+    if explicit:
+        pointer = _access_ptr(work, [_int(0), _int(0)], 128, 2)
+        store = _evaluate(_vstore(_vec("value"), pointer, offset=64 * i))
+    else:
+        store = _evaluate(_vstore(_vec("value"), _load(work, [_int(0), 64 * i])))
+    # Only a store in the assertion's own branch may use its i < 2 fact.
+    # At i == 3 the assertion does not execute and an unguarded store is OOB.
+    if access_position == "then":
+        tail = tirx.IfThenElse(condition, tirx.SeqStmt([assertion, store]), None)
+    elif access_position == "else":
+        tail = tirx.IfThenElse(condition, assertion, store)
+    else:
+        tail = tirx.SeqStmt([tirx.IfThenElse(condition, assertion, None), store])
     body = tirx.For(i, 0, 4, tirx.ForKind.SERIAL, tail)
-    _assert_no_raw_address(_run(_sblock(body, work)))
+    if access_position == "then":
+        _assert_no_raw_address(_run(_sblock(body, work)))
+        return
+    with pytest.raises(tvm.error.InternalError, match="complete physical access envelope exceeds the descriptor"):
+        _run(_sblock(body, work))
 
 
 @pytest.mark.parametrize("scope", ["for_min", "for_extent", "block_min", "block_extent", "attr", "assume", "while"])
-def test_descriptor_construction_with_body_assertion(scope):
+@pytest.mark.parametrize("explicit, access_position", [(False, "inside"), (True, "inside"), (True, "after")])
+def test_descriptor_construction_with_body_assertion(scope, explicit, access_position):
     work = _buffer((1, 128))
     i, j = tirx.Var("i", "int32"), tirx.Var("j", "int32")
     execute_body = tirx.Var("execute_body", "bool")
     unsafe = tirx.Cast("int32", tirx.Cast("uint32", i - 1))
     assertion = tirx.AssertStmt(i < 2, tirx.StringImm("range"))
-    store = _evaluate(_vstore(_vec("value"), _load(work, [_int(0), 64 * i])))
-    scoped_body = tirx.SeqStmt([assertion, store])
+    if explicit:
+        pointer = _access_ptr(work, [_int(0), _int(0)], 128, 2)
+        store = _evaluate(_vstore(_vec("value"), pointer, offset=64 * i))
+    else:
+        store = _evaluate(_vstore(_vec("value"), _load(work, [_int(0), 64 * i])))
+    scoped_body = tirx.SeqStmt([assertion, store]) if access_position == "inside" else assertion
     if scope == "for_min":
         wrapper = tirx.For(j, unsafe, 0, tirx.ForKind.SERIAL, scoped_body)
     elif scope == "for_extent":
@@ -1528,10 +1549,18 @@ def test_descriptor_construction_with_body_assertion(scope):
         wrapper = tirx.AttrStmt(condition, "tl.assume", _int(0), scoped_body)
     else:
         wrapper = tirx.While(execute_body, scoped_body)
-    body = tirx.For(i, 0, 4, tirx.ForKind.SERIAL, wrapper)
-    result = _run(_sblock(body, work), params=[execute_body])
-    assert len(_vmi_calls(result, "tl.vmi.vstore")) == 1
-    _assert_no_raw_address(result)
+    tail = wrapper if access_position == "inside" else tirx.SeqStmt([wrapper, store])
+    body = tirx.For(i, 0, 4, tirx.ForKind.SERIAL, tail)
+    # An assertion may prove a store in its own scope. It must not prove a
+    # subsequent store, especially when a zero-trip loop or false predicate
+    # skips the assertion entirely (i == 3 would make the store out of bounds).
+    if access_position == "inside":
+        result = _run(_sblock(body, work), params=[execute_body])
+        assert len(_vmi_calls(result, "tl.vmi.vstore")) == 1
+        _assert_no_raw_address(result)
+    else:
+        with pytest.raises(tvm.error.InternalError, match="complete physical access envelope exceeds the descriptor"):
+            _run(_sblock(body, work), params=[execute_body])
 
 
 def test_cast_safe_in_guarded_scope_keeps_proof():

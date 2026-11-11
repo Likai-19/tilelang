@@ -29,11 +29,13 @@
 #include <functional>
 #include <set>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 #include "../../transform/common/attr.h"
 #include "buffer_version.h"
 #include "parallel_to_pto_utils.h"
+#include "pto_indexed_memory.h"
 
 namespace tvm {
 namespace tl {
@@ -302,6 +304,210 @@ private:
   // ------------------------------------------------------------------
   // Unit-level checks
   // ------------------------------------------------------------------
+  // Run before the expression/statement whitelist: Legalize may add old-value
+  // reads to conditional stores, or turn branches into Select. Classify the
+  // original access at its execution position, without following a saved
+  // load's Var back to its definition and changing that execution position.
+  class ConditionalIndexedAccessVisitor : public StmtExprVisitor {
+  public:
+    ConditionalIndexedAccessVisitor(
+        VerifyParallelToPTOImpl *parent, const Var &loop_var,
+        const pto_analysis::PtoInverseMapping &mapping,
+        const std::set<const VarNode *> &external_defs,
+        const Map<Var, PrimExpr> &bind_env = {})
+        : parent_(parent), loop_var_(loop_var), mapping_(mapping),
+          bind_env_(bind_env) {
+      for (const VarNode *var : external_defs) {
+        defs_.insert(GetRef<Var>(var));
+      }
+      defs_.insert(loop_var);
+      for (const auto &[var, value] : bind_env) {
+        defs_.insert(var);
+      }
+      if (mapping.is_2d) {
+        defs_.insert(mapping.select_inner ? mapping.outer_var
+                                          : mapping.inner_var);
+      }
+    }
+
+    void VisitStmt_(const IfThenElseNode *op) final {
+      std::ostringstream condition;
+      condition << op->condition;
+      InContext("IfThenElse condition `" + condition.str() + "`",
+                [&] { VisitExpr(op->condition); });
+      auto visit_branch = [&](const Stmt &body, const char *branch) {
+        Map<Var, PrimExpr> saved_env = bind_env_;
+        VarSet saved_defs = defs_;
+        InContext(std::string("IfThenElse ") + branch + " branch (condition `" +
+                      condition.str() + "`)",
+                  [&] { VisitStmt(body); });
+        bind_env_ = std::move(saved_env);
+        defs_ = std::move(saved_defs);
+      };
+      visit_branch(op->then_case, "then");
+      if (op->else_case.defined()) {
+        visit_branch(op->else_case.value(), "else");
+      }
+    }
+
+    void VisitExpr_(const SelectNode *op) final {
+      InContext("Select condition", [&] { VisitExpr(op->condition); });
+      InContext("Select true value", [&] { VisitExpr(op->true_value); });
+      InContext("Select false value", [&] { VisitExpr(op->false_value); });
+    }
+
+    void VisitExpr_(const CallNode *op) final {
+      if (auto call_op = op->op.as<Op>()) {
+        const std::string &name = call_op.value()->name;
+        if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
+            name == "tirx.sqrt") {
+          StmtExprVisitor::VisitExpr_(op);
+        }
+      }
+      // Unknown calls (including unsupported conditional intrinsics) keep
+      // their existing whitelist diagnostic; do not infer their evaluation.
+    }
+
+    void VisitExpr_(const LetNode *) final {}
+
+    void VisitStmt_(const BindNode *op) final {
+      InContextIfActive("Bind `" + std::string(op->var->name_hint) + "` value",
+                        [&] { VisitExpr(op->value); });
+      bind_env_.Set(op->var, op->value);
+      defs_.insert(op->var);
+    }
+
+    void VisitStmt_(const AttrStmtNode *op) final {
+      Map<Var, PrimExpr> saved_env = bind_env_;
+      VarSet saved_defs = defs_;
+      if (auto node = op->node.try_cast<PrimExpr>()) {
+        VisitExpr(node.value());
+      }
+      StmtExprVisitor::VisitStmt_(op);
+      bind_env_ = std::move(saved_env);
+      defs_ = std::move(saved_defs);
+    }
+
+    // These forms are rejected by the existing unit whitelist. Do not infer
+    // execution or lexical semantics for them in this narrower check.
+    void VisitStmt_(const ForNode *) final {}
+    void VisitStmt_(const WhileNode *) final {}
+    void VisitStmt_(const SBlockNode *) final {}
+    void VisitStmt_(const SBlockRealizeNode *) final {}
+    void VisitStmt_(const AssertStmtNode *) final {}
+
+    void VisitStmt_(const BufferStoreNode *op) final {
+      VisitPredicatedAccess(op->predicate, "BufferStore", [&] {
+        // Check the original store even when there is no old-value load.
+        CheckAccess(op->buffer, op->indices, /*is_write=*/true);
+        StmtExprVisitor::VisitStmt_(op);
+      });
+    }
+
+    void VisitExpr_(const BufferLoadNode *op) final {
+      VisitPredicatedAccess(op->predicate, "BufferLoad", [&] {
+        // Nested index reads have their own access classification and may
+        // require gather even when the enclosing payload access does not.
+        StmtExprVisitor::VisitExpr_(op);
+        CheckAccess(op->buffer, op->indices, /*is_write=*/false);
+      });
+    }
+
+  private:
+    using VarSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
+
+    void InContext(const std::string &context,
+                   const std::function<void()> &visit) {
+      contexts_.push_back(context);
+      visit();
+      contexts_.pop_back();
+    }
+
+    void InContextIfActive(const std::string &context,
+                           const std::function<void()> &visit) {
+      if (contexts_.empty()) {
+        visit();
+      } else {
+        InContext(context, visit);
+      }
+    }
+
+    void VisitPredicatedAccess(const Optional<PrimExpr> &predicate,
+                               const char *kind,
+                               const std::function<void()> &visit) {
+      if (!predicate.defined()) {
+        visit();
+        return;
+      }
+      const std::string context = std::string(kind) + " access predicate";
+      // Base TIR visitors skip the predicate field. Inspect its reads even
+      // if simplifying it would erase them, then check the guarded access.
+      InContext(context + " condition", [&] { VisitExpr(predicate.value()); });
+      if (is_one(analyzer_.Simplify(predicate.value()))) {
+        visit();
+      } else {
+        InContext(context, visit);
+      }
+    }
+
+    [[noreturn]] void FailAccess(const Buffer &buffer,
+                                 const Array<PrimExpr> &indices, bool is_write,
+                                 const std::string &reason) {
+      std::ostringstream oss;
+      oss << "buffer `" << buffer->name << "` " << (is_write ? "store" : "load")
+          << " at " << BufferLoad(buffer, indices) << " " << reason << " in ";
+      for (size_t i = 0; i < contexts_.size(); ++i) {
+        if (i != 0)
+          oss << " -> ";
+        oss << contexts_[i];
+      }
+      oss << "; conditional gather/scatter is not yet supported";
+      parent_->Fail("control flow", oss.str());
+    }
+
+    void CheckAccess(const Buffer &buffer, const Array<PrimExpr> &indices,
+                     bool is_write) {
+      if (contexts_.empty() ||
+          !pto_analysis::IsOrdinaryUbScope(buffer.scope())) {
+        return;
+      }
+      for (const PrimExpr &index : indices) {
+        PostOrderVisit(index, [&](const ObjectRef &node) {
+          if (auto var = node.as<Var>(); var && !defs_.count(var.value())) {
+            FailAccess(buffer, indices, is_write,
+                       "cannot be classified reliably: variable `" +
+                           std::string(var.value()->name_hint) +
+                           "` is not defined in this lexical scope");
+          }
+        });
+      }
+      pto_analysis::AccessPattern pattern;
+      try {
+        pattern = pto_analysis::AnalyzeBufferAccess(buffer, indices, is_write,
+                                                    loop_var_, mapping_,
+                                                    &analyzer_, bind_env_)
+                      .pattern;
+      } catch (const pto_analysis::PtoAnalysisError &err) {
+        FailAccess(buffer, indices, is_write,
+                   std::string("cannot be classified reliably: ") + err.what());
+      }
+      if (pattern == pto_analysis::AccessPattern::kIndexed ||
+          (is_write && pattern == pto_analysis::AccessPattern::kLaneUniform)) {
+        FailAccess(buffer, indices, is_write,
+                   std::string(pto_analysis::AccessPatternToString(pattern)) +
+                       " access requires " + (is_write ? "scatter" : "gather"));
+      }
+    }
+
+    VerifyParallelToPTOImpl *parent_;
+    Var loop_var_;
+    const pto_analysis::PtoInverseMapping &mapping_;
+    arith::Analyzer analyzer_;
+    Map<Var, PrimExpr> bind_env_;
+    VarSet defs_;
+    std::vector<std::string> contexts_;
+  };
+
   class UnitVisitor : public StmtExprVisitor {
   public:
     UnitVisitor(VerifyParallelToPTOImpl *parent, const Var &loop_var,
@@ -600,30 +806,30 @@ private:
     // Inner sub-expressions are classified individually, so an int8
     // scalar Mul inside a Varying Add is legal while an int8 vector Mul
     // stays rejected.
-    void CheckBinaryOpTypes(const PrimExpr &expr) {
+    void CheckBinaryOpTypes(const PrimExpr &expr, bool indexed_offset = false) {
       std::function<void(const PrimExpr &)> check = [&](const PrimExpr &e) {
         if (const auto *add = e.as<AddNode>()) {
           check(add->a);
           check(add->b);
-          CheckOneOp("vadd", add->dtype, add->a, add->b);
+          CheckOneOp("vadd", add->dtype, add->a, add->b, indexed_offset);
           return;
         }
         if (const auto *sub = e.as<SubNode>()) {
           check(sub->a);
           check(sub->b);
-          CheckOneOp("vsub", sub->dtype, sub->a, sub->b);
+          CheckOneOp("vsub", sub->dtype, sub->a, sub->b, indexed_offset);
           return;
         }
         if (const auto *mul = e.as<MulNode>()) {
           check(mul->a);
           check(mul->b);
-          CheckOneOp("vmul", mul->dtype, mul->a, mul->b);
+          CheckOneOp("vmul", mul->dtype, mul->a, mul->b, indexed_offset);
           return;
         }
         if (const auto *div = e.as<DivNode>()) {
           check(div->a);
           check(div->b);
-          CheckOneOp("vdiv", div->dtype, div->a, div->b);
+          CheckOneOp("vdiv", div->dtype, div->a, div->b, indexed_offset);
           return;
         }
         if (const auto *cast = e.as<CastNode>()) {
@@ -689,14 +895,89 @@ private:
       }
     }
 
-    void CheckOneOp(const char *op_name, DataType dtype, const PrimExpr &lhs,
-                    const PrimExpr &rhs) {
+    pto_analysis::LaneUse ClassifyComputeOperand(const PrimExpr &expr,
+                                                 bool indexed_offset,
+                                                 std::string *why) {
+      if (indexed_offset) {
+        if (pto_analysis::IsPtoScalarCoordinate(expr, loop_var_, bind_env_)) {
+          return pto_analysis::LaneUse::kUniform;
+        }
+        // Address expressions additionally admit scalar chunk/kept-coordinate
+        // selection. Use the same bounded, loaded-value-aware
+        // proof as ConvertExpr instead of the narrower value whitelist.
+        const PrimExpr *lhs = nullptr;
+        const PrimExpr *rhs = nullptr;
+        if (const auto *add = expr.as<AddNode>()) {
+          lhs = &add->a;
+          rhs = &add->b;
+        } else if (const auto *sub = expr.as<SubNode>()) {
+          lhs = &sub->a;
+          rhs = &sub->b;
+        } else if (const auto *mul = expr.as<MulNode>()) {
+          lhs = &mul->a;
+          rhs = &mul->b;
+        } else if (const auto *div = expr.as<DivNode>()) {
+          lhs = &div->a;
+          rhs = &div->b;
+        }
+        if (lhs != nullptr) {
+          pto_analysis::LaneUse a =
+              ClassifyComputeOperand(*lhs, indexed_offset, why);
+          pto_analysis::LaneUse b =
+              ClassifyComputeOperand(*rhs, indexed_offset, why);
+          if (a == pto_analysis::LaneUse::kUnknown ||
+              b == pto_analysis::LaneUse::kUnknown) {
+            return pto_analysis::LaneUse::kUnknown;
+          }
+          // ConvertBinary retains vector representation even when an
+          // algebraic identity such as saved_index - saved_index is uniform.
+          return a == pto_analysis::LaneUse::kUniform &&
+                         b == pto_analysis::LaneUse::kUniform
+                     ? pto_analysis::LaneUse::kUniform
+                     : pto_analysis::LaneUse::kVarying;
+        }
+        if (const auto *cast = expr.as<CastNode>()) {
+          return ClassifyComputeOperand(cast->value, indexed_offset, why);
+        }
+        if (expr.as<ModNode>() || expr.as<MinNode>() || expr.as<MaxNode>() ||
+            expr.as<SelectNode>()) {
+          Optional<Var> kept_var;
+          int64_t kept_extent = 0;
+          if (mapping_.is_2d) {
+            kept_var = serial_var_;
+            kept_extent = mapping_.select_inner ? mapping_.outer_extent
+                                                : mapping_.inner_extent;
+          }
+          const bool uniform = pto_analysis::IsPtoLaneUniform(
+              expr, loop_var_, mapping_.index_expr, mapping_.lane_var,
+              mapping_.chunk_var, mapping_.lanes, mapping_.chunk_count,
+              kept_var, kept_extent, bind_env_);
+          if (uniform)
+            return pto_analysis::LaneUse::kUniform;
+          if (why != nullptr) {
+            *why = "indexed coordinate requires unsupported lane-varying "
+                   "division/modulo or selection";
+          }
+          return pto_analysis::LaneUse::kUnknown;
+        }
+      }
       pto_analysis::LaneUseContext ctx = MakeLaneUseContext();
+      return pto_analysis::AnalyzeLaneUse(expr, &ctx, why);
+    }
+
+    void CheckOneOp(const char *op_name, DataType dtype, const PrimExpr &lhs,
+                    const PrimExpr &rhs, bool indexed_offset) {
       std::string why;
-      pto_analysis::LaneUse a = pto_analysis::AnalyzeLaneUse(lhs, &ctx, &why);
-      pto_analysis::LaneUse b = pto_analysis::AnalyzeLaneUse(rhs, &ctx, &why);
+      pto_analysis::LaneUse a =
+          ClassifyComputeOperand(lhs, indexed_offset, &why);
+      pto_analysis::LaneUse b =
+          ClassifyComputeOperand(rhs, indexed_offset, &why);
       if (a == pto_analysis::LaneUse::kUnknown ||
           b == pto_analysis::LaneUse::kUnknown) {
+        if (indexed_offset) {
+          parent_->Fail("expression", std::string("indexed offset ") + op_name +
+                                          " cannot be classified: " + why);
+        }
         // The operand's access analysis failed (stride/pattern/etc.); the
         // dedicated BufferLoad visitor reports that with the correct
         // category later in this same unit walk. Do not double-report it
@@ -758,17 +1039,17 @@ private:
     // proves a VMI-equivalent conversion (attributes included); Cast
     // nodes inside BufferLoad *indices* are index arithmetic handled by
     // address analysis and are not checked here.
-    void CheckValueCasts(const PrimExpr &expr) {
+    void CheckValueCasts(const PrimExpr &expr, bool indexed_offset = false) {
       class CastCheck : public StmtExprVisitor {
       public:
-        CastCheck(UnitVisitor *parent) : parent_(parent) {}
+        CastCheck(UnitVisitor *parent, bool indexed_offset)
+            : parent_(parent), indexed_offset_(indexed_offset) {}
         void VisitExpr_(const CastNode *op) final {
           // Classify the *input of this Cast* with the existing lane-use
           // analysis, then hand the explicit kind to the shared planner.
-          pto_analysis::LaneUseContext ctx = parent_->MakeLaneUseContext();
           std::string lane_why;
-          pto_analysis::LaneUse use =
-              pto_analysis::AnalyzeLaneUse(op->value, &ctx, &lane_why);
+          pto_analysis::LaneUse use = parent_->ClassifyComputeOperand(
+              op->value, indexed_offset_, &lane_why);
           if (use == pto_analysis::LaneUse::kUnknown) {
             std::ostringstream oss;
             oss << "Cast " << op->value.dtype() << " -> " << op->dtype
@@ -805,8 +1086,9 @@ private:
 
       private:
         UnitVisitor *parent_;
+        bool indexed_offset_;
       };
-      CastCheck checker(this);
+      CastCheck checker(this, indexed_offset);
       checker(expr);
     }
 
@@ -836,23 +1118,92 @@ private:
             buffer, indices, is_write, loop_var_, mapping_, &analyzer_,
             bind_env_);
         if (access.pattern != pto_analysis::AccessPattern::kContinuous &&
-            access.pattern != pto_analysis::AccessPattern::kLaneUniform) {
+            access.pattern != pto_analysis::AccessPattern::kLaneUniform &&
+            access.pattern != pto_analysis::AccessPattern::kIndexed) {
           std::ostringstream oss;
           oss << "buffer `" << buffer->name << "` access pattern "
               << pto_analysis::AccessPatternToString(access.pattern)
               << " is not supported";
           parent_->Fail("memory access", oss.str());
         }
-        if (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
-            is_write) {
-          // Lane-uniform is only a load pattern.
-          std::ostringstream oss;
-          oss << "buffer `" << buffer->name
-              << "`: lane-uniform stores are not yet supported";
-          parent_->Fail("memory access", oss.str());
+        if (access.pattern == pto_analysis::AccessPattern::kIndexed ||
+            (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
+             is_write)) {
+          pto_analysis::IndexedMemoryOwner owner =
+              pto_analysis::GetIndexedMemoryOwner(
+                  buffer, parent_->active_allocations_, &parent_->analyzer_,
+                  "VerifyParallelToPTO");
+          pto_analysis::PtoIndexedAccessPlan plan =
+              pto_analysis::PlanPtoIndexedAccess(access, owner, loop_var_,
+                                                 mapping_, &parent_->analyzer_);
+          pto_analysis::CheckPtoIndexedAccessPlan(
+              plan, owner, loop_var_, mapping_, &parent_->analyzer_);
+          const PrimExpr &relative = plan.offsets;
+          const int bits = buffer->dtype.bits();
+          if (bits != 16 && bits != 32) {
+            parent_->Fail("dtype", "indexed gather/scatter requires a 16-bit "
+                                   "or 32-bit payload");
+          }
+          // Verify exactly what LowerIndexed converts, after any proved B16
+          // rebasing and removal of an ElemOffset-only promotion. Metadata
+          // such as strides/elem_offset can introduce operations and Var
+          // references absent from the source index array.
+          CheckDefinedVars(relative);
+          const std::string offset_context = "buffer `" +
+                                             std::string(buffer->name) +
+                                             "` complete indexed offset";
+          if (!pto_analysis::IsPtoIndexDType(relative.dtype())) {
+            parent_->Fail("dtype", offset_context +
+                                       " requires a scalar 16-bit or 32-bit "
+                                       "integer expression");
+          }
+          if (!pto_analysis::IsSupportedAddressExpr(relative)) {
+            parent_->Fail("expression", offset_context +
+                                            " contains an unsupported call "
+                                            "or a non-UB index load");
+          }
+          // ElemOffset metadata can contain reads that were absent from the
+          // source indices. Apply the same scope, predicate, conditional-read
+          // and nested-access rules before ConvertExpr can consume them.
+          auto check_metadata_reads = [&](const PrimExpr &expr) {
+            RegionVisitor metadata_accesses(parent_);
+            metadata_accesses(expr);
+            ConditionalIndexedAccessVisitor conditional_accesses(
+                parent_, loop_var_, mapping_, external_defs_, bind_env_);
+            conditional_accesses(expr);
+            VisitExpr(expr);
+          };
+          // Source indices are visited by the ordinary unit walk. Rewalking
+          // the complete rebased offset here duplicates every nested gather
+          // subtree, so validate only the metadata introduced by ElemOffset.
+          // This also covers metadata moved into the scalar base by rebasing.
+          check_metadata_reads(buffer->elem_offset);
+          bool uses_outer_coordinate = false;
+          for (size_t axis = 0; axis < indices.size(); ++axis) {
+            if (buffer->strides.empty()) {
+              if (uses_outer_coordinate) {
+                check_metadata_reads(buffer->shape[axis]);
+              }
+              uses_outer_coordinate |= !is_zero(indices[axis]);
+            } else if (!is_zero(indices[axis])) {
+              check_metadata_reads(buffer->strides[axis]);
+            }
+          }
+          std::string offset_why;
+          if (ClassifyComputeOperand(relative, /*indexed_offset=*/true,
+                                     &offset_why) ==
+              pto_analysis::LaneUse::kUnknown) {
+            parent_->Fail("expression",
+                          offset_context +
+                              " cannot be classified: " + offset_why);
+          }
+          CheckValueCasts(relative, /*indexed_offset=*/true);
+          CheckBinaryOpTypes(relative, /*indexed_offset=*/true);
         }
       } catch (const pto_analysis::PtoAnalysisError &err) {
-        parent_->Fail("memory access", err.what());
+        std::ostringstream oss;
+        oss << "buffer `" << buffer->name << "`: " << err.what();
+        parent_->Fail("memory access", oss.str());
       }
     }
 
@@ -872,6 +1223,18 @@ private:
     // where the unit appears.
     std::set<const VarNode *> external_defs_;
   };
+
+  // Keep flat allocation definitions visible within the enclosing statement
+  // sequence, then discard them when that lexical scope ends.
+  void VisitStmt(const Stmt &stmt) final {
+    if (stmt.as<AllocBufferNode>()) {
+      StmtExprVisitor::VisitStmt(stmt);
+      return;
+    }
+    const size_t allocation_mark = active_allocations_.size();
+    StmtExprVisitor::VisitStmt(stmt);
+    active_allocations_.resize(allocation_mark);
+  }
 
   // ------------------------------------------------------------------
   // Scope tracking: every definition — outer serial loop vars,
@@ -941,6 +1304,7 @@ private:
     // Flat statement (no body): the allocation is visible to the rest of
     // the enclosing scope.
     defs_.insert(op->buffer->data.get());
+    active_allocations_.push_back(op->buffer);
     StmtExprVisitor::VisitStmt_(op);
   }
 
@@ -972,6 +1336,9 @@ private:
   }
 
   void VisitStmt_(const SBlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers) {
+      active_allocations_.push_back(buffer);
+    }
     if (op->name_hint != "SIMD_VF") {
       std::set<const VarNode *> saved = defs_;
       for (const auto &iv : op->iter_vars) {
@@ -1159,6 +1526,9 @@ private:
             : unit->loop_var;
     // The definition snapshot at the unit's lexical position.
     const Stmt &body_to_verify = inner != nullptr ? inner->body : unit->body;
+    ConditionalIndexedAccessVisitor conditional_accesses(this, vector_var,
+                                                         mapping, defs_);
+    conditional_accesses(body_to_verify);
     UnitVisitor unit_visitor(this, vector_var, mapping, defs_);
     unit_visitor(body_to_verify);
   }
@@ -1195,6 +1565,20 @@ private:
   // UnitVisitor.
   void WalkRegion(const Stmt &stmt, const std::vector<For> &units,
                   int64_t lanes, size_t *next_unit) {
+    // This walk does not use VisitStmt, so maintain the same allocation
+    // scope here. A flat AllocBuffer remains visible to later siblings;
+    // allocations inside every other statement expire on leaving it.
+    struct AllocationScope {
+      std::vector<Buffer> *allocations;
+      size_t mark;
+      bool restore;
+      ~AllocationScope() {
+        if (restore) {
+          allocations->resize(mark);
+        }
+      }
+    } allocation_scope{&active_allocations_, active_allocations_.size(),
+                       stmt.as<AllocBufferNode>() == nullptr};
     if (const auto *for_node = stmt.as<ForNode>()) {
       if (for_node->kind == ForKind::kParallel &&
           !pto_analysis::UsesExplicitSIMD(for_node->body)) {
@@ -1265,6 +1649,7 @@ private:
       }
       for (const auto &buf : block->alloc_buffers) {
         defs_.insert(buf->data.get());
+        active_allocations_.push_back(buf);
       }
       WalkRegion(block->body, units, lanes, next_unit);
       defs_ = std::move(saved);
@@ -1277,6 +1662,7 @@ private:
       }
       for (const auto &buf : realize->block->alloc_buffers) {
         defs_.insert(buf->data.get());
+        active_allocations_.push_back(buf);
       }
       WalkRegion(realize->block->body, units, lanes, next_unit);
       defs_ = std::move(saved);
@@ -1311,6 +1697,7 @@ private:
     }
     if (const auto *alloc = stmt.as<AllocBufferNode>()) {
       defs_.insert(alloc->buffer->data.get());
+      active_allocations_.push_back(alloc->buffer);
       return;
     }
     if (const auto *decl = stmt.as<DeclBufferNode>()) {
@@ -1404,6 +1791,7 @@ private:
   // Lane count of the converting region under check (0 when unknown); part of
   // the region/unit diagnostic context.
   int64_t current_lanes_ = 0;
+  std::vector<Buffer> active_allocations_;
   BufferVersionMap buffer_versions_;
 };
 

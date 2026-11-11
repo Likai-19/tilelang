@@ -13,6 +13,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -46,12 +47,12 @@ public:
 };
 
 // Pick the vectorized dimension of a two-layer Parallel nest from the buffer
-// accesses. Both dimensions are tried as layout candidates under the same
-// lane/chunk proof rules the consumers (Verify/Vectorize) use: a candidate is
-// valid when every access is continuous (or, for loads, lane-uniform) over its
-// padded lane/chunk domain, since a non-divisible selected extent is padded to
-// a whole number of lanes. The inner dimension wins when both are valid; no
-// valid candidate is a layout error naming the failing access.
+// accesses. Both dimensions use the same address classification as the
+// consumers. Minimize total iterations (kept extent * ceil(selected extent /
+// lanes)), then per-iteration gather + scatter count, then scatter count; ties
+// retain the non-degenerate-axis rule and inner-axis preference. Count source
+// accesses without predicting CSE or physical instruction costs. The proof
+// domain includes the padded tail lanes.
 class PtoAccessCollector : public tirx::StmtExprVisitor {
 public:
   struct Access {
@@ -101,13 +102,9 @@ private:
 // rule, the address-node whitelist and the resource limits are the shared
 // read-only helpers in pto_index_analysis.h — the same implementation
 // AnalyzeBufferAccess uses, so planning and consumption cannot diverge.
-// An access passes when its flattened offset is continuous
-// (`offset == start + lane`); a load may instead be lane-uniform
-// (`offset == start`), while a store must be continuous (lane-uniform
-// stores are rejected downstream). A candidate is valid once every access
-// proof passes over the padded chunk domain (`q in [0, Q)`, `lane in [0, L)`);
-// when both candidates are valid, the selection rules below
-// (non-degenerate-dimension preference, then the inner preference) apply.
+// Continuous accesses and uniform loads do not need indexed instructions.
+// Uniform stores use scatter and count as indexed stores.
+// Detailed dtype, owner, mask and offset checks still belong to Verify.
 // Layout-inference code reports construct-time failures as
 // LoopLayoutInjectiveException (the type LayoutInference catches to discard
 // an attempt), while the shared padding helper speaks PtoAnalysisError;
@@ -127,143 +124,74 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
   PtoAccessCollector collector;
   collector(root->body);
 
-  auto candidate_ok = [&](bool select_inner) -> bool {
-    const int64_t sel_extent = select_inner ? N : M;
-    const Var &sel_var = select_inner ? jv : iv;
+  struct Candidate {
+    bool legal = true;
+    int64_t chunks = 0;
+    int64_t indexed_loads = 0;
+    int64_t indexed_stores = 0;
+    std::string why;
+  };
+  auto analyze_candidate = [&](bool select_inner) {
+    Candidate candidate;
+    const int64_t selected_extent = select_inner ? N : M;
+    const Var &selected_var = select_inner ? jv : iv;
     const Var &kept_var = select_inner ? iv : jv;
     const int64_t kept_extent = select_inner ? M : N;
-    // A non-divisible extent is padded to P = ceil(E/L)*L when the
-    // fragment is built; the candidate proof below works over the padded
-    // domain (Q = P/L chunks), which includes the tail chunk's full lane
-    // range, and the analyzer proves continuity over that whole padded
-    // domain. What remains a caller guarantee is only the *readability*
-    // of the padded range past E on the selected axis (tail loads read
-    // it); the candidate neither proves nor rejects that.
-    // Shared checked padding (rejects extents above the int32 index space
-    // before the addition; the same helper the fragment construction uses).
-    const auto [pad, padded_extent] =
-        CheckedPaddingForInference(sel_extent, lanes);
-    (void)pad;
-    const int64_t chunk_count = padded_extent / lanes;
-    DataType dt = sel_var.dtype();
-    Var lane("probe_lane", dt);
-    Var q("probe_q", dt);
-    PrimExpr sel_expr = q * IntImm(dt, lanes) + lane;
+    const int64_t padded =
+        CheckedPaddingForInference(selected_extent, lanes).second;
+    candidate.chunks = padded / lanes;
+    const DataType dtype = selected_var.dtype();
+    Var lane("probe_lane", dtype);
+    Var q("probe_q", dtype);
+    PrimExpr inverse = q * IntImm(dtype, lanes) + lane;
+    arith::Analyzer analyzer;
     for (const auto &access : collector.accesses) {
-      // Resolve Bind aliases per index with the shared resolver (cycle /
-      // depth / loaded-value failure, 4096-node budget, error conversion)
-      // against this access's program-point environment, then apply the
-      // shared address-node whitelist — the same order AnalyzeBufferAccess
-      // uses.
-      Array<PrimExpr> resolved;
-      for (const auto &idx : access.indices) {
-        Optional<PrimExpr> opt;
-        try {
-          opt = ResolveIndexAliases(idx, access.bind_env);
-        } catch (const PtoAnalysisError &err) {
-          *why = err.what();
-          return false;
+      try {
+        PtoAddressAnalysis analysis = AnalyzePtoAddress(
+            access.buffer, access.indices, selected_var, inverse, lane, q,
+            lanes, candidate.chunks, kept_var, kept_extent, access.bind_env,
+            &analyzer);
+        if (analysis.pattern == PtoAddressPattern::kIndexed ||
+            (access.is_write &&
+             analysis.pattern == PtoAddressPattern::kLaneUniform)) {
+          if (access.is_write) {
+            ++candidate.indexed_stores;
+          } else {
+            ++candidate.indexed_loads;
+          }
         }
-        if (!opt.has_value()) {
-          std::ostringstream oss;
-          oss << "buffer `" << access.buffer->name
-              << "`: bind alias chain in index is too deep, cyclic, or "
-                 "depends on a loaded value (data-dependent addresses are "
-                 "not yet supported)";
-          *why = oss.str();
-          return false;
-        }
-        resolved.push_back(opt.value());
-      }
-      for (const auto &idx : resolved) {
-        if (!IsSupportedAddressExpr(idx)) {
-          std::ostringstream oss;
-          oss << "buffer `" << access.buffer->name
-              << "`: address expression contains a loaded value or an "
-                 "unsupported call (loaded values and opaque/extern calls "
-                 "cannot appear in addresses; they would be evaluated once "
-                 "per chunk instead of per element)";
-          *why = oss.str();
-          return false;
-        }
-      }
-      // indices under the candidate mapping, then the flattened element
-      // offset (same construction as the consumers).
-      Array<PrimExpr> indices_after;
-      for (const auto &idx : resolved) {
-        indices_after.push_back(SubstituteVar(idx, sel_var.get(), sel_expr));
-      }
-      Array<PrimExpr> raw = access.buffer->ElemOffset(indices_after);
-      if (raw.size() != 1) {
-        *why = "multi-axis element offsets are not supported";
-        return false;
-      }
-      PrimExpr off = raw[0];
-      Array<PrimExpr> start_indices;
-      for (const auto &idx : indices_after) {
-        start_indices.push_back(SubstituteVar(idx, lane.get(), make_zero(dt)));
-      }
-      PrimExpr start = access.buffer->ElemOffset(start_indices)[0];
-      arith::Analyzer probe;
-      probe.Bind(lane, Range::FromMinExtent(make_zero(dt), IntImm(dt, lanes)));
-      // In-row chunk range only: q is the per-row chunk index in [0, Q),
-      // never the global position (K*Q for a kept extent K). The kept
-      // coordinate is separately bounded below, so the proof domain is
-      // exactly (q, lane, kept) — the same domain the final consumers'
-      // proof uses.
-      probe.Bind(q,
-                 Range::FromMinExtent(make_zero(dt), IntImm(dt, chunk_count)));
-      // The kept coordinate is bounded by its loop extent; the
-      // final consumers' proof binds the same fact.
-      probe.Bind(kept_var,
-                 Range::FromMinExtent(make_zero(dt), IntImm(dt, kept_extent)));
-      const bool continuous = probe.CanProveEqual(off, start + lane);
-      const bool uniform = probe.CanProveEqual(
-          off, probe.Simplify(SubstituteVar(off, lane.get(), make_zero(dt))));
-      if (!continuous && !(uniform && !access.is_write)) {
+      } catch (const PtoAnalysisError &err) {
+        candidate.legal = false;
         std::ostringstream oss;
         oss << "buffer `" << access.buffer->name << "` ("
-            << (access.is_write ? "store" : "load")
-            << ") is neither continuous nor lane-uniform under the "
-            << (select_inner ? "inner (j)" : "outer (i)") << " mapping";
-        *why = oss.str();
-        return false;
+            << (access.is_write ? "store" : "load") << "): " << err.what();
+        candidate.why = oss.str();
+        break;
       }
     }
-    return true;
+    return candidate;
   };
 
-  std::string inner_why;
-  std::string outer_why;
-  const bool inner_ok = candidate_ok(/*select_inner=*/true);
-  if (!inner_ok) {
-    inner_why = *why;
+  Candidate inner = analyze_candidate(true);
+  Candidate outer = analyze_candidate(false);
+  if (inner.legal && outer.legal) {
+    const auto inner_cost = std::make_tuple(
+        M * inner.chunks, inner.indexed_loads + inner.indexed_stores,
+        inner.indexed_stores);
+    const auto outer_cost = std::make_tuple(
+        N * outer.chunks, outer.indexed_loads + outer.indexed_stores,
+        outer.indexed_stores);
+    if (inner_cost != outer_cost) {
+      return inner_cost < outer_cost ? 1 : 0;
+    }
+    return N == 1 && M > 1 ? 0 : 1;
   }
-  const bool outer_ok = candidate_ok(/*select_inner=*/false);
-  if (!outer_ok) {
-    outer_why = *why;
-  }
-  if (inner_ok && outer_ok && N == 1 && M > 1) {
-    // Both dims classify and only the outer is non-degenerate: selecting the
-    // inner (extent-1) dim would emit M chunks with
-    // one valid lane each, while the outer dim covers the same logical
-    // points in ceil(M/L) chunks carrying M valid lanes in total. The
-    // candidate proofs above have already checked the actual buffer
-    // indices and strides, so the preference only breaks the tie between
-    // two already-legal candidates and never overrides an access
-    // constraint. The symmetric M == 1 && N > 1 falls through to the
-    // inner preference below.
-    return 0;
-  }
-  if (inner_ok) {
-    // Inner preference; a degenerate dimension is
-    // only an interpretation when its accesses classify under the padded
-    // domain, which candidate_ok already enforces.
+  if (inner.legal)
     return 1;
-  }
-  if (outer_ok) {
+  if (outer.legal)
     return 0;
-  }
+  const std::string &inner_why = inner.why;
+  const std::string &outer_why = outer.why;
   std::ostringstream oss;
   oss << "no vectorizable dimension: inner (j) -> " << inner_why
       << "; outer (i) -> " << outer_why;
@@ -355,10 +283,8 @@ Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds) {
     int required =
         PtoRequiredVectorDim(root, i_var, j_var, M, N, lanes, &candidate_why);
     if (required < 0) {
-      // Both candidates failed (an access that is neither continuous nor a
-      // lane-uniform load under the padded domain). Report the concrete
-      // access and reason — the candidate check already applies the
-      // inner-dimension preference, so -1 never means "no constraint".
+      // Both candidates failed address analysis under the padded domain.
+      // Report the concrete access and reason; -1 never means "no constraint".
       std::ostringstream oss;
       oss << "[PTO layout inference] the 2D unit has no vectorizable "
              "dimension (M="

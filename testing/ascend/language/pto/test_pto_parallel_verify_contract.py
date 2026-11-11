@@ -17,8 +17,9 @@ Covered contract:
 * 2D units pad only the selected dimension and keep the other extent;
 * a real (padded) row stride is accepted and buffer shapes are untouched;
 * lanes ``{64, 128, 256}`` are accepted and agree with the annotation;
-* the rejection diagnostics fire: gather access, invalid lanes, a missing or
-  invalid lane annotation, and hand-written VMI mixed with ``T.Parallel``.
+* gather accesses are accepted; rejection diagnostics cover invalid lanes,
+  a missing or invalid lane annotation, and hand-written VMI mixed with
+  ``T.Parallel``.
 """
 
 from __future__ import annotations
@@ -438,12 +439,11 @@ def test_2d_column_selection_pads_the_selected_dimension_only():
 
 
 @pytest.mark.pto
-def test_gather_access_is_rejected():
+def test_gather_access_is_vectorized():
     E, lanes = 150, 128
-    _, error = _lower_capture(_k_gather(E, lanes), expect_error=True)
-    assert error is not None, "a gather access must be rejected"
-    message = str(error)
-    assert "continuous" in message or "pto_parallel_loop_layout" in message, f"expected a continuity/layout diagnostic, got: {message}"
+    mod, error = _lower_capture(_k_gather(E, lanes))
+    assert error is None
+    assert mod is not None
 
 
 @pytest.mark.pto
