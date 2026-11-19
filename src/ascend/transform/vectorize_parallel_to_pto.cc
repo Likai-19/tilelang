@@ -1361,15 +1361,27 @@ private:
     if (const auto *div = expr.as<DivNode>()) {
       return ConvertBinary(div->a, div->b, "vdiv", pre);
     }
-    if (expr.as<ModNode>() || expr.as<MinNode>() || expr.as<MaxNode>() ||
-        expr.as<SelectNode>()) {
-      ICHECK(IsUniform(expr))
-          << "[VectorizeParallelToPTO] internal error: unsupported "
-             "lane-varying indexed coordinate passed Verify: "
-          << expr->GetTypeKey();
-      PrimExpr coordinate = pto_analysis::SubstituteVar(expr, loop_var_.get(),
-                                                        lane_indexed_expr_);
-      return ConvertScalarExpr(BindChunkToQ(coordinate));
+    if ((expr.as<ModNode>() || expr.as<MinNode>() || expr.as<MaxNode>() ||
+         expr.as<SelectNode>()) &&
+        pto_analysis::IsPtoIndexDType(expr.dtype())) {
+      // Index coordinates (gather/scatter) only. A value Select/Min/Max from
+      // control-flow legalization is lane-varying or carries non-index
+      // (float/bool) loads, so it must fall through to the value lowering
+      // below instead of the scalar coordinate path.
+      bool coordinate_uniform = false;
+      try {
+        coordinate_uniform = IsUniform(expr);
+      } catch (const pto_analysis::PtoAnalysisError &) {
+        // The lane-uniform proof met a non-index (value) load: the expression
+        // is a value choice, not a coordinate.
+        coordinate_uniform = false;
+      }
+      if (coordinate_uniform) {
+        PrimExpr coordinate = pto_analysis::SubstituteVar(
+            expr, loop_var_.get(), lane_indexed_expr_);
+        return ConvertScalarExpr(BindChunkToQ(coordinate));
+      }
+      // Lane-varying int value choices fall through to the vsel lowering.
     }
     if (const auto *call = expr.as<CallNode>()) {
       // Lane-mask boolean combinations come first. They are not unary

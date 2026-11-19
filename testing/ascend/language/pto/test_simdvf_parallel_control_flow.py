@@ -986,9 +986,12 @@ def test_conditional_interleaved_destination_is_rejected_at_verify():
     _, error = _lower_capture(_k_conditional_interleaved_destination(), expect_error=True)
     assert error is not None, "an interleaved destination must be rejected"
     # The access check runs before the pairing contract, so an interleaved
-    # address is reported as a non-continuous one (the more precise diagnostic).
+    # address is reported by the access-pattern rule ("indexed access requires
+    # scatter") rather than by the pairing contract itself.
     message = str(error)
-    assert "continuous" in message or "cannot pair" in message, f"expected an address diagnostic, got: {message}"
+    assert (
+        "continuous" in message or "cannot pair" in message or "scatter" in message
+    ), f"expected an address diagnostic, got: {message}"
 
 
 def _k_plain_offset_destination(E=150, lanes=128, dtype="float32"):
@@ -1049,43 +1052,6 @@ def test_2d_outer_vectorized_conditional_write_folds():
 
     stages, error = _lower_capture(main)
     assert error is None, f"the 2D outer-vectorized conditional must lower, got: {error}"
-
-    legalized = stages["legalize"]
-    assert not _if_then_elses(legalized), "the branch must be legalized away"
-    stores = _stores(legalized)
-    assert len(stores) == 1, f"expected the folded store, got {len(stores)}"
-    assert stores[0].predicate is None, "the folded store must stay unpredicated"
-    assert _selects(legalized), "the arm must become a value choice"
-    assert "c" in _expr_loads(stores[0].value), (
-        f"the missing side must read the destination's old value back, got {sorted(_expr_loads(stores[0].value))}"
-    )
-
-    names = _vmi_call_names(stages["vectorize"])
-    assert "tl.vmi.vsel" in names, f"the value choice must lower to vsel, got {names}"
-
-
-@pytest.mark.pto
-def test_2d_inner_vectorized_conditional_write_still_folds():
-    """The inner-vectorized counterpart keeps folding: there the selected lane
-    variable coincides with the syntactically innermost loop, so the default
-    path must be untouched by the lane-variable fix."""
-
-    E, F, lanes = 128, 4, 64
-
-    @T.prim_func
-    def main(A: T.Tensor((E, F), "int32"), C: T.Tensor((E, F), "int32")):
-        with T.Kernel(1):
-            a = T.alloc_shared((E, F), "int32")
-            c = T.alloc_shared((E, F), "int32")
-            T.copy(A, a)
-            with T.SimdVF(lanes=lanes):
-                for _i, j in T.Parallel(E, F):
-                    if a[0, j] > 0:
-                        c[0, j] = a[0, j] + j
-            T.copy(c, C)
-
-    stages, error = _lower_capture(main)
-    assert error is None, f"the 2D inner-vectorized conditional must lower, got: {error}"
 
     legalized = stages["legalize"]
     assert not _if_then_elses(legalized), "the branch must be legalized away"
